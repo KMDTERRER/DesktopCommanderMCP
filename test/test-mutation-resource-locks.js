@@ -70,6 +70,49 @@ async function main() {
     ));
     assert.equal(maxActive, 1, 'same-process calls must serialize the same resource');
 
+    let sharedActive = 0;
+    let sharedMax = 0;
+    await Promise.all(Array.from({ length: 3 }, () =>
+      withMutationResourceLocks([resource], Date.now() + 5_000, async () => {
+        sharedActive += 1;
+        sharedMax = Math.max(sharedMax, sharedActive);
+        await sleep(60);
+        sharedActive -= 1;
+      }, { topologyMode: 'none', resourceMode: 'shared' })
+    ));
+    assert.equal(sharedMax, 3, 'shared exact-resource readers must coexist');
+
+    const releaseReaderA = await acquireMutationResourceLocks(
+      [resource], Date.now() + 5_000, { topologyMode: 'none', resourceMode: 'shared' },
+    );
+    const releaseReaderB = await acquireMutationResourceLocks(
+      [resource], Date.now() + 5_000, { topologyMode: 'none', resourceMode: 'shared' },
+    );
+    let writerAcquired = false;
+    const writerPending = acquireMutationResourceLocks([resource], Date.now() + 5_000, { topologyMode: 'none' })
+      .then((release) => { writerAcquired = true; return release; });
+    await sleep(100);
+    assert.equal(writerAcquired, false, 'exclusive exact-resource writer bypassed active shared readers');
+    await releaseReaderA();
+    await sleep(60);
+    assert.equal(writerAcquired, false, 'exclusive writer acquired before the final shared reader released');
+    await releaseReaderB();
+    const releaseWriter = await writerPending;
+    assert.equal(writerAcquired, true);
+    await releaseWriter();
+
+    const releaseExclusive = await acquireMutationResourceLocks([resource], Date.now() + 5_000, { topologyMode: 'none' });
+    let readerBehindWriterAcquired = false;
+    const readerBehindWriter = acquireMutationResourceLocks(
+      [resource], Date.now() + 5_000, { topologyMode: 'none', resourceMode: 'shared' },
+    ).then((release) => { readerBehindWriterAcquired = true; return release; });
+    await sleep(100);
+    assert.equal(readerBehindWriterAcquired, false, 'shared reader bypassed an active exclusive exact-resource writer');
+    await releaseExclusive();
+    const releaseReaderBehindWriter = await readerBehindWriter;
+    assert.equal(readerBehindWriterAcquired, true);
+    await releaseReaderBehindWriter();
+
     let parallelActive = 0;
     let parallelMax = 0;
     const siblingResources = [path.join(root, 'parallel-a.txt'), path.join(root, 'parallel-b.txt')];

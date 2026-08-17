@@ -12,7 +12,9 @@ import {
 import { BUILD_METADATA_ACCELERATOR_TOOL, callBuildMetadataAcceleratorTool } from './build-metadata-accelerator.js';
 import { CPP_BUILD_PLAN_ACCELERATOR_TOOL, callCppBuildPlanAcceleratorTool } from './cpp-build-plan-accelerator.js';
 import { CPP_BUILD_CONTEXT_ACCELERATOR_TOOL, callCppBuildContextAcceleratorTool } from './cpp-build-context-accelerator.js';
+import { CPP_BUILD_EXECUTE_ACCELERATOR_TOOL, callCppBuildExecuteAcceleratorTool } from './cpp-build-execute-accelerator.js';
 import { CPP_BUILD_IMPACT_ACCELERATOR_TOOL, callCppBuildImpactAcceleratorTool } from './cpp-build-impact-accelerator.js';
+import { startProcess } from './improved-process-tools.js';
 import { CPP_TOOLCHAIN_PROFILE_ACCELERATOR_TOOL, callCppToolchainProfileAcceleratorTool } from './cpp-toolchain-profile-accelerator.js';
 import { SAFE_FIX_ACCELERATOR_TOOL, callSafeFixAcceleratorTool } from './safe-fix-accelerator.js';
 import { runWithAbortableTimeout } from '../utils/withTimeout.js';
@@ -1008,7 +1010,10 @@ function isTransientContextPath(relativePath: string): boolean {
     part === '.cache' || part === '.pytest_cache' || part === '.mypy_cache' || part === '.ruff_cache' ||
     part === '__pycache__' || part === '.venv' || part === 'venv' || part === 'coverage' ||
     part.startsWith('build-') || part.startsWith('build_') || part.startsWith('cmake-build-') || part.startsWith('cmake-build_');
-  if (parts.some(generatedDirectory)) return true;
+  const hiddenRuntimeState = parts.some((part, index) =>
+    part.startsWith('.') && part.length > 1 && parts.slice(index + 1).some((child) =>
+      child === 'state' || child === 'runtime' || child === 'cache' || child === 'tmp' || child === 'logs'));
+  if (hiddenRuntimeState || parts.some(generatedDirectory)) return true;
   return parts.some((part) => part === '.tmp' || part.startsWith('.tmp-') || part.startsWith('.tmp_'));
 }
 
@@ -1017,6 +1022,7 @@ function contextPathExplicitlyRequested(relativePath: string, queryLower: string
   const base = path.posix.basename(normalized);
   if (queryLower.includes(normalized) || (base.length >= 3 && queryLower.includes(base))) return true;
   const parts = normalized.split('/');
+  if (parts.some((part) => part.startsWith('.') && part.length > 2 && queryLower.includes(part.slice(1)))) return true;
   return parts.some((part) => part.startsWith('.tmp')) && (queryLower.includes('.tmp') || queryLower.includes('tmp'));
 }
 
@@ -1877,7 +1883,7 @@ async function waitProcess(args: Record<string, unknown>) {
       treeProbeWarning: result.treeProbeWarning ?? null,
       terminalError: result.terminalError ?? null,
     };
-    if (result.terminalError && !result.isComplete) {
+    if ((result.terminalError || (result.rootExited && result.treeState === 'probe_uncertain')) && !result.isComplete) {
       const tail = result.lines.join('\n');
       return {
         pid,
@@ -1885,8 +1891,9 @@ async function waitProcess(args: Record<string, unknown>) {
         timedOut: false,
         stalled: false,
         terminalFailed: true,
+        ownershipLost: result.rootExited && result.treeState === 'probe_uncertain',
         processSucceeded: false,
-        exitCode: null,
+        exitCode: result.rootExited ? result.rootExitCode ?? null : null,
         runtimeMs: Date.now() - started,
         noOutputForMs: result.noOutputForMs ?? 0,
         evictedLines: result.evictedLines ?? 0,
@@ -1958,6 +1965,7 @@ const tools: BuiltinAcceleratorTool[] = [
   ...AST_GREP_ACCELERATOR_TOOLS,
   BUILD_METADATA_ACCELERATOR_TOOL,
   CPP_BUILD_CONTEXT_ACCELERATOR_TOOL,
+  CPP_BUILD_EXECUTE_ACCELERATOR_TOOL,
   CPP_BUILD_PLAN_ACCELERATOR_TOOL,
   CPP_BUILD_IMPACT_ACCELERATOR_TOOL,
   CPP_TOOLCHAIN_PROFILE_ACCELERATOR_TOOL,
@@ -2209,14 +2217,17 @@ export async function callBuiltinAcceleratorTool(
   args: Record<string, unknown>,
   timeoutMs?: number,
 ) {
+  const isProcessExecutionTool = tool === 'wait_process' || tool === 'cpp_build_execute';
+  const requestedExecutionTimeout = typeof args.timeoutMs === 'number' ? args.timeoutMs : PROCESS_WAIT_DEFAULT_MS;
   const effectiveTimeoutMs = timeoutMs ?? (
-    tool === 'wait_process' ? PROCESS_WAIT_DEFAULT_MS + 10_000
-      : tool === 'ast_rewrite' ? BUILTIN_OPERATION_TIMEOUT_MAX_MS
-      : 30_000
+    tool === 'cpp_build_execute' ? Math.min(PROCESS_TRANSPORT_TIMEOUT_MAX_MS, requestedExecutionTimeout + 10_000)
+      : tool === 'wait_process' ? PROCESS_WAIT_DEFAULT_MS + 10_000
+        : tool === 'ast_rewrite' ? BUILTIN_OPERATION_TIMEOUT_MAX_MS
+          : 30_000
   );
   const deadlineAt = createDeadline(
     effectiveTimeoutMs,
-    tool === 'wait_process' ? PROCESS_TRANSPORT_TIMEOUT_MAX_MS : BUILTIN_OPERATION_TIMEOUT_MAX_MS,
+    isProcessExecutionTool ? PROCESS_TRANSPORT_TIMEOUT_MAX_MS : BUILTIN_OPERATION_TIMEOUT_MAX_MS,
   );
   switch (tool) {
     case 'workspace_snapshot':
@@ -2229,6 +2240,19 @@ export async function callBuiltinAcceleratorTool(
       return callBuildMetadataAcceleratorTool(args, remainingTimeout(deadlineAt, BUILTIN_OPERATION_TIMEOUT_MAX_MS));
     case 'cpp_build_context':
       return callCppBuildContextAcceleratorTool(args, remainingTimeout(deadlineAt, BUILTIN_OPERATION_TIMEOUT_MAX_MS));
+    case 'cpp_build_execute':
+      return callCppBuildExecuteAcceleratorTool(
+        args,
+        remainingTimeout(deadlineAt, PROCESS_WAIT_MAX_MS),
+        {
+          startProcess: (processArgs) => startProcess(processArgs),
+          waitProcess: (waitArgs) => waitProcess(waitArgs),
+          readProcessOutputPage: (pid, offset, length) => terminalManager.readOutputPaginated(pid, offset, length),
+          terminateProcess: (pid, cause, detail) => terminalManager.forceTerminate(pid, cause, detail),
+          acquireMutationLocks: (resources, lockDeadlineAt, resourceMode = 'exclusive') =>
+            acquireMutationResourceLocks(resources, lockDeadlineAt, { topologyMode: 'none', resourceMode }),
+        },
+      );
     case 'cpp_build_plan':
       return callCppBuildPlanAcceleratorTool(args, remainingTimeout(deadlineAt, BUILTIN_OPERATION_TIMEOUT_MAX_MS));
     case 'cpp_build_impact':

@@ -5,6 +5,7 @@ import path from 'path';
 import { callBuildMetadataAcceleratorTool, revalidateBuildMetadataSnapshot, type BuildMetadataSnapshot } from './build-metadata-accelerator.js';
 import { runBoundedSubprocess, type BoundedSubprocessResult } from '../utils/bounded-subprocess.js';
 import { runWithAbortableTimeout } from '../utils/withTimeout.js';
+import { inspectConfiguredExecutable } from '../utils/configured-executable.js';
 
 const MAX_OPERATION_TIMEOUT_MS = 45_000;
 const PROBE_TIMEOUT_MS = 5_000;
@@ -42,11 +43,6 @@ function queryDriverSafePath(value: string): boolean {
 function recordValue(value: unknown): JsonRecord | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? value as JsonRecord : undefined;
-}
-
-function isInside(root: string, candidate: string): boolean {
-  const relative = path.relative(root, candidate);
-  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 function remaining(deadlineAt: number, maximum = 10_000): number {
@@ -94,22 +90,14 @@ function firstLine(result: BoundedSubprocessResult): string {
 async function canonicalExternalExecutable(
   candidate: string, repositoryRoot: string, buildDir: string, deadlineAt: number,
 ): Promise<{ path: string | null; probeAllowed: boolean; warning?: string }> {
-  if (!path.isAbsolute(candidate)) return { path: null, probeAllowed: false, warning: `Compiler path is not absolute: ${candidate}` };
-  try {
-    const canonical = await runWithAbortableTimeout(
-      (_signal) => fs.realpath(candidate), remaining(deadlineAt), `Resolve toolchain executable ${candidate}`,
-    );
-    if (isInside(repositoryRoot, canonical) || isInside(buildDir, canonical)) {
-      return { path: slash(canonical), probeAllowed: false, warning: 'Executable is inside the repository/build tree and will not be auto-queried.' };
-    }
-    const stats = await runWithAbortableTimeout(
-      (_signal) => fs.stat(canonical), remaining(deadlineAt), `Stat toolchain executable ${canonical}`,
-    );
-    if (!stats.isFile()) return { path: null, probeAllowed: false, warning: `Compiler path is not a file: ${candidate}` };
-    return { path: slash(canonical), probeAllowed: true };
-  } catch (error) {
-    return { path: null, probeAllowed: false, warning: error instanceof Error ? error.message : String(error) };
-  }
+  const inspected = await inspectConfiguredExecutable(candidate, {
+    repositoryRoot, buildDir, deadlineAt, label: 'Toolchain executable',
+  });
+  return {
+    path: inspected.path ? slash(inspected.path) : null,
+    probeAllowed: inspected.trusted,
+    ...(inspected.reason ? { warning: inspected.reason } : {}),
+  };
 }
 
 function cacheCompilerPaths(cacheValues: JsonRecord): string[] {

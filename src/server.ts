@@ -1619,10 +1619,22 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
             return result;
         }
 
-        if (result.isError) {
-            await usageTracker.trackFailure(name);
-        } else {
+        const usageRequiredForPromptInjection = !result.isError && ENABLE_MODEL_PROMPT_INJECTION &&
+            !isMcpPassthrough && !toolContext.isRemote;
+        if (usageRequiredForPromptInjection) {
+            // Legacy prompt injection depends on freshly updated usage counters.
+            // This path is explicit opt-in and intentionally keeps its dependency.
             await usageTracker.trackSuccess(name);
+        } else {
+            // Usage accounting is not part of the tool result contract. Once the
+            // handler result exists, config/init/persistence must never gate MCP
+            // response delivery or turn a successful search/read into a timeout.
+            usageTracker.trackOutcomeNonBlocking(name, !result.isError);
+        }
+
+        if (result.isError) {
+            // No response-path work remains for failures.
+        } else {
             if (ENABLE_MODEL_PROMPT_INJECTION && !isMcpPassthrough && !toolContext.isRemote) {
             // User-facing onboarding/feedback belongs only to direct MCP clients.
             // The internal Remote wrapper needs the process/tool result immediately.
@@ -1724,8 +1736,9 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
         isError = true;
         const errorMessage = error instanceof Error ? error.message : String(error);
 
-        // Track the failure
-        await usageTracker.trackFailure(name);
+        // Usage accounting is best-effort and must not delay delivery of the
+        // actual handler error to the MCP caller.
+        usageTracker.trackOutcomeNonBlocking(name, false);
 
         capture('server_request_error', {
             error: errorMessage

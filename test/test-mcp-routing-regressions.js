@@ -277,6 +277,23 @@ async function main() {
     terminalManager.readOutputPaginated = originalReadOutputPaginated;
   }
 
+  const buildExecuteWaitMs = 1000;
+  const buildExecuteTransportBudget = buildExecuteWaitMs + PROCESS_TRANSPORT_RESERVE_MS;
+  const buildExecuteArgs = { root, buildDir: root, operation: 'build', timeoutMs: buildExecuteWaitMs };
+  await expectReject(
+    () => callExternalMcpCompatUri(
+      `mcp://desktop-accelerators/cpp_build_execute?timeout_ms=${buildExecuteTransportBudget - 1}`,
+      JSON.stringify(buildExecuteArgs),
+    ),
+    /must be at least/,
+  );
+  const buildExecuteBoundary = parseText(await callExternalMcpCompatUri(
+    `mcp://desktop-accelerators/cpp_build_execute?timeout_ms=${buildExecuteTransportBudget}`,
+    JSON.stringify(buildExecuteArgs),
+  ));
+  assert.equal(buildExecuteBoundary.succeeded, false);
+  assert(buildExecuteBoundary.diagnostics.some((item) => item.tool === 'cpp_build_execute'));
+
   const explicitLegacy = parseText(await callExternalMcpCompatUri(
     'mcp://desktop-accelerators/workspace_snapshot?envelope=legacy&timeout_ms=5000',
     JSON.stringify({ arguments: { root, includeDiffStat: false }, timeout_ms: 5000 }),
@@ -559,9 +576,26 @@ const workspaceSession = 'session_test_123';
 const boundSerena = await callSerenaWorkspaceTool({ operation: 'bind', root: process.env.DC_SERENA_ROOT, session: workspaceSession, templateServer: 'serena-test' }, 5000);
 assert.equal(boundSerena.workspaceSession, workspaceSession);
 const localReadArgs = { relative_path: 'cache-probe.ts', value: 'session-read' };
-const sessionRead = await callSessionSerenaTool({ tool: 'get_symbols_overview', arguments: localReadArgs, session: workspaceSession }, 5000);
+const originalSerenaCacheReadFile = fs.readFile;
+let cacheProbeReads = 0;
+fs.readFile = async (...args) => {
+  if (String(args[0]) === cacheProbePath) {
+    cacheProbeReads++;
+    if (cacheProbeReads === 2) await new Promise((resolve) => setTimeout(resolve, 1200));
+  }
+  return originalSerenaCacheReadFile(...args);
+};
+const sessionReadStartedAt = Date.now();
+let sessionRead;
+try {
+  sessionRead = await callSessionSerenaTool({ tool: 'get_symbols_overview', arguments: localReadArgs, session: workspaceSession }, 5000);
+} finally {
+  fs.readFile = originalSerenaCacheReadFile;
+}
+assert(Date.now() - sessionReadStartedAt < 900, 'completed Serena read waited for post-result cache hashing');
 assert.equal(sessionRead.status, 'ready');
 assert.equal(sessionRead.result.structuredContent.echoed.value, 'session-read');
+await new Promise((resolve) => setTimeout(resolve, 1300));
 const sessionCached = await callSessionSerenaTool({ tool: 'get_symbols_overview', arguments: localReadArgs, session: workspaceSession }, 5000);
 assert.equal(sessionCached.cached, true, 'unchanged file-local Serena read was not reused');
 await fs.writeFile(cacheProbePath, 'export const generation = 2;\\n', 'utf8');

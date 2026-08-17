@@ -1,97 +1,16 @@
 import { createClient, SupabaseClient, Session, UserResponse, User, RealtimeChannel } from '@supabase/supabase-js';
 import { captureRemote } from '../utils/capture.js';
 import { runWithAbortableTimeout } from '../utils/withTimeout.js';
-import { makeCancellationError } from '../utils/cancellation.js';
-import { isTransientRemoteError } from './transient-remote-error.js';
 import { VERSION } from '../version.js';
-import { createHash, randomUUID } from 'crypto';
+import { randomUUID } from 'crypto';
+import { SessionTokenOwner, type AuthSession } from './session-token-owner.js';
+import { CLAIM_METADATA_KEY, stripNullBytes } from './remote-result-contract.js';
 
-const NUL_CHAR = String.fromCharCode(0);
-const NUL_RE = new RegExp(NUL_CHAR, 'g');
-const OUTCOME_METADATA_REVISION_KEY = '_desktop_commander_outcome_revision';
-const OUTCOME_METADATA_HASH_KEY = '_desktop_commander_outcome_hash';
 const DEVICE_SESSION_CAPABILITY_KEY = 'device_session_v1';
 
 interface DeviceSessionLease {
     generation: string;
     acquired_at: string;
-}
-export const REMOTE_OUTCOME_REVISION = 1 as const;
-
-/**
- * Strip NUL characters (U+0000) from strings and object keys — Postgres rejects
- * them in jsonb and text (22P05). Walks the structure rather than
- * round-tripping JSON, which would also match escape text in legitimate content.
- */
-export function stripNullBytes<T>(value: T): T {
-    if (typeof value === 'string') {
-        return (value.includes(NUL_CHAR) ? value.replace(NUL_RE, '') : value) as T;
-    }
-    if (Array.isArray(value)) {
-        return value.map((item) => stripNullBytes(item)) as T;
-    }
-    if (value && typeof value === 'object') {
-        // Plain objects only — leave Date/Buffer/etc. untouched.
-        const proto = Object.getPrototypeOf(value);
-        if (proto !== Object.prototype && proto !== null) return value;
-        const out: Record<string, any> = {};
-        for (const [k, v] of Object.entries(value as Record<string, any>)) {
-            out[k.includes(NUL_CHAR) ? k.replace(NUL_RE, '') : k] = stripNullBytes(v);
-        }
-        return out as T;
-    }
-    return value;
-}
-
-function canonicalJsonValue(value: unknown): unknown {
-    if (Array.isArray(value)) return value.map(canonicalJsonValue);
-    if (value && typeof value === 'object') {
-        const out: Record<string, unknown> = {};
-        for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-            out[key] = canonicalJsonValue((value as Record<string, unknown>)[key]);
-        }
-        return out;
-    }
-    return value;
-}
-
-function canonicalJson(value: unknown): string {
-    const serialized = JSON.stringify(value);
-    if (serialized === undefined) throw new Error('Remote terminal outcome is not JSON serializable.');
-    return JSON.stringify(canonicalJsonValue(JSON.parse(serialized)));
-}
-
-export interface RemoteOutcomeIdentity {
-    outcomeRevision: typeof REMOTE_OUTCOME_REVISION;
-    outcomeHash: string;
-    result: unknown | null;
-    errorMessage: string | null;
-}
-
-export function createRemoteOutcomeIdentity(
-    status: string, result: unknown | null, errorMessage: string | null,
-): RemoteOutcomeIdentity {
-    const normalizedResult = result === null ? null : stripNullBytes(result);
-    const normalizedError = errorMessage === null ? null : stripNullBytes(errorMessage);
-    const canonical = canonicalJson({
-        outcomeRevision: REMOTE_OUTCOME_REVISION,
-        status,
-        result: normalizedResult,
-        errorMessage: normalizedError,
-    });
-    return {
-        outcomeRevision: REMOTE_OUTCOME_REVISION,
-        outcomeHash: createHash('sha256').update(canonical, 'utf8').digest('hex'),
-        result: normalizedResult,
-        errorMessage: normalizedError,
-    };
-}
-
-
-export interface AuthSession {
-    access_token: string;
-    refresh_token: string | null;
-    device_id?: string;
 }
 
 interface DeviceData {
@@ -128,44 +47,17 @@ const REMOTE_CALL_FETCH_TIMEOUT_MS = 15000;
 const REMOTE_CALL_CLAIM_TIMEOUT_MS = 15000;
 const REMOTE_CALL_CLAIM_RECONCILE_TIMEOUT_MS = 5000;
 const REMOTE_CALL_CLAIM_ATTEMPTS = 3;
-const CLAIM_METADATA_KEY = '_desktop_commander_claim_token';
-const REMOTE_CALL_RESULT_WRITE_TIMEOUT_MS = 60000;
-const REMOTE_CALL_RESULT_WRITE_ATTEMPTS = 3;
-const REMOTE_CALL_RESULT_ATTEMPT_TIMEOUT_MS = 15000;
-const REMOTE_CALL_RESULT_RECONCILE_TIMEOUT_MS = 5000;
-// A freshly completed tool must not spend the request's remaining lifetime inside
-// result persistence. Two bounded live attempts absorb one transient network/DB failure;
-// the durable outbox owns the slower background replay after the handler returns.
-const REMOTE_CALL_LIVE_RESULT_WRITE_TIMEOUT_MS = 16000;
-const REMOTE_CALL_LIVE_RESULT_WRITE_ATTEMPTS = 2;
-const REMOTE_CALL_LIVE_RESULT_ATTEMPT_TIMEOUT_MS = 6000;
-const REMOTE_CALL_LIVE_RESULT_RECONCILE_TIMEOUT_MS = 1500;
-const REMOTE_RESULT_NOTIFICATION_ATTEMPTS = 2;
-const REMOTE_RESULT_NOTIFICATION_ATTEMPT_TIMEOUT_MS = 5000;
-const REMOTE_RESULT_NOTIFICATION_RETRY_DELAY_MS = 100;
-const REMOTE_CALL_FALLBACK_WRITE_TIMEOUT_MS = 15000;
-const REMOTE_CALL_FALLBACK_WRITE_ATTEMPTS = 2;
 // All other PostgREST control-plane operations are bounded too. An outer
 // Promise.race alone would leave the underlying fetch alive and can pin ordered
 // chains such as statusWriteChain; abortSignal cancels the request itself.
 const REMOTE_CONTROL_QUERY_TIMEOUT_MS = 15000;
 const REMOTE_HEARTBEAT_WRITE_TIMEOUT_MS = 5000;
-// Cap on the shutdown session fetch, which races device.ts's 5s force-exit.
-const OFFLINE_SESSION_TIMEOUT_MS = 500;
 // realtime-js parks in 'disconnecting' for ~100ms after a disconnect and
 // connect() early-returns for that whole window (see waitForSocketSettled).
 // Bound generously — this only ever delays a recreate, which RECREATE_TIMEOUT_MS
 // already covers.
 const SOCKET_SETTLE_MAX_MS = 300;
 const SOCKET_SETTLE_POLL_MS = 20;
-
-export type RemoteResultDeliveryMode = 'live' | 'replay';
-
-export interface RemoteTerminalIdentityContext {
-    outcomeRevision?: typeof REMOTE_OUTCOME_REVISION;
-    outcomeHash?: string;
-    claimMetadata?: Record<string, unknown> | null;
-}
 
 export class RemoteChannel {
     private client: SupabaseClient | null = null;
@@ -186,10 +78,6 @@ export class RemoteChannel {
     // Single writer for the capabilities JSONB column. Catalog refresh and
     // transport reachability both replace the whole value, so they must never race.
     private capabilityWriteChain: Promise<void> = Promise.resolve();
-    /** Tokens from the last setSession / TOKEN_REFRESHED, for setOffline(). */
-    private lastKnownSession: { access_token: string; refresh_token: string | null } | null = null;
-    /** Device-owned persistence hook. Auth owns token rotation; the device owns disk I/O. */
-    private sessionUpdateHandler: ((session: AuthSession) => void) | null = null;
     /** Fences terminal writes to the process that won pending -> executing. */
     private callClaimTokens = new Map<string, string>();
     /** Exact metadata written with the winning claim, retained for durable terminal identity. */
@@ -232,13 +120,22 @@ export class RemoteChannel {
     private _user: User | null = null;
     get user(): User | null { return this._user; }
 
+    constructor(private readonly tokens: SessionTokenOwner = new SessionTokenOwner()) {}
 
     initialize(url: string, key: string): void {
         this.client = createClient(url, key);
     }
 
-    setSessionUpdateHandler(handler: ((session: AuthSession) => void) | null): void {
-        this.sessionUpdateHandler = handler;
+    private async syncRealtimeAuth(token: string | null, reason: string): Promise<void> {
+        if (!this.client) return;
+        try {
+            await this.client.realtime.setAuth(token);
+        } catch (error: any) {
+            console.debug(`[DEBUG] Realtime auth sync failed (${reason}):`, error?.message);
+            void captureRemote('remote_channel_realtime_auth_sync_error', {
+                reason, error: error?.message || String(error),
+            });
+        }
     }
 
     private async runDbQuery<T>(
@@ -301,31 +198,30 @@ export class RemoteChannel {
             'auth.getSession after setSession'
         );
         const realtimeToken = currentSession?.access_token ?? session.access_token;
-        this.client.realtime.setAuth(realtimeToken);
-        // Cached for setOffline(), which can't afford to wait on getSession().
-        this.lastKnownSession = {
+        this.tokens.replace({
             access_token: realtimeToken,
             refresh_token: currentSession?.refresh_token ?? session.refresh_token ?? null,
-        };
+            ...(session.device_id ? { device_id: session.device_id } : {}),
+        });
+        await this.syncRealtimeAuth(realtimeToken, 'setSession');
         console.debug('[DEBUG] Realtime socket authorized with current session JWT');
         if (!this.authListenerRegistered) {
             this.authListenerRegistered = true;
             this.client.auth.onAuthStateChange((event, newSession) => {
-                if (event === 'TOKEN_REFRESHED' && newSession?.access_token && this.client) {
-                    console.debug('[DEBUG] Token refreshed — re-authorizing realtime socket');
-                    this.client.realtime.setAuth(newSession.access_token);
-                    this.lastKnownSession = {
+                const hasSessionToken =
+                    (event === 'TOKEN_REFRESHED' || event === 'SIGNED_IN' || event === 'INITIAL_SESSION') &&
+                    !!newSession?.access_token;
+                if (hasSessionToken && newSession?.access_token && this.client) {
+                    const previous = this.tokens.snapshot();
+                    this.tokens.replace({
                         access_token: newSession.access_token,
-                        refresh_token: newSession.refresh_token ?? this.lastKnownSession?.refresh_token ?? null,
-                    };
-                    // Do not await or call Supabase APIs from this callback: Supabase documents
-                    // an onAuthStateChange deadlock hazard for async API work. Pass the already
-                    // rotated token snapshot to the device-owned persistence layer instead.
-                    try {
-                        this.sessionUpdateHandler?.({ ...this.lastKnownSession });
-                    } catch (persistError: any) {
-                        console.error('[DEBUG] Session update handler failed:', persistError?.message);
-                    }
+                        refresh_token: newSession.refresh_token ?? previous?.refresh_token ?? null,
+                        ...(previous?.device_id ? { device_id: previous.device_id } : {}),
+                    });
+                    void this.syncRealtimeAuth(newSession.access_token, `auth:${event}`);
+                } else if (event === 'SIGNED_OUT' && this.client) {
+                    this.tokens.clear();
+                    void this.syncRealtimeAuth(null, 'auth:SIGNED_OUT');
                 }
             });
         }
@@ -334,7 +230,13 @@ export class RemoteChannel {
     }
 
     getCachedSessionSnapshot(): AuthSession | null {
-        return this.lastKnownSession ? { ...this.lastKnownSession } : null;
+        const snapshot = this.tokens.snapshot();
+        if (!snapshot) return null;
+        return {
+            access_token: snapshot.access_token,
+            refresh_token: snapshot.refresh_token,
+            ...(snapshot.device_id ? { device_id: snapshot.device_id } : {}),
+        };
     }
 
     async getSession(): Promise<{ data: { session: Session | null }; error: any }> {
@@ -866,61 +768,6 @@ export class RemoteChannel {
     }
 
     /**
-     * Wake the server after the terminal row is durably persisted. The wake-up is
-     * only an acceleration path: make at most two bounded attempts, then rely on
-     * server-side recovery instead of retrying forever. A joined channel gets one
-     * WebSocket attempt with server ACK; the final attempt uses Realtime REST so a
-     * half-open WebSocket cannot head-of-line block later call results.
-     */
-    async notifyResult(callId: string): Promise<{ acknowledged: boolean; attempts: number; lastStatus: string }> {
-        const channel = this.channel;
-        if (!channel) {
-            console.debug('[DEBUG] Result notification skipped — no channel object (server recovery covers):', callId);
-            return { acknowledged: false, attempts: 0, lastStatus: 'channel-unavailable' };
-        }
-
-        const payload = { call_id: callId };
-        let attempts = 0;
-        let lastStatus = 'not-attempted';
-
-        for (let attempt = 1; attempt <= REMOTE_RESULT_NOTIFICATION_ATTEMPTS; attempt++) {
-            attempts = attempt;
-            try {
-                if (attempt === 1 && channel.state === 'joined') {
-                    const result = await channel.send(
-                        { type: 'broadcast', event: 'result', payload },
-                        { timeout: REMOTE_RESULT_NOTIFICATION_ATTEMPT_TIMEOUT_MS },
-                    );
-                    lastStatus = `websocket:${result}`;
-                    if (result === 'ok') {
-                        console.debug('[DEBUG] Result notification acknowledged over WebSocket:', callId);
-                        return { acknowledged: true, attempts, lastStatus };
-                    }
-                } else {
-                    const result = await channel.httpSend(
-                        'result', payload, { timeout: REMOTE_RESULT_NOTIFICATION_ATTEMPT_TIMEOUT_MS },
-                    );
-                    lastStatus = result.success ? 'http:accepted' : `http:${result.status}`;
-                    if (result.success) {
-                        console.debug('[DEBUG] Result notification accepted over Realtime REST:', callId);
-                        return { acknowledged: true, attempts, lastStatus };
-                    }
-                }
-            } catch (error: any) {
-                lastStatus = `error:${error?.message || String(error)}`;
-            }
-
-            if (attempt < REMOTE_RESULT_NOTIFICATION_ATTEMPTS) {
-                await this.sleep(REMOTE_RESULT_NOTIFICATION_RETRY_DELAY_MS);
-            }
-        }
-
-        console.debug(`[DEBUG] Result notification unconfirmed after ${attempts} attempt(s); server recovery owns continuation:`, callId);
-        captureRemote('remote_channel_result_notification_unconfirmed', { callId, attempts, lastStatus }).catch(() => { });
-        return { acknowledged: false, attempts, lastStatus };
-    }
-
-    /**
      * Compact connection state for logs — e.g. "socket=open(1) ch=errored attempt=3".
      * readyState 1=OPEN (a 1 while joins keep failing = a half-open socket being reused),
      * 3=CLOSED, '-'=no socket. Reads realtime-js internals defensively; never throws.
@@ -1264,172 +1111,9 @@ export class RemoteChannel {
         return metadata ? { ...metadata } : null;
     }
 
-    async updateCallResult(
-        callId: string,
-        status: string,
-        result: any = null,
-        errorMessage: string | null = null,
-        claimTokenOverride?: string,
-        deliveryMode: RemoteResultDeliveryMode = 'replay',
-        identityContext?: RemoteTerminalIdentityContext,
-    ) {
-        if (!this.client) throw new Error('Client not initialized');
-        const claimToken = claimTokenOverride ?? this.callClaimTokens.get(callId);
-        if (!claimToken) throw new Error(`No claim ownership token for call ${callId}`);
-
-        const expectedIdentity = createRemoteOutcomeIdentity(status, result, errorMessage);
-        if (identityContext?.outcomeRevision !== undefined && identityContext.outcomeRevision !== expectedIdentity.outcomeRevision) {
-            throw new Error(`Outcome revision mismatch before terminal write for ${callId}`);
-        }
-        if (identityContext?.outcomeHash !== undefined && identityContext.outcomeHash !== expectedIdentity.outcomeHash) {
-            throw new Error(`Outcome hash mismatch before terminal write for ${callId}`);
-        }
-        const updateData: any = { status, completed_at: new Date().toISOString() };
-        if (expectedIdentity.result !== null) updateData.result = expectedIdentity.result;
-        if (expectedIdentity.errorMessage !== null) updateData.error_message = expectedIdentity.errorMessage;
-        const claimMetadata = identityContext?.claimMetadata ?? this.callClaimMetadata.get(callId);
-        if (claimMetadata) {
-            updateData.metadata = {
-                ...stripNullBytes(claimMetadata),
-                [CLAIM_METADATA_KEY]: claimToken,
-                [OUTCOME_METADATA_REVISION_KEY]: expectedIdentity.outcomeRevision,
-                [OUTCOME_METADATA_HASH_KEY]: expectedIdentity.outcomeHash,
-            };
-        }
-
-        if (process.env.DEBUG_MODE === 'true') {
-            console.debug(
-                `[DEBUG] Updating call result: ${callId} status=${status}` +
-                (result !== null ? ` resultBytes=~${JSON.stringify(updateData.result)?.length ?? 0}` : '')
-            );
-        }
-
-        const isFallback = result === null && status === 'failed';
-        const isLiveDelivery = deliveryMode === 'live';
-        const totalBudgetMs = isLiveDelivery
-            ? REMOTE_CALL_LIVE_RESULT_WRITE_TIMEOUT_MS
-            : isFallback
-                ? REMOTE_CALL_FALLBACK_WRITE_TIMEOUT_MS
-                : REMOTE_CALL_RESULT_WRITE_TIMEOUT_MS;
-        const maxAttempts = isLiveDelivery
-            ? REMOTE_CALL_LIVE_RESULT_WRITE_ATTEMPTS
-            : isFallback
-                ? REMOTE_CALL_FALLBACK_WRITE_ATTEMPTS
-                : REMOTE_CALL_RESULT_WRITE_ATTEMPTS;
-        const attemptTimeoutMs = isLiveDelivery
-            ? REMOTE_CALL_LIVE_RESULT_ATTEMPT_TIMEOUT_MS
-            : REMOTE_CALL_RESULT_ATTEMPT_TIMEOUT_MS;
-        const reconcileTimeoutMs = isLiveDelivery
-            ? REMOTE_CALL_LIVE_RESULT_RECONCILE_TIMEOUT_MS
-            : REMOTE_CALL_RESULT_RECONCILE_TIMEOUT_MS;
-        const deadline = Date.now() + totalBudgetMs;
-        let error: any = null;
-
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            const remaining = deadline - Date.now();
-            if (remaining <= 0) break;
-
-            let data: any = null;
-            let writeError: any = null;
-            try {
-                const response = await runWithAbortableTimeout(
-                    async (signal) => await this.client!
-                        .from('mcp_remote_calls')
-                        .update(updateData)
-                        .eq('id', callId)
-                        .eq('status', 'executing')
-                        .contains('metadata', { [CLAIM_METADATA_KEY]: claimToken })
-                        .select('id, status, metadata')
-                        .abortSignal(signal),
-                    Math.max(100, Math.min(attemptTimeoutMs, remaining)),
-                    `Update call result ${callId} attempt ${attempt}`
-                );
-                data = response.data;
-                writeError = response.error;
-            } catch (caught: any) {
-                writeError = caught;
-            }
-
-            if (!writeError && data && data.length > 0) {
-                this.callClaimTokens.delete(callId);
-                this.callClaimMetadata.delete(callId);
-                console.debug('[DEBUG] Call result updated successfully:', callId);
-                return;
-            }
-
-            let reconcileError: any = null;
-            try {
-                const reconcileRemaining = deadline - Date.now();
-                if (reconcileRemaining > 0) {
-                    const row = await this.readCallClaimState(
-                        callId,
-                        Math.max(100, Math.min(reconcileTimeoutMs, reconcileRemaining)),
-                    );
-                    if (!row) {
-                        const goneError = new Error(`Remote call ${callId} no longer exists`) as NodeJS.ErrnoException;
-                        goneError.code = 'EREMOTECALLGONE';
-                        error = goneError;
-                        break;
-                    }
-                    const owner = row.metadata?.[CLAIM_METADATA_KEY];
-                    const isTerminal = row?.status === 'completed' || row?.status === 'failed';
-                    if (owner === claimToken && isTerminal) {
-                        const remoteIdentity = createRemoteOutcomeIdentity(
-                            row.status, row.result ?? null, row.error_message ?? null,
-                        );
-                        const metadataRevision = row.metadata?.[OUTCOME_METADATA_REVISION_KEY];
-                        const metadataHash = row.metadata?.[OUTCOME_METADATA_HASH_KEY];
-                        const metadataMatches =
-                            (metadataRevision === undefined || metadataRevision === expectedIdentity.outcomeRevision) &&
-                            (metadataHash === undefined || metadataHash === expectedIdentity.outcomeHash);
-                        if (remoteIdentity.outcomeHash === expectedIdentity.outcomeHash && metadataMatches) {
-                            this.callClaimTokens.delete(callId);
-                            this.callClaimMetadata.delete(callId);
-                            console.debug('[DEBUG] Reconciled exact terminal outcome as committed:', callId);
-                            return;
-                        }
-                        error = new Error(
-                            `Terminal outcome identity mismatch for ${callId}: expected ${expectedIdentity.outcomeHash}, ` +
-                            `remote ${remoteIdentity.outcomeHash}`
-                        );
-                        break;
-                    }
-                    if (row && (owner !== claimToken || row.status !== 'executing')) {
-                        error = makeCancellationError(
-                            'ownership_lost',
-                            `Terminal write rejected because claim ownership/state changed for ${callId}`,
-                            'EOWNERSHIPLOST',
-                        );
-                        break;
-                    }
-                }
-            } catch (caught: any) {
-                reconcileError = caught;
-            }
-
-            error = writeError ?? new Error(`Terminal write was not confirmed for ${callId}`);
-            const retryable = isTransientRemoteError(writeError) || isTransientRemoteError(reconcileError);
-            if (reconcileError) {
-                error = new Error(`${error.message}; reconcile failed: ${reconcileError?.message || reconcileError}`);
-            }
-            if (!retryable || attempt >= maxAttempts) break;
-
-            const backoffMs = 250 * attempt;
-            if (deadline - Date.now() <= backoffMs) break;
-            console.debug(`[DEBUG] Retrying transient result persistence failure (${attempt}/${maxAttempts}):`, error.message);
-            await this.sleep(backoffMs);
-        }
-
-        error ??= new Error(`Terminal result persistence deadline exhausted for ${callId}`);
-        if (process.env.DEBUG_MODE === 'true') {
-            console.debug('[DEBUG] Failed to update call result:', error.message);
-        }
-        await captureRemote('remote_channel_update_call_result_error', { error, callId, status });
-
-        // Do not rewrite a successfully executed tool result into a synthetic
-        // failure when persistence is unavailable. The device keeps the exact
-        // terminal outcome in its durable result outbox and retries delivery.
-        throw error;
+    releaseCallClaim(callId: string): void {
+        this.callClaimTokens.delete(callId);
+        this.callClaimMetadata.delete(callId);
     }
 
     /**
@@ -1620,26 +1304,13 @@ export class RemoteChannel {
         console.debug('[DEBUG] setOffline() initiating blocking update for device:', deviceId);
 
         try {
-            // Session for the subprocess — bounded, with a cached fallback.
-            // getSession() is not a cheap read: it takes a lock (10s acquire
-            // timeout) and refreshes when the token is within ~90s of expiry,
-            // POSTing /token with its own ~30s retry budget. On a just-woken
-            // machine that outlasts device.ts's 5s force-exit, and then spawnSync
-            // never runs and the offline write is lost. The subprocess calls
-            // setSession() itself, so a slightly stale access_token is fine.
-            const live = await Promise.race([
-                this.client.auth.getSession().then((r) => r.data?.session ?? null),
-                this.sleep(OFFLINE_SESSION_TIMEOUT_MS).then(() => null),
-            ]).catch(() => null);
-            const session = live ?? this.lastKnownSession;
-
+            // Shutdown must never enter Auth refresh/storage machinery. The token
+            // owner already tracks every accepted session rotation in memory.
+            const session = this.tokens.snapshot();
             if (!session?.access_token) {
                 console.error('❌ No valid session for offline update');
                 console.debug('[DEBUG] Session data missing or invalid');
                 return;
-            }
-            if (!live) {
-                console.debug('[DEBUG] getSession() slow/failed — using last known session tokens');
             }
 
             // Get Supabase config from client

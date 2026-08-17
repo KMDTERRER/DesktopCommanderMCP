@@ -866,9 +866,9 @@ function Start-Installation {
         }
         Write-Host ""
         Write-Info "Path Translation Examples:"
-        Write-Info "  Windows: C:\Users\wonde\projects\file.txt"
-        Write-Info "  Docker:  /c/users/wonde/projects/file.txt  (windows-style)"
-        Write-Info "  Docker:  /home/wonde/projects/file.txt     (home-style)"
+        Write-Info "  Windows: C:\Users\<user>\projects\file.txt"
+        Write-Info "  Docker:  /c/users/<user>/projects/file.txt  (windows-style)"
+        Write-Info "  Docker:  /home/<user>/projects/file.txt     (home-style)"
     }
     
     Write-Host ""

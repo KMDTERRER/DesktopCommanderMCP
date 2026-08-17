@@ -11,7 +11,11 @@ const MAX_LOCK_METADATA_BYTES = 4 * 1024;
 type LockOwner = { pid: number; token: string; createdAt: number };
 type HeldLock = { handle: fs.FileHandle; lockPath: string; token: string };
 export type MutationTopologyMode = 'shared' | 'exclusive' | 'none';
-export type MutationLockOptions = { topologyMode?: MutationTopologyMode };
+export type MutationResourceMode = 'shared' | 'exclusive';
+export type MutationLockOptions = {
+  topologyMode?: MutationTopologyMode;
+  resourceMode?: MutationResourceMode;
+};
 
 function timeoutError(resources: string[]): NodeJS.ErrnoException {
   const error = new Error(`Timed out waiting for mutation ownership of ${resources.length} resource(s).`) as NodeJS.ErrnoException;
@@ -41,6 +45,14 @@ function topologyScopeIdentity(resource: string): string {
 
 function topologyScopeKey(scope: string): string {
   return crypto.createHash('sha256').update(`topology:${scope}`).digest('hex');
+}
+
+function resourceScopeKey(identity: string): string {
+  return crypto.createHash('sha256').update(identity).digest('hex');
+}
+
+function resourceSharedPrefix(identity: string): string {
+  return `${resourceScopeKey(identity)}.resource-shared.`;
 }
 
 function topologyExclusiveIdentity(scope: string): string {
@@ -240,6 +252,85 @@ async function releaseOne(lock: HeldLock): Promise<void> {
   }
 }
 
+async function hasActiveResourceExclusive(identity: string): Promise<boolean> {
+  return !(await reapDeadOwner(lockPathFor(identity)));
+}
+
+async function acquireResourceShared(
+  identity: string, deadlineAt: number, allResources: string[],
+): Promise<HeldLock> {
+  await fs.mkdir(LOCK_ROOT, { recursive: true });
+  const prefix = resourceSharedPrefix(identity);
+  while (true) {
+    remaining(deadlineAt, allResources);
+    if (await hasActiveResourceExclusive(identity)) {
+      await sleep(Math.min(LOCK_POLL_MS, remaining(deadlineAt, allResources)));
+      continue;
+    }
+    const token = crypto.randomUUID();
+    const lockPath = path.join(LOCK_ROOT, `${prefix}${process.pid}.${token}.lock`);
+    let handle: fs.FileHandle;
+    try {
+      handle = await fs.open(lockPath, 'wx', 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === 'EEXIST') continue;
+      throw error;
+    }
+    try {
+      await handle.writeFile(JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }), 'utf8');
+      await handle.sync();
+      const owner = await readLockOwnerWithRetry(lockPath);
+      if (owner?.pid !== process.pid || owner.token !== token) {
+        await handle.close().catch(() => undefined);
+        await fs.unlink(lockPath).catch(() => undefined);
+        continue;
+      }
+      const held = { handle, lockPath, token };
+      if (await hasActiveResourceExclusive(identity)) {
+        await releaseOne(held);
+        await sleep(Math.min(LOCK_POLL_MS, remaining(deadlineAt, allResources)));
+        continue;
+      }
+      return held;
+    } catch (error) {
+      await handle.close().catch(() => undefined);
+      await fs.unlink(lockPath).catch(() => undefined);
+      throw error;
+    }
+  }
+}
+
+async function hasActiveResourceShared(identity: string): Promise<boolean> {
+  let names: string[];
+  try {
+    names = await fs.readdir(LOCK_ROOT);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
+    throw error;
+  }
+  const prefix = resourceSharedPrefix(identity);
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith('.lock')) continue;
+    if (!(await reapDeadOwner(path.join(LOCK_ROOT, name)))) return true;
+  }
+  return false;
+}
+
+async function acquireResourceExclusive(
+  identity: string, deadlineAt: number, allResources: string[],
+): Promise<HeldLock> {
+  const held = await acquireOne(identity, deadlineAt, allResources);
+  try {
+    while (await hasActiveResourceShared(identity)) {
+      await sleep(Math.min(LOCK_POLL_MS, remaining(deadlineAt, allResources)));
+    }
+    return held;
+  } catch (error) {
+    await releaseOne(held);
+    throw error;
+  }
+}
+
 async function hasActiveTopologyExclusive(scope: string): Promise<boolean> {
   const lockPath = lockPathFor(topologyExclusiveIdentity(scope));
   return !(await reapDeadOwner(lockPath));
@@ -346,6 +437,7 @@ export async function acquireMutationResourceLocks(
   const identities = [...new Set(resources.map(resourceIdentity))].sort();
   if (identities.length === 0) return async () => undefined;
   const topologyMode = options.topologyMode ?? 'shared';
+  const resourceMode = options.resourceMode ?? 'exclusive';
   const topologyScopes = topologyMode === 'none'
     ? []
     : [...new Set(resources.map(topologyScopeIdentity))].sort();
@@ -359,7 +451,9 @@ export async function acquireMutationResourceLocks(
         : await acquireTopologyShared(scope, deadlineAt, allResources));
     }
     for (const identity of identities) {
-      held.push(await acquireOne(identity, deadlineAt, allResources));
+      held.push(resourceMode === 'shared'
+        ? await acquireResourceShared(identity, deadlineAt, allResources)
+        : await acquireResourceExclusive(identity, deadlineAt, allResources));
     }
   } catch (error) {
     for (const lock of held.reverse()) await releaseOne(lock);

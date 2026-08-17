@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
-import { createRemoteOutcomeIdentity, RemoteChannel, type AuthSession, type RemoteResultDeliveryMode } from './remote-channel.js';
+import { RemoteChannel } from './remote-channel.js';
+import { SessionTokenOwner, type AuthSession } from './session-token-owner.js';
+import { RemoteResultTransport } from './remote-result-transport.js';
+import { createRemoteOutcomeIdentity, type RemoteResultDeliveryMode } from './remote-result-contract.js';
 import { DeviceAuthenticator } from './device-authenticator.js';
 import { DesktopCommanderIntegration } from './desktop-commander-integration.js';
 import { fileURLToPath } from 'url';
@@ -118,7 +121,7 @@ export function describeRemoteToolCall(toolName: unknown, toolArgs: unknown): st
     return direct;
 }
 
-type RemoteToolTracePhase = 'START' | 'OK' | 'FAIL';
+type RemoteToolTracePhase = 'RECV' | 'START' | 'OK' | 'FAIL';
 
 function remoteToolTraceColorEnabled(): boolean {
     if (process.env.NO_COLOR !== undefined || process.env.FORCE_COLOR === '0') return false;
@@ -135,11 +138,13 @@ export function formatRemoteToolTrace(
     colorEnabled = remoteToolTraceColorEnabled(),
 ): string {
     const id = operatorTraceToken(callId || 'unknown', 12);
-    const style = phase === 'START'
-        ? { glyph: '▶', color: '1;36' }
-        : phase === 'OK'
-            ? { glyph: '✓', color: '1;32' }
-            : { glyph: '✖', color: '1;31' };
+    const style = phase === 'RECV'
+        ? { glyph: '◆', color: '1;35' }
+        : phase === 'START'
+            ? { glyph: '▶', color: '1;36' }
+            : phase === 'OK'
+                ? { glyph: '✓', color: '1;32' }
+                : { glyph: '✖', color: '1;31' };
     const prefix = colorizeRemoteToolTrace('[TOOL]', '1;34', colorEnabled);
     const phaseText = colorizeRemoteToolTrace(`${style.glyph} ${phase.padEnd(5)}`, style.color, colorEnabled);
     const callText = colorizeRemoteToolTrace(`call=${id}`, '2', colorEnabled);
@@ -163,7 +168,9 @@ function writeRemoteToolTrace(
 
 export class MCPDevice {
     private baseServerUrl: string;
+    private tokenOwner: SessionTokenOwner;
     private remoteChannel: RemoteChannel;
+    private resultTransport: RemoteResultTransport;
     private deviceId?: string;
     private isShuttingDown: boolean;
     private configPath: string;
@@ -189,7 +196,9 @@ export class MCPDevice {
 
     constructor(options: MCPDeviceOptions = {}) {
         this.baseServerUrl = process.env.MCP_SERVER_URL || 'https://mcp.desktopcommander.app';
-        this.remoteChannel = new RemoteChannel();
+        this.tokenOwner = new SessionTokenOwner();
+        this.remoteChannel = new RemoteChannel(this.tokenOwner);
+        this.resultTransport = new RemoteResultTransport(this.tokenOwner);
         this.deviceId = undefined;
         this.isShuttingDown = false;
         this.configPath = path.join(os.homedir(), '.desktop-commander-device', 'device.json');
@@ -197,11 +206,14 @@ export class MCPDevice {
         this.resultOutbox = new RemoteResultOutbox(
             path.join(path.dirname(this.configPath), 'result-outbox')
         );
-        this.remoteChannel.setSessionUpdateHandler((session) => {
-            if (!this.persistSession) return;
-            // Fire-and-queue only filesystem work. RemoteChannel's auth callback must
-            // stay synchronous and must not call back into Supabase.
-            void this.savePersistedConfig(session);
+        this.tokenOwner.subscribe((session) => {
+            if (!this.persistSession || !session) return;
+            const persistedSession: AuthSession = {
+                access_token: session.access_token,
+                refresh_token: session.refresh_token,
+                ...(session.device_id ? { device_id: session.device_id } : {}),
+            };
+            void this.savePersistedConfig(persistedSession);
         });
 
         // Initialize desktop integration. Construction itself must stay process-lifecycle neutral.
@@ -286,8 +298,9 @@ export class MCPDevice {
             const { supabaseUrl, anonKey } = await this.fetchSupabaseConfig();
             console.log(`   - 🔌 Connected to Remote MCP`);
 
-            // Initialize Remote Channel
+            // Initialize independent inbound/control and outbound-result clients.
             this.remoteChannel.initialize(supabaseUrl, anonKey);
+            this.resultTransport.initialize(supabaseUrl, anonKey);
 
             // Load persisted configuration (deviceId, session)
             let session = await this.loadPersistedConfig();
@@ -332,6 +345,10 @@ export class MCPDevice {
                 if (error) throw error;
             }
 
+
+            const currentUser = this.remoteChannel.user;
+            if (!currentUser) throw new Error('Authenticated user missing before result transport setup');
+            this.resultTransport.configureUser(currentUser.id);
 
             // Force save the current session immediately to ensure it's persisted
             await this.savePersistedConfig();
@@ -616,15 +633,16 @@ export class MCPDevice {
                 // Once the database confirms it, retire the local retry entry BEFORE
                 // notification so an unconfirmed wake-up can never create an
                 // unbounded notification loop. Server-side recovery owns resume.
-                await this.remoteChannel.updateCallResult(
+                await this.resultTransport.updateCallResult(
                     entry.callId, entry.status, entry.result, entry.errorMessage, entry.claimToken, priority, {
                         outcomeRevision: entry.outcomeRevision, outcomeHash: entry.outcomeHash, claimMetadata: entry.claimMetadata,
                     }
                 );
+                this.remoteChannel.releaseCallClaim(entry.callId);
                 await this.resultOutbox.remove(entry.callId);
 
                 try {
-                    const notification = await this.remoteChannel.notifyResult(entry.callId);
+                    const notification = await this.resultTransport.notifyResult(entry.callId);
                     if (notification && !notification.acknowledged && process.env.DEBUG_MODE === 'true') {
                         console.debug(
                             `[DEBUG] Result ${entry.callId} persisted; notification unconfirmed after ${notification.attempts} attempt(s).`
@@ -661,11 +679,12 @@ export class MCPDevice {
             const release = await this.acquireResultDeliverySlot(priority);
             try {
                 try {
-                    await this.remoteChannel.updateCallResult(
+                    await this.resultTransport.updateCallResult(
                         entry.callId, entry.status, entry.result, entry.errorMessage, entry.claimToken, priority, {
                             outcomeRevision: entry.outcomeRevision, outcomeHash: entry.outcomeHash, claimMetadata: entry.claimMetadata,
                         }
                     );
+                    this.remoteChannel.releaseCallClaim(entry.callId);
                 } catch (error: any) {
                     if (error?.code === 'EREMOTECALLGONE') {
                         this.volatileOutcomes.delete(entry.callId);
@@ -676,7 +695,7 @@ export class MCPDevice {
                 // Remote terminal persistence is authoritative even if the optional
                 // wake-up notification cannot be acknowledged.
                 this.volatileOutcomes.delete(entry.callId);
-                try { await this.remoteChannel.notifyResult(entry.callId); }
+                try { await this.resultTransport.notifyResult(entry.callId); }
                 catch (notificationError: any) {
                     captureRemote('remote_device_result_notification_failed', {
                         call_id: entry.callId, error: notificationError?.message
@@ -780,13 +799,14 @@ export class MCPDevice {
             this.volatileOutcomes.delete(callId);
         } catch (spoolError: any) {
             console.error(`[DEBUG] Could not persist local result outbox entry ${callId}:`, spoolError?.message);
-            await this.remoteChannel.updateCallResult(
+            await this.resultTransport.updateCallResult(
                 callId, status, identity.result, identity.errorMessage, claimToken, 'live', {
                     outcomeRevision: identity.outcomeRevision, outcomeHash: identity.outcomeHash, claimMetadata,
                 }
             );
+            this.remoteChannel.releaseCallClaim(callId);
             this.volatileOutcomes.delete(callId);
-            try { await this.remoteChannel.notifyResult(callId); }
+            try { await this.resultTransport.notifyResult(callId); }
             catch (notificationError: any) {
                 captureRemote('remote_device_result_notification_failed', {
                     call_id: callId, error: notificationError?.message
@@ -885,6 +905,9 @@ export class MCPDevice {
             return;
         }
 
+        const operatorDescriptor = describeRemoteToolCall(tool_name, tool_args);
+        writeRemoteToolTrace('RECV', call_id, operatorDescriptor);
+
         this.inFlightCallIds.add(call_id);
         let claimed = false;
         try {
@@ -908,7 +931,6 @@ export class MCPDevice {
         }
         this.rememberCallId(call_id);
 
-        const operatorDescriptor = describeRemoteToolCall(tool_name, tool_args);
         const operatorStartedAt = Date.now();
         writeRemoteToolTrace('START', call_id, operatorDescriptor);
 

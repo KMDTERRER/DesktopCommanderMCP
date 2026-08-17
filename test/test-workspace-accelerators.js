@@ -18,8 +18,9 @@ import {
   readExternalMcpCompatUri,
 } from '../dist/tools/external-mcp.js';
 import { normalizeMcpArgumentsObject } from '../dist/utils/mcp-arguments.js';
-import { callBuildMetadataAcceleratorTool, revalidateBuildMetadataSnapshot } from '../dist/tools/build-metadata-accelerator.js';
+import { callBuildMetadataAcceleratorTool, discoverConfiguredCmakeTrees, revalidateBuildMetadataSnapshot } from '../dist/tools/build-metadata-accelerator.js';
 import { callCppBuildPlanAcceleratorTool } from '../dist/tools/cpp-build-plan-accelerator.js';
+import { callCppBuildExecuteAcceleratorTool, normalizeCppBuildDiagnostics } from '../dist/tools/cpp-build-execute-accelerator.js';
 import { terminalManager } from '../dist/terminal-manager.js';
 import { readProcessOutput } from '../dist/tools/improved-process-tools.js';
 import { TextFileHandler } from '../dist/utils/files/text.js';
@@ -74,7 +75,7 @@ async function main() {
     assert.equal(BUILTIN_SERVER_ID, 'desktop-accelerators');
     assert.deepEqual(
       catalog.map((tool) => tool.name).sort(),
-      ['apply_patch', 'ast_rewrite', 'ast_rule_search', 'ast_search', 'build_metadata', 'context_pack', 'cpp_build_context', 'cpp_build_impact', 'cpp_build_plan', 'cpp_toolchain_profile', 'edit_file', 'read_ranges', 'safe_fix', 'wait_process', 'workspace_delta', 'workspace_snapshot'],
+      ['apply_patch', 'ast_rewrite', 'ast_rule_search', 'ast_search', 'build_metadata', 'context_pack', 'cpp_build_context', 'cpp_build_execute', 'cpp_build_impact', 'cpp_build_plan', 'cpp_toolchain_profile', 'edit_file', 'read_ranges', 'safe_fix', 'wait_process', 'workspace_delta', 'workspace_snapshot'],
     );
     const patchMetadata = listBuiltinAcceleratorTools('apply_patch');
     assert.equal(patchMetadata.mutating, true);
@@ -98,8 +99,8 @@ async function main() {
     assert.throws(() => normalizeMcpArgumentsObject([]), /must be a JSON object/);
     assert.throws(() => normalizeMcpArgumentsObject('relative_path=x.cpp'), /must be a JSON object/);
     assert.deepEqual(
-      parseExternalMcpCompatUri('mcp://serena-project/get_symbols_overview?timeout_ms=45000'),
-      { server: 'serena-project', tool: 'get_symbols_overview', timeout_ms: 45000 },
+      parseExternalMcpCompatUri('mcp://serena-ai-agent/get_symbols_overview?timeout_ms=45000'),
+      { server: 'serena-ai-agent', tool: 'get_symbols_overview', timeout_ms: 45000 },
     );
     assert.deepEqual(
       parseExternalMcpCompatUri(`mcp://desktop-core/start_process?timeout_ms=${PROCESS_TRANSPORT_TIMEOUT_MAX_MS}`),
@@ -590,9 +591,11 @@ async function main() {
     const scopedContextRoot = path.join(deltaRoot, 'scoped-context');
     await fs.mkdir(path.join(scopedContextRoot, 'src'), { recursive: true });
     await fs.mkdir(path.join(scopedContextRoot, '.tmp-trace'), { recursive: true });
+    await fs.mkdir(path.join(scopedContextRoot, '.workspace-state', 'state'), { recursive: true });
     await fs.mkdir(path.join(scopedContextRoot, 'build-debug', 'CMakeFiles'), { recursive: true });
     await fs.writeFile(path.join(scopedContextRoot, 'src', 'main.ts'), 'export const scopedNeedle = 1;\n', 'utf8');
     await fs.writeFile(path.join(scopedContextRoot, '.tmp-trace', 'trace.txt'), 'scopedNeedle runtime trace\n', 'utf8');
+    await fs.writeFile(path.join(scopedContextRoot, '.workspace-state', 'state', 'runtime.lock'), 'scopedNeedle\n', 'utf8');
     await fs.writeFile(path.join(scopedContextRoot, 'build-debug', 'CMakeFiles', 'generated.txt'), 'scopedNeedle\n', 'utf8');
 
     const scopedPack = await callBuiltinAcceleratorTool('context_pack', {
@@ -602,7 +605,7 @@ async function main() {
     assert.deepEqual(scopedPack.workspaceDelta.changedFiles, ['scoped-context/src/main.ts']);
     assert(scopedPack.files.some((file) => file.path === 'scoped-context/src/main.ts'));
     assert(!scopedPack.files.some((file) =>
-      file.path.includes('.tmp-trace') || file.path.includes('/build-debug/')
+      file.path.includes('.tmp-trace') || file.path.includes('.workspace-state') || file.path.includes('/build-debug/')
     ));
     const scopedCursorJson = inflateRawSync(Buffer.from(scopedPack.workspaceCursor.slice(3), 'base64url')).toString('utf8');
     assert.deepEqual(Object.keys(JSON.parse(scopedCursorJson).dirty), ['scoped-context/src/main.ts']);
@@ -627,6 +630,7 @@ async function main() {
     const buildMetaRoot = path.join(root, 'build-meta-repo');
     const buildMetaDir = path.join(buildMetaRoot, 'build');
     const replyDir = path.join(buildMetaDir, '.cmake', 'api', 'v1', 'reply');
+    const syntheticCmakeBin = path.join(root, 'build-meta-host-tools');
     await fs.mkdir(path.join(buildMetaRoot, 'src'), { recursive: true });
     await fs.mkdir(path.join(buildMetaRoot, 'include'), { recursive: true });
     await fs.mkdir(replyDir, { recursive: true });
@@ -635,6 +639,7 @@ async function main() {
     const syntheticQtBin = path.join(syntheticQtRoot, 'bin');
     const syntheticQtPlugins = path.join(syntheticQtRoot, 'plugins');
     const syntheticQtDir = path.join(syntheticQtRoot, 'lib', 'cmake', 'Qt6');
+    await fs.mkdir(syntheticCmakeBin, { recursive: true });
     await fs.mkdir(syntheticToolchainBin, { recursive: true });
     await fs.mkdir(syntheticQtBin, { recursive: true });
     await fs.mkdir(syntheticQtPlugins, { recursive: true });
@@ -659,8 +664,8 @@ async function main() {
       { directory: buildMetaDir, file: '../src/future.cpp', arguments: ['clang++', '-std=c++23', '-c', '../src/future.cpp'], output: 'future.obj' },
     ]);
     await fs.writeFile(compileDbPath, compileDbSource, 'utf8');
-    const cmakeExecutable = path.join(buildMetaDir, process.platform === 'win32' ? 'cmake.exe' : 'cmake').replace(/\\/g, '/');
-    const ctestExecutable = path.join(buildMetaDir, process.platform === 'win32' ? 'ctest.exe' : 'ctest').replace(/\\/g, '/');
+    const cmakeExecutable = path.join(syntheticCmakeBin, process.platform === 'win32' ? 'cmake.exe' : 'cmake').replace(/\\/g, '/');
+    const ctestExecutable = path.join(syntheticCmakeBin, process.platform === 'win32' ? 'ctest.exe' : 'ctest').replace(/\\/g, '/');
     await fs.writeFile(cmakeExecutable, '', 'utf8');
     await fs.writeFile(ctestExecutable, '', 'utf8');
     await fs.writeFile(path.join(buildMetaDir, 'CMakeCache.txt'), [
@@ -671,6 +676,7 @@ async function main() {
       `CMAKE_PREFIX_PATH:PATH=${syntheticQtRoot}`,
       `Qt6_DIR:PATH=${syntheticQtDir}`,
       'CMAKE_GENERATOR:INTERNAL=Ninja',
+      `CMAKE_HOME_DIRECTORY:INTERNAL=${buildMetaRoot.replace(/\\/g, '/')}`,
       'CMAKE_BUILD_TYPE:STRING=Debug',
       '',
     ].join('\n'), 'utf8');
@@ -784,9 +790,24 @@ async function main() {
     assert.equal(buildPlan.process.pty, 'never');
     assert.equal(buildPlan.process.timeout_ms, PROCESS_WAIT_DEFAULT_MS);
     assert.equal(typeof buildPlan.process.env?.PATH, 'string');
+
+    const cachePathForTrustTest = path.join(buildMetaDir, 'CMakeCache.txt');
+    const trustedCacheSource = await fs.readFile(cachePathForTrustTest, 'utf8');
+    const repoLocalCmake = path.join(buildMetaDir, process.platform === 'win32' ? 'cmake.exe' : 'cmake');
+    await fs.writeFile(repoLocalCmake, '', 'utf8');
+    await fs.writeFile(
+      cachePathForTrustTest,
+      trustedCacheSource.replace(`CMAKE_COMMAND:INTERNAL=${cmakeExecutable}`, `CMAKE_COMMAND:INTERNAL=${repoLocalCmake.replace(/\\/g, '/')}`),
+      'utf8',
+    );
+    const projectLocalBuildPlan = await callBuiltinAcceleratorTool(
+      'cpp_build_plan', { root: buildMetaRoot, buildDir: buildMetaDir, operation: 'build' },
+    );
+    assert.equal(path.resolve(projectLocalBuildPlan.process.executable), path.resolve(repoLocalCmake));
+    await fs.writeFile(cachePathForTrustTest, trustedCacheSource, 'utf8');
     const buildPathEntries = buildPlan.process.env.PATH.split(path.delimiter).map((value) => path.resolve(value));
     assert(buildPathEntries.some((value) => value === path.resolve(syntheticToolchainBin)), JSON.stringify(buildPlan.evidence.environment));
-    assert(buildPathEntries.some((value) => value === path.resolve(buildMetaDir)), JSON.stringify(buildPlan.evidence.environment));
+    assert(buildPathEntries.some((value) => value === path.resolve(syntheticCmakeBin)), JSON.stringify(buildPlan.evidence.environment));
     assert(buildPathEntries.some((value) => value === path.resolve(syntheticQtBin)), JSON.stringify(buildPlan.evidence.environment));
     assert.equal(buildPlan.evidence.environment.source, 'cmake-cache');
     assert(buildPlan.profileFingerprint.startsWith('sha256:'));
@@ -799,6 +820,18 @@ async function main() {
     assert.deepEqual(testPlan.process.args, ['--test-dir', path.resolve(buildMetaDir), '-C', 'Debug']);
     assert.equal(testPlan.process.timeout_ms, PROCESS_WAIT_DEFAULT_MS);
     assert.equal(path.resolve(testPlan.process.env.QT_PLUGIN_PATH), path.resolve(syntheticQtPlugins));
+    const focusedTestPlan = await callBuiltinAcceleratorTool('cpp_build_plan', {
+      root: buildMetaRoot, buildDir: buildMetaDir, operation: 'test', configuration: 'Debug',
+      tests: ['suite.alpha', 'suite[beta]'], parallelism: 3, outputOnFailure: true, noTestsError: true,
+    });
+    assert.deepEqual(focusedTestPlan.process.args, [
+      '--test-dir', path.resolve(buildMetaDir), '-C', 'Debug',
+      '--tests-regex', '^(suite\\.alpha|suite\\[beta\\])$', '--parallel', '3', '--output-on-failure', '--no-tests=error',
+    ]);
+    assert.deepEqual(focusedTestPlan.tests, ['suite.alpha', 'suite[beta]']);
+    assert.equal(focusedTestPlan.parallelism, 3);
+    assert.equal(focusedTestPlan.outputOnFailure, true);
+    assert.equal(focusedTestPlan.noTestsError, true);
     await assert.rejects(
       () => callBuiltinAcceleratorTool('cpp_build_plan', { root: buildMetaRoot, buildDir: buildMetaDir, operation: 'test', targets: ['sample'] }),
       /targets is only valid/,
@@ -807,13 +840,30 @@ async function main() {
       () => callBuiltinAcceleratorTool('cpp_build_plan', { root: buildMetaRoot, buildDir: buildMetaDir, preset: 'ci' }),
       /has no CMakePresets/,
     );
-    await fs.writeFile(path.join(buildMetaRoot, 'CMakePresets.json'), JSON.stringify({ version: 3, buildPresets: [{ name: 'ci', configurePreset: 'base' }] }), 'utf8');
+    const includedPresetDir = path.join(buildMetaRoot, 'cmake');
+    const includedPresetPath = path.join(includedPresetDir, 'common-presets.json');
+    await fs.mkdir(includedPresetDir, { recursive: true });
+    await fs.writeFile(includedPresetPath, JSON.stringify({
+      version: 4, buildPresets: [{ name: 'ci', configurePreset: 'base' }],
+    }), 'utf8');
+    const staticRootPreset = JSON.stringify({ version: 4, include: ['cmake/common-presets.json'] });
+    await fs.writeFile(path.join(buildMetaRoot, 'CMakePresets.json'), staticRootPreset, 'utf8');
     const presetPlan = await callBuiltinAcceleratorTool('cpp_build_plan', {
       root: buildMetaRoot, buildDir: buildMetaDir, preset: 'ci', targets: ['sample'],
     });
     assert.deepEqual(presetPlan.process.args, ['--build', '--preset', 'ci', '--target', 'sample']);
     assert.equal(presetPlan.source, 'explicit-preset');
-    assert.equal(presetPlan.evidence.presetFiles.length, 1);
+    assert.deepEqual(presetPlan.evidence.presetFiles.map((file) => file.name).sort(), [
+      'CMakePresets.json', 'cmake/common-presets.json',
+    ]);
+    await fs.writeFile(path.join(buildMetaRoot, 'CMakePresets.json'), JSON.stringify({
+      version: 7, include: ['$penv{DC_PRESET_FILE}'],
+    }), 'utf8');
+    await assert.rejects(
+      () => callBuiltinAcceleratorTool('cpp_build_plan', { root: buildMetaRoot, buildDir: buildMetaDir, preset: 'ci' }),
+      /CPP_PRESET_DYNAMIC_INCLUDE_UNSUPPORTED/,
+    );
+    await fs.writeFile(path.join(buildMetaRoot, 'CMakePresets.json'), staticRootPreset, 'utf8');
 
     const toolchainSchema = parseTextResult(await readExternalMcpCompatUri('mcp://desktop-accelerators/cpp_toolchain_profile'));
     assert.equal(toolchainSchema.tool.name, 'cpp_toolchain_profile');
@@ -843,6 +893,212 @@ async function main() {
     const contextSchema = parseTextResult(await readExternalMcpCompatUri('mcp://desktop-accelerators/cpp_build_context'));
     assert.equal(contextSchema.tool.name, 'cpp_build_context');
     assert.equal(contextSchema.tool.readOnly, true);
+    const executeSchema = parseTextResult(await readExternalMcpCompatUri('mcp://desktop-accelerators/cpp_build_execute'));
+    assert.equal(executeSchema.tool.name, 'cpp_build_execute');
+    assert.equal(executeSchema.tool.readOnly, false);
+    assert.equal(executeSchema.tool.mutating, true);
+    assert.equal(executeSchema.tool.preferredFrozenSurface, 'write_file');
+    assert.deepEqual(executeSchema.tool.inputSchema.required, ['root', 'operation']);
+    assert.equal(executeSchema.tool.inputSchema.properties.configureMode.default, 'never');
+
+    const configuredTrees = await discoverConfiguredCmakeTrees(buildMetaRoot, 5000);
+    assert.equal(configuredTrees.trees.length, 1);
+    assert.equal(path.resolve(configuredTrees.trees[0].buildDir), path.resolve(buildMetaDir));
+
+    const foreignSourceRoot = path.join(root, 'foreign-cmake-source');
+    const foreignBuildDir = path.join(buildMetaRoot, 'foreign-build');
+    await fs.mkdir(foreignSourceRoot, { recursive: true });
+    await fs.mkdir(foreignBuildDir, { recursive: true });
+    await fs.writeFile(path.join(foreignBuildDir, 'CMakeCache.txt'), [
+      `CMAKE_HOME_DIRECTORY:INTERNAL=${foreignSourceRoot.replace(/\\/g, '/')}`,
+      'CMAKE_GENERATOR:INTERNAL=Ninja',
+      '',
+    ].join('\n'), 'utf8');
+    const ownedTrees = await discoverConfiguredCmakeTrees(buildMetaRoot, 5000);
+    assert.deepEqual(ownedTrees.trees.map((tree) => path.resolve(tree.buildDir)), [path.resolve(buildMetaDir)]);
+
+    const nestedSourceRoot = path.join(buildMetaRoot, 'native');
+    const nestedBuildDir = path.join(buildMetaRoot, 'nested-build');
+    await fs.mkdir(nestedSourceRoot, { recursive: true });
+    await fs.mkdir(nestedBuildDir, { recursive: true });
+    await fs.writeFile(path.join(nestedBuildDir, 'CMakeCache.txt'), [
+      `CMAKE_HOME_DIRECTORY:INTERNAL=${nestedSourceRoot.replace(/\\/g, '/')}`,
+      'CMAKE_GENERATOR:INTERNAL=Ninja',
+      '',
+    ].join('\n'), 'utf8');
+    const nestedMetadata = await callBuildMetadataAcceleratorTool({
+      root: buildMetaRoot, buildDir: nestedBuildDir, maxEntries: 1, maxTargets: 1,
+    }, 5000);
+    assert.equal(nestedMetadata.cmakeCache.found, true);
+    const nestedTrees = await discoverConfiguredCmakeTrees(buildMetaRoot, 5000);
+    assert(nestedTrees.trees.some((tree) => path.resolve(tree.buildDir) === path.resolve(nestedBuildDir)));
+    await fs.rm(nestedBuildDir, { recursive: true, force: true });
+    await fs.rm(nestedSourceRoot, { recursive: true, force: true });
+
+    let fakePid = 80000;
+    const fakeExecuteDeps = {
+      startProcess: async () => ({ structuredContent: { pid: fakePid++ }, content: [{ type: 'text', text: 'started' }] }),
+      waitProcess: async () => ({ completed: true, timedOut: false, processSucceeded: true, exitCode: 0, runtimeMs: 5, tail: '' }),
+      readProcessOutputPage: () => ({
+        lines: [], totalLines: 0, readFrom: 0, readCount: 0, remaining: 0, isComplete: true, exitCode: 0,
+      }),
+      terminateProcess: async () => true,
+      acquireMutationLocks: async () => async () => undefined,
+    };
+    const autoBuildDir = await callCppBuildExecuteAcceleratorTool({
+      root: buildMetaRoot, operation: 'build', targets: ['sample'], configuration: 'Debug', timeoutMs: 5000,
+    }, 5000, fakeExecuteDeps);
+    assert.equal(autoBuildDir.succeeded, true, JSON.stringify(autoBuildDir));
+    assert.equal(path.resolve(autoBuildDir.buildDir), path.resolve(buildMetaDir));
+    assert.equal(autoBuildDir.buildDirSource, 'discovered');
+
+    const presetLockCalls = [];
+    const presetFastPath = await callCppBuildExecuteAcceleratorTool({
+      root: buildMetaRoot, buildDir: buildMetaDir, operation: 'build', preset: 'ci', targets: ['sample'], timeoutMs: 5000,
+    }, 5000, {
+      ...fakeExecuteDeps,
+      acquireMutationLocks: async (resources, _deadline, resourceMode = 'exclusive') => {
+        presetLockCalls.push({ resources: resources.map((value) => path.resolve(value)), resourceMode });
+        return async () => undefined;
+      },
+    });
+    assert.equal(presetFastPath.succeeded, true, JSON.stringify(presetFastPath));
+    const sharedPresetLock = presetLockCalls.find((call) => call.resourceMode === 'shared');
+    assert(sharedPresetLock, JSON.stringify(presetLockCalls));
+    assert(sharedPresetLock.resources.includes(path.resolve(path.join(buildMetaRoot, 'CMakePresets.json'))));
+    assert(sharedPresetLock.resources.includes(path.resolve(path.join(buildMetaRoot, 'CMakeUserPresets.json'))));
+    assert(sharedPresetLock.resources.includes(path.resolve(includedPresetPath)), JSON.stringify(sharedPresetLock));
+
+    await assert.rejects(
+      () => callBuildMetadataAcceleratorTool({ root: buildMetaRoot, buildDir: foreignBuildDir, maxEntries: 1, maxTargets: 1 }, 5000),
+      /BUILD_METADATA_SOURCE_MISMATCH/,
+      'build_metadata must own CMake source-root validation for every downstream C++ accelerator',
+    );
+
+    let foreignBuildStarted = false;
+    const foreignExecute = await callCppBuildExecuteAcceleratorTool({
+      root: buildMetaRoot, buildDir: foreignBuildDir, operation: 'build', timeoutMs: 5000,
+    }, 5000, {
+      ...fakeExecuteDeps,
+      startProcess: async () => { foreignBuildStarted = true; throw new Error('foreign build must not start'); },
+    });
+    assert.equal(foreignExecute.succeeded, false);
+    assert.equal(foreignBuildStarted, false);
+    assert(foreignExecute.diagnostics.some((item) => /BUILD_METADATA_SOURCE_MISMATCH/.test(item.message)), JSON.stringify(foreignExecute.diagnostics));
+
+    const timeoutEvents = [];
+    let timeoutWaitCount = 0;
+    const timeoutExecute = await callCppBuildExecuteAcceleratorTool({
+      root: buildMetaRoot, buildDir: buildMetaDir, operation: 'build', targets: ['sample'],
+      configuration: 'Debug', timeoutMs: 5000,
+    }, 5000, {
+      ...fakeExecuteDeps,
+      acquireMutationLocks: async (resources) => {
+        const resolvedResources = resources.map((value) => path.resolve(value));
+        timeoutEvents.push(['lock', ...resolvedResources]);
+        return async () => { timeoutEvents.push(['release', ...resolvedResources]); };
+      },
+      startProcess: async () => { timeoutEvents.push(['start']); return { structuredContent: { pid: 81234 } }; },
+      waitProcess: async () => {
+        timeoutWaitCount += 1;
+        timeoutEvents.push([timeoutWaitCount === 1 ? 'wait' : 'cleanup-wait']);
+        return timeoutWaitCount === 1
+          ? { completed: false, timedOut: true, processSucceeded: false, exitCode: null, tail: 'timed out' }
+          : { completed: true, timedOut: false, processSucceeded: false, exitCode: 1, tail: 'terminated' };
+      },
+      terminateProcess: async (_pid, cause) => { timeoutEvents.push(['terminate', cause]); return true; },
+    });
+    assert.equal(timeoutExecute.succeeded, false);
+    assert.equal(timeoutExecute.build.timedOut, true);
+    assert.equal(timeoutExecute.build.terminationAttempted, true);
+    assert.equal(timeoutExecute.build.terminationConfirmed, true);
+    assert(timeoutEvents.some((event) => event[0] === 'lock' && event.includes(path.resolve(buildMetaDir))), JSON.stringify(timeoutEvents));
+    const terminateIndex = timeoutEvents.findIndex((event) => event[0] === 'terminate');
+    const buildReleaseIndex = timeoutEvents.findIndex((event) => event[0] === 'release' && event.includes(path.resolve(buildMetaDir)));
+    assert(terminateIndex >= 0 && buildReleaseIndex > terminateIndex, JSON.stringify(timeoutEvents));
+
+    const noisyOutput = Array.from({ length: 20_500 }, () => 'progress');
+    noisyOutput[noisyOutput.length - 1] = 'src/tail.cpp:77:3: error: tail-only failure';
+    const noisyExecute = await callCppBuildExecuteAcceleratorTool({
+      root: buildMetaRoot, buildDir: buildMetaDir, operation: 'build', targets: ['sample'],
+      configuration: 'Debug', timeoutMs: 5000,
+    }, 5000, {
+      ...fakeExecuteDeps,
+      startProcess: async () => ({ structuredContent: { pid: 82345 }, content: [{ type: 'text', text: 'started' }] }),
+      waitProcess: async () => ({
+        completed: true, timedOut: false, processSucceeded: false, exitCode: 1, runtimeMs: 5, tail: 'tail-only failure',
+      }),
+      readProcessOutputPage: (_pid, offset, length) => {
+        const totalLines = noisyOutput.length;
+        const readFrom = offset < 0 ? Math.max(0, totalLines + offset) : Math.min(offset, totalLines);
+        const lines = noisyOutput.slice(readFrom, readFrom + length);
+        return {
+          lines, totalLines, readFrom, readCount: lines.length, remaining: Math.max(0, totalLines - readFrom - lines.length),
+          isComplete: true, exitCode: 1,
+        };
+      },
+    });
+    assert.equal(noisyExecute.succeeded, false);
+    assert(noisyExecute.diagnostics.some((item) =>
+      item.file === 'src/tail.cpp' && item.line === 77 && item.column === 3 && item.message.includes('tail-only failure')
+    ), JSON.stringify(noisyExecute.diagnostics));
+
+    const ambiguousDir = path.join(buildMetaRoot, 'build-secondary');
+    await fs.mkdir(ambiguousDir, { recursive: true });
+    await fs.writeFile(path.join(ambiguousDir, 'CMakeCache.txt'), [
+      'CMAKE_GENERATOR:INTERNAL=Ninja',
+      `CMAKE_HOME_DIRECTORY:INTERNAL=${buildMetaRoot.replace(/\\/g, '/')}`,
+      '',
+    ].join('\n'), 'utf8');
+    const ambiguousBuild = await callCppBuildExecuteAcceleratorTool({
+      root: buildMetaRoot, operation: 'build', targets: ['sample'], timeoutMs: 5000,
+    }, 5000, fakeExecuteDeps);
+    assert.equal(ambiguousBuild.succeeded, false, JSON.stringify(ambiguousBuild));
+    assert.equal(ambiguousBuild.buildDir, null);
+    assert(ambiguousBuild.diagnostics.some((item) => item.message.includes('CPP_BUILD_TREE_AMBIGUOUS')));
+    await fs.rm(ambiguousDir, { recursive: true, force: true });
+
+    const configureAutoRoot = path.join(root, 'configure-auto-repo');
+    const configureAutoBuild = path.join(configureAutoRoot, 'preset-build');
+    const configureAutoToolDir = path.join(root, 'configure-auto-host-tools');
+    const configureAutoCmake = path.join(configureAutoToolDir, process.platform === 'win32' ? 'cmake.exe' : 'cmake');
+    const configureAutoCtest = path.join(configureAutoToolDir, process.platform === 'win32' ? 'ctest.exe' : 'ctest');
+    await fs.mkdir(configureAutoRoot, { recursive: true });
+    await fs.mkdir(configureAutoToolDir, { recursive: true });
+    await fs.writeFile(configureAutoCmake, '', 'utf8');
+    await fs.writeFile(configureAutoCtest, '', 'utf8');
+    await fs.writeFile(path.join(configureAutoRoot, 'CMakePresets.json'), JSON.stringify({
+      version: 3, configurePresets: [{ name: 'auto', binaryDir: '${sourceDir}/preset-build' }],
+    }), 'utf8');
+    const configureDeps = {
+      ...fakeExecuteDeps,
+      startProcess: async (processArgs) => {
+        if (Array.isArray(processArgs.args) && processArgs.args[0] === '--preset') {
+          await fs.mkdir(configureAutoBuild, { recursive: true });
+          await fs.writeFile(path.join(configureAutoBuild, 'CMakeCache.txt'), [
+            `CMAKE_COMMAND:INTERNAL=${configureAutoCmake}`,
+            `CMAKE_CTEST_COMMAND:INTERNAL=${configureAutoCtest}`,
+            `CMAKE_MAKE_PROGRAM:FILEPATH=${configureAutoCmake}`,
+            'CMAKE_GENERATOR:INTERNAL=Ninja',
+            `CMAKE_HOME_DIRECTORY:INTERNAL=${configureAutoRoot.replace(/\\/g, '/')}`,
+            'CMAKE_BUILD_TYPE:STRING=Debug',
+            '',
+          ].join('\n'), 'utf8');
+        }
+        return { structuredContent: { pid: fakePid++ }, content: [{ type: 'text', text: 'started' }] };
+      },
+    };
+    const configuredByPreset = await callCppBuildExecuteAcceleratorTool({
+      root: configureAutoRoot, operation: 'build', targets: ['sample'],
+      configureMode: 'if_missing', configurePreset: 'auto', timeoutMs: 5000,
+    }, 5000, configureDeps);
+    assert.equal(configuredByPreset.succeeded, true, JSON.stringify(configuredByPreset));
+    assert.equal(path.resolve(configuredByPreset.buildDir), path.resolve(configureAutoBuild));
+    assert.equal(configuredByPreset.buildDirSource, 'configure-preset');
+    assert.equal(configuredByPreset.configure.executed, true);
+    await fs.rm(configureAutoRoot, { recursive: true, force: true });
+    await fs.rm(configureAutoToolDir, { recursive: true, force: true });
+
     const buildContext = await callBuiltinAcceleratorTool('cpp_build_context', {
       root: buildMetaRoot, buildDir: buildMetaDir, changedFiles: ['src/main.cpp'], includeTests: false, operation: 'build',
     });
@@ -853,6 +1109,25 @@ async function main() {
     assert.deepEqual(buildContext.plan.process.args, ['--build', path.resolve(buildMetaDir), '--target', 'sample']);
     assert.equal(buildContext.metadata.cmake.targetCount, 1);
     assert(buildContext.contextFingerprint.startsWith('sha256:'));
+
+    const compilerDiagnostics = normalizeCppBuildDiagnostics([
+      'src/scanner.cpp:123:9: error: broken expression',
+      'src/warn.cpp:5:2: warning: risky conversion',
+      'C:\\repo\\main.cpp(44,7): error C2143: syntax error: missing ; before }',
+      'ninja: error: build stopped: subcommand failed.',
+      'CMake Error at CMakeLists.txt:17 (message): fatal config',
+    ], 'build', 'clang');
+    assert.deepEqual(compilerDiagnostics.map((item) => item.tool), ['clang', 'clang', 'msvc', 'ninja', 'cmake']);
+    assert.equal(compilerDiagnostics[0].file, 'src/scanner.cpp');
+    assert.equal(compilerDiagnostics[0].line, 123);
+    assert.equal(compilerDiagnostics[0].column, 9);
+    const ctestDiagnostics = normalizeCppBuildDiagnostics([
+      '1/3 Test #2: parser_test ........***Failed    0.01 sec',
+      'Errors while running CTest',
+      'No tests were found!!!',
+    ], 'test');
+    assert.equal(ctestDiagnostics.length, 3);
+    assert(ctestDiagnostics.every((item) => item.tool === 'ctest' && item.severity === 'error'));
 
     const headerImpact = await callBuiltinAcceleratorTool('cpp_build_impact', {
       root: buildMetaRoot, buildDir: buildMetaDir, changedFiles: ['include/shared.hpp'], includeTests: false,
@@ -887,6 +1162,7 @@ async function main() {
     await fs.rm(newerErrorIndex, { force: true });
 
     await fs.rm(buildMetaRoot, { recursive: true, force: true });
+    await fs.rm(syntheticCmakeBin, { recursive: true, force: true });
 
     await expectReject(
       () => callBuiltinAcceleratorTool('read_ranges', {

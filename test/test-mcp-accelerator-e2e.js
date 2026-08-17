@@ -104,14 +104,16 @@ async function main() {
   const cppSourceFile = path.join(sourceDir, 'sample.cpp');
   const verifyScript = path.join(root, 'verify.mjs');
   const buildDir = path.join(root, 'build');
+  const cmakeToolDir = path.join(home, 'cmake-tools');
   await fs.mkdir(sourceDir, { recursive: true });
   await fs.mkdir(buildDir, { recursive: true });
+  await fs.mkdir(cmakeToolDir, { recursive: true });
   await fs.mkdir(configDir, { recursive: true });
   await fs.writeFile(sourceFile, 'export const targetValue = "before";\n', 'utf8');
   await fs.writeFile(cppSourceFile, 'int sample(){ return 1; }\n', 'utf8');
   await fs.writeFile(verifyScript, "import fs from 'node:fs';\nconst text=fs.readFileSync(process.argv[2],'utf8');\nconsole.log(text.includes('after')?'E2E_OK':'E2E_BAD');\n", 'utf8');
-  const cmakeExecutable = path.join(buildDir, process.platform === 'win32' ? 'cmake.exe' : 'cmake').replace(/\\/g, '/');
-  const ctestExecutable = path.join(buildDir, process.platform === 'win32' ? 'ctest.exe' : 'ctest').replace(/\\/g, '/');
+  const cmakeExecutable = path.join(cmakeToolDir, process.platform === 'win32' ? 'cmake.exe' : 'cmake').replace(/\\/g, '/');
+  const ctestExecutable = path.join(cmakeToolDir, process.platform === 'win32' ? 'ctest.exe' : 'ctest').replace(/\\/g, '/');
   await fs.writeFile(cmakeExecutable, '', 'utf8');
   await fs.writeFile(ctestExecutable, '', 'utf8');
   await fs.writeFile(path.join(buildDir, 'CMakeCache.txt'), [
@@ -119,6 +121,7 @@ async function main() {
     `CMAKE_CTEST_COMMAND:INTERNAL=${ctestExecutable}`,
     `CMAKE_MAKE_PROGRAM:FILEPATH=${cmakeExecutable}`,
     'CMAKE_GENERATOR:INTERNAL=Ninja',
+    `CMAKE_HOME_DIRECTORY:INTERNAL=${root.replace(/\\/g, '/')}`,
     '',
   ].join('\n'), 'utf8');
   git(root, 'init');
@@ -142,10 +145,50 @@ async function main() {
     });
     client.notify('notifications/initialized');
 
+    // Warm the Windows process owner so the correlation check measures response
+    // routing rather than first-use helper compilation.
+    await client.tool('start_process', {
+      executable: process.execPath, args: ['-e', 'process.exit(0)'], cwd: root,
+      execution_kind: 'finite', pty: 'never', timeout_ms: 5000,
+    }, 10000);
+    let slowResolvedAt = 0;
+    let fastResolvedAt = 0;
+    const slowResponse = client.tool('start_process', {
+      executable: process.execPath, args: ['-e', 'setTimeout(() => process.exit(7), 400)'], cwd: root,
+      execution_kind: 'finite', pty: 'never', timeout_ms: 2000,
+    }, 10000).then((result) => { slowResolvedAt = Date.now(); return result; });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const fastResponse = client.tool('start_process', {
+      executable: process.execPath, args: ['-e', 'process.exit(3)'], cwd: root,
+      execution_kind: 'finite', pty: 'never', timeout_ms: 2000,
+    }, 10000).then((result) => { fastResolvedAt = Date.now(); return result; });
+    const [slowResult, fastResult] = await Promise.all([slowResponse, fastResponse]);
+    assert.equal(slowResult.structuredContent?.exitCode, 7, JSON.stringify(slowResult.structuredContent));
+    assert.equal(fastResult.structuredContent?.exitCode, 3, JSON.stringify(fastResult.structuredContent));
+    assert(fastResolvedAt > 0 && slowResolvedAt > fastResolvedAt,
+      `JSON-RPC responses did not complete out of order as expected: fast=${fastResolvedAt} slow=${slowResolvedAt}`);
+
+    const retrievalStartedAt = Date.now();
     const searchStarted = await client.tool('start_search', {
       path: root, pattern: 'targetValue', searchType: 'content', literalSearch: true,
       maxResults: 20, contextLines: 0, timeout_ms: 5000,
     });
+    const searchResolvedAt = Date.now();
+    const readAfterSearch = await client.tool('read_file', { path: sourceFile, offset: 0, length: 20 }, 5000);
+    const readResolvedAt = Date.now();
+    const writeAfterRead = await client.tool('write_file', {
+      path: sourceFile, content: 'export const targetValue = \"before\";\n', mode: 'rewrite',
+    }, 5000);
+    const writeResolvedAt = Date.now();
+    assert(searchResolvedAt - retrievalStartedAt < 1500,
+      `start_search response was held after local completion: ${searchResolvedAt - retrievalStartedAt}ms`);
+    assert(readResolvedAt - searchResolvedAt < 1500,
+      `read_file response was held after preceding start_search: ${readResolvedAt - searchResolvedAt}ms`);
+    assert(writeResolvedAt - readResolvedAt < 1500,
+      `write_file response was held after preceding read_file: ${writeResolvedAt - readResolvedAt}ms`);
+    assert(textOf(readAfterSearch).includes('targetValue'), `read_file missed fixture after start_search: ${textOf(readAfterSearch)}`);
+    assert(textOf(writeAfterRead).includes('Successfully'), `write_file did not return success promptly: ${textOf(writeAfterRead)}`);
+    assert.equal(await fs.readFile(sourceFile, 'utf8'), 'export const targetValue = \"before\";\n');
     const searchMatch = textOf(searchStarted).match(/session:\s*(search_[^\s]+)/);
     assert(searchMatch, `start_search did not publish a session id: ${textOf(searchStarted)}`);
     searchSessionId = searchMatch[1];

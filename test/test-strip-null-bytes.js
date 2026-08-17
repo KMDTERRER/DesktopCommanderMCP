@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Regression tests for stripNullBytes (remote-device/remote-channel.ts).
+ * Regression tests for stripNullBytes (remote-device/remote-result-contract.ts).
  *
  * Postgres rejects a NUL (U+0000) in BOTH jsonb and text with 22P05, which
  * stranded remote calls at 'executing' until the 5-minute timeout. The first
@@ -17,7 +17,7 @@
  * Run: npm run build && node test/test-strip-null-bytes.js
  */
 
-import { stripNullBytes } from '../dist/remote-device/remote-channel.js';
+import { stripNullBytes } from '../dist/remote-device/remote-result-contract.js';
 
 const NUL = String.fromCharCode(0);
 const BACKSLASH = String.fromCharCode(92);

@@ -501,7 +501,7 @@ export class TerminalManager {
     // helper's close event authoritative for tree completion.
     const jobOwned = process.platform === 'win32' && !spawnOptions.shell
       ? await spawnWindowsJobOwnedProcess(
-          spawnConfig.executable, spawnConfig.args, spawnOptions, spawnConfig.windowsVerbatim,
+          spawnConfig.executable, spawnConfig.args, spawnOptions, spawnConfig.windowsVerbatim, timeoutMs,
         )
       : null;
     const childProcess = jobOwned?.process ?? spawn(spawnConfig.executable, spawnConfig.args, spawnOptions);

@@ -6,18 +6,30 @@ import { callBuildMetadataAcceleratorTool, revalidateBuildMetadataSnapshot, type
 import { readFileBounded } from '../utils/bounded-file-read.js';
 import { runWithAbortableTimeout } from '../utils/withTimeout.js';
 import { PROCESS_WAIT_DEFAULT_MS } from '../utils/process-wait-contract.js';
+import { requireConfiguredExecutable } from '../utils/configured-executable.js';
 
 const MAX_OPERATION_TIMEOUT_MS = 45_000;
 const MAX_PRESET_FILE_BYTES = 4 * 1024 * 1024;
+const MAX_PRESET_FILES = 32;
+const MAX_PRESET_INCLUDE_DEPTH = 8;
 const MAX_TARGETS = 50;
+const MAX_TESTS = 50;
+const MAX_PARALLELISM = 256;
 
 type BuildOperation = 'build' | 'test';
-type PresetFingerprint = {
+type BuildParallelism = number | 'project';
+export type PresetFingerprint = {
   name: string;
   path: string;
   sha256: string;
   size: number;
   mtimeMs: number;
+};
+
+type LoadedPresetFile = {
+  fingerprint: PresetFingerprint;
+  canonicalPath: string;
+  includes: string[];
 };
 
 function slash(value: string): string {
@@ -40,7 +52,7 @@ function isInside(root: string, candidate: string): boolean {
 }
 
 function assertArguments(args: Record<string, unknown>): void {
-  const allowed = new Set(['root', 'buildDir', 'operation', 'preset', 'targets', 'configuration']);
+  const allowed = new Set(['root', 'buildDir', 'operation', 'preset', 'targets', 'tests', 'configuration', 'parallelism', 'outputOnFailure', 'noTestsError']);
   const unknown = Object.keys(args).filter((key) => !allowed.has(key)).sort();
   if (unknown.length > 0) throw new Error(`cpp_build_plan received unsupported argument(s): ${unknown.join(', ')}.`);
 }
@@ -65,12 +77,33 @@ function requestedTargets(value: unknown, operation: BuildOperation): string[] {
   return [...new Set(targets)];
 }
 
-async function presetFingerprint(
-  root: string,
-  name: string,
-  deadlineAt: number,
-): Promise<PresetFingerprint | null> {
-  const lexical = path.join(root, name);
+function requestedTests(value: unknown, operation: BuildOperation): string[] {
+  if (value === undefined) return [];
+  if (operation !== 'test') throw new Error('cpp_build_plan.tests is only valid for test operations.');
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_TESTS) {
+    throw new Error(`cpp_build_plan.tests must contain 1-${MAX_TESTS} test names.`);
+  }
+  return [...new Set(value.map((item, index) => boundedToken(item, `cpp_build_plan.tests[${index}]`)))];
+}
+
+function requestedParallelism(value: unknown): BuildParallelism {
+  if (value === undefined || value === 'project') return 'project';
+  if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > MAX_PARALLELISM) {
+    throw new Error(`cpp_build_plan.parallelism must be 'project' or an integer from 1 to ${MAX_PARALLELISM}.`);
+  }
+  return value as number;
+}
+
+function exactTestRegex(tests: string[]): string {
+  const escaped = tests.map((test) => test.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  return `^(${escaped.join('|')})$`;
+}
+
+async function loadPresetFile(
+  root: string, requestedPath: string, deadlineAt: number, optional: boolean,
+): Promise<LoadedPresetFile | null> {
+  const lexical = path.isAbsolute(requestedPath) ? path.resolve(requestedPath) : path.resolve(root, requestedPath);
+  if (!isInside(root, lexical)) throw new Error(`Preset include escapes repository root: ${requestedPath}`);
   let initial;
   try {
     initial = await runWithAbortableTimeout(
@@ -79,7 +112,10 @@ async function presetFingerprint(
       `Stat cpp_build_plan preset file ${lexical}`,
     );
   } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    if (optional && (error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      throw new Error(`CPP_PRESET_INCLUDE_MISSING: included preset file does not exist: ${requestedPath}`);
+    }
     throw error;
   }
   if (!initial.isFile() && !initial.isSymbolicLink()) throw new Error(`Preset path is not a file: ${lexical}`);
@@ -88,14 +124,14 @@ async function presetFingerprint(
     remaining(deadlineAt, 'cpp_build_plan preset resolution'),
     `Resolve cpp_build_plan preset file ${lexical}`,
   );
-  if (!isInside(root, canonical)) throw new Error(`Preset file escapes repository root: ${name}`);
+  if (!isInside(root, canonical)) throw new Error(`Preset file resolves outside repository root: ${requestedPath}`);
   const before = await runWithAbortableTimeout(
     (_signal) => fs.stat(canonical),
     remaining(deadlineAt, 'cpp_build_plan preset stat'),
     `Stat resolved cpp_build_plan preset file ${canonical}`,
   );
   if (!before.isFile()) throw new Error(`Resolved preset path is not a file: ${canonical}`);
-  if (before.size > MAX_PRESET_FILE_BYTES) throw new Error(`Preset file exceeds ${MAX_PRESET_FILE_BYTES} bytes: ${name}`);
+  if (before.size > MAX_PRESET_FILE_BYTES) throw new Error(`Preset file exceeds ${MAX_PRESET_FILE_BYTES} bytes: ${canonical}`);
   const bytes = await runWithAbortableTimeout(
     (signal) => readFileBounded(canonical, MAX_PRESET_FILE_BYTES, signal, 'cpp_build_plan preset file'),
     remaining(deadlineAt, 'cpp_build_plan preset read'),
@@ -107,34 +143,90 @@ async function presetFingerprint(
     `Re-stat cpp_build_plan preset file ${canonical}`,
   );
   if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || bytes.length !== after.size) {
-    throw new Error(`Preset file changed while cpp_build_plan was reading it: ${name}`);
+    throw new Error(`Preset file changed while cpp_build_plan was reading it: ${canonical}`);
   }
+  let parsed: unknown;
+  try { parsed = JSON.parse(bytes.toString('utf8')); }
+  catch (error) {
+    throw new Error(`Invalid CMake preset JSON ${canonical}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const object = recordValue(parsed);
+  if (!object) throw new Error(`CMake preset root must be an object: ${canonical}`);
+  const rawIncludes = object.include;
+  if (rawIncludes !== undefined && (!Array.isArray(rawIncludes) || rawIncludes.some((item) => typeof item !== 'string'))) {
+    throw new Error(`CMake preset include must be an array of strings: ${canonical}`);
+  }
+  const includes = (rawIncludes as string[] | undefined) ?? [];
+  const name = slash(path.relative(root, canonical)) || path.basename(canonical);
   return {
-    name,
-    path: slash(canonical),
-    size: bytes.length,
-    mtimeMs: after.mtimeMs,
-    sha256: `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`,
+    canonicalPath: canonical, includes,
+    fingerprint: {
+      name, path: slash(canonical), size: bytes.length, mtimeMs: after.mtimeMs,
+      sha256: `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`,
+    },
   };
 }
 
+export async function collectCmakePresetDependencies(
+  rootValue: string, timeoutMs = 5_000,
+): Promise<PresetFingerprint[]> {
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > MAX_OPERATION_TIMEOUT_MS) {
+    throw new Error(`CMake preset dependency timeout must be an integer from 100 to ${MAX_OPERATION_TIMEOUT_MS}ms.`);
+  }
+  const deadlineAt = Date.now() + timeoutMs;
+  const root = path.resolve(rootValue);
+  const visited = new Map<string, PresetFingerprint>();
+  const visiting = new Set<string>();
+
+  const visit = async (requestedPath: string, depth: number, optional = false): Promise<void> => {
+    if (depth > MAX_PRESET_INCLUDE_DEPTH) {
+      throw new Error(`CPP_PRESET_INCLUDE_DEPTH: preset include depth exceeds ${MAX_PRESET_INCLUDE_DEPTH}.`);
+    }
+    const loaded = await loadPresetFile(root, requestedPath, deadlineAt, optional);
+    if (!loaded) return;
+    const identity = process.platform === 'win32' ? loaded.canonicalPath.toLowerCase() : loaded.canonicalPath;
+    if (visited.has(identity)) return;
+    if (visiting.has(identity)) throw new Error(`CPP_PRESET_INCLUDE_CYCLE: preset include cycle reaches ${loaded.fingerprint.name}.`);
+    if (visited.size + visiting.size >= MAX_PRESET_FILES) {
+      throw new Error(`CPP_PRESET_FILE_LIMIT: preset dependency set exceeds ${MAX_PRESET_FILES} files.`);
+    }
+    visiting.add(identity);
+    try {
+      for (const rawInclude of loaded.includes) {
+        if (!rawInclude || rawInclude.length > 4096 || /[\0\r\n]/.test(rawInclude)) {
+          throw new Error(`CPP_PRESET_INCLUDE_INVALID: invalid include in ${loaded.fingerprint.name}.`);
+        }
+        if (rawInclude.includes('$')) {
+          throw new Error(
+            `CPP_PRESET_DYNAMIC_INCLUDE_UNSUPPORTED: ${loaded.fingerprint.name} uses a macro-expanded include '${rawInclude}'. ` +
+            'Use the low-level CMake execution path for this dynamic preset layout.',
+          );
+        }
+        const includePath = path.isAbsolute(rawInclude)
+          ? path.resolve(rawInclude) : path.resolve(path.dirname(loaded.canonicalPath), rawInclude);
+        if (!isInside(root, includePath)) {
+          throw new Error(`CPP_PRESET_INCLUDE_OUTSIDE_ROOT: ${loaded.fingerprint.name} includes ${rawInclude} outside repository root.`);
+        }
+        await visit(includePath, depth + 1);
+      }
+    } finally {
+      visiting.delete(identity);
+    }
+    visited.set(identity, loaded.fingerprint);
+  };
+
+  await visit(path.join(root, 'CMakePresets.json'), 0, true);
+  await visit(path.join(root, 'CMakeUserPresets.json'), 0, true);
+  return [...visited.values()].sort((a, b) => a.path.localeCompare(b.path));
+}
+
 async function verifyExecutable(
-  executable: unknown, label: string, expectedName: 'cmake' | 'ctest', deadlineAt: number,
+  executable: unknown, label: string, expectedName: 'cmake' | 'ctest',
+  repositoryRoot: string, buildDir: string, deadlineAt: number,
 ): Promise<string> {
-  if (typeof executable !== 'string' || !path.isAbsolute(executable)) {
-    throw new Error(`${label} is unavailable in the configured CMake cache.`);
-  }
-  const basename = path.basename(executable).toLowerCase();
-  if (basename !== expectedName && basename !== `${expectedName}.exe`) {
-    throw new Error(`${label} does not identify the expected ${expectedName} executable: ${executable}`);
-  }
-  const stats = await runWithAbortableTimeout(
-    (_signal) => fs.stat(executable),
-    remaining(deadlineAt, `${label} stat`),
-    `Stat ${label} ${executable}`,
-  );
-  if (!stats.isFile()) throw new Error(`${label} does not resolve to a file: ${executable}`);
-  return executable;
+  return requireConfiguredExecutable(executable, {
+    repositoryRoot, buildDir, deadlineAt, label, expectedNames: [expectedName], projectLocalPolicy: 'allow',
+  });
 }
 
 function recordValue(value: unknown): Record<string, unknown> | undefined {
@@ -219,6 +311,16 @@ export async function callCppBuildPlanAcceleratorTool(
     ? undefined
     : boundedToken(args.configuration, 'cpp_build_plan.configuration', 128);
   const targets = requestedTargets(args.targets, typedOperation);
+  const tests = requestedTests(args.tests, typedOperation);
+  const parallelism = requestedParallelism(args.parallelism);
+  const outputOnFailure = args.outputOnFailure === true;
+  const noTestsError = args.noTestsError === true;
+  if (args.outputOnFailure !== undefined && typeof args.outputOnFailure !== 'boolean') {
+    throw new Error('cpp_build_plan.outputOnFailure must be boolean.');
+  }
+  if (args.noTestsError !== undefined && typeof args.noTestsError !== 'boolean') {
+    throw new Error('cpp_build_plan.noTestsError must be boolean.');
+  }
 
   const metadata = metadataSnapshot ?? await callBuildMetadataAcceleratorTool({
     root: args.root,
@@ -239,15 +341,14 @@ export async function callCppBuildPlanAcceleratorTool(
   const codemodelSha256 = typeof codemodelRecord?.sha256 === 'string' ? codemodelRecord.sha256 : null;
   const generatorName = typeof generatorRecord?.name === 'string' ? generatorRecord.name : null;
   const executable = typedOperation === 'build'
-    ? await verifyExecutable(cacheValues.CMAKE_COMMAND, 'CMAKE_COMMAND', 'cmake', deadlineAt)
-    : await verifyExecutable(cacheValues.CMAKE_CTEST_COMMAND, 'CMAKE_CTEST_COMMAND', 'ctest', deadlineAt);
+    ? await verifyExecutable(cacheValues.CMAKE_COMMAND, 'CMAKE_COMMAND', 'cmake', repositoryRoot, buildDir, deadlineAt)
+    : await verifyExecutable(cacheValues.CMAKE_CTEST_COMMAND, 'CMAKE_CTEST_COMMAND', 'ctest', repositoryRoot, buildDir, deadlineAt);
 
   const environment = await configuredEnvironment(cacheValues, typedOperation, deadlineAt);
 
-  const presetFiles = (await Promise.all([
-    presetFingerprint(repositoryRoot, 'CMakePresets.json', deadlineAt),
-    presetFingerprint(repositoryRoot, 'CMakeUserPresets.json', deadlineAt),
-  ])).filter((item): item is PresetFingerprint => item !== null);
+  const presetFiles = preset
+    ? await collectCmakePresetDependencies(repositoryRoot, remaining(deadlineAt, 'cpp_build_plan preset dependencies'))
+    : [];
   if (preset && presetFiles.length === 0) {
     throw new Error('cpp_build_plan.preset was provided but the project has no CMakePresets.json or CMakeUserPresets.json.');
   }
@@ -265,10 +366,15 @@ export async function callCppBuildPlanAcceleratorTool(
     else processArgs.push(buildDir);
     if (configuration) processArgs.push('--config', configuration);
     if (targets.length > 0) processArgs.push('--target', ...targets);
+    if (typeof parallelism === 'number') processArgs.push('--parallel', String(parallelism));
   } else {
     if (preset) processArgs.push('--preset', preset);
     else processArgs.push('--test-dir', buildDir);
     if (configuration) processArgs.push('-C', configuration);
+    if (tests.length > 0) processArgs.push('--tests-regex', exactTestRegex(tests));
+    if (typeof parallelism === 'number') processArgs.push('--parallel', String(parallelism));
+    if (outputOnFailure) processArgs.push('--output-on-failure');
+    if (noTestsError) processArgs.push('--no-tests=error');
   }
 
   const snapshotValidation = await revalidateBuildMetadataSnapshot(
@@ -290,6 +396,10 @@ export async function callCppBuildPlanAcceleratorTool(
     operation: typedOperation,
     executable: slash(executable),
     args: processArgs,
+    tests,
+    parallelism,
+    outputOnFailure,
+    noTestsError,
     environment: { pathPrepend: environment.pathPrepend, qtPluginPath: environment.qtPluginPath },
   };
   return {
@@ -299,7 +409,11 @@ export async function callCppBuildPlanAcceleratorTool(
     source: preset ? 'explicit-preset' : 'configured-build-tree',
     preset: preset ?? null,
     targets,
+    tests,
     configuration: configuration ?? null,
+    parallelism,
+    outputOnFailure,
+    noTestsError,
     process: {
       executable: slash(executable),
       args: processArgs,
@@ -354,7 +468,23 @@ export const CPP_BUILD_PLAN_ACCELERATOR_TOOL = {
         items: { type: 'string' },
         description: 'Optional CMake build targets; build operations only.',
       },
+      tests: {
+        type: 'array',
+        maxItems: MAX_TESTS,
+        items: { type: 'string' },
+        description: 'Optional exact CTest names; test operations only. Converted to one anchored escaped --tests-regex.',
+      },
       configuration: { type: 'string', description: 'Optional Debug/Release-style configuration.' },
+      parallelism: {
+        oneOf: [
+          { type: 'integer', minimum: 1, maximum: MAX_PARALLELISM },
+          { type: 'string', enum: ['project'] },
+        ],
+        default: 'project',
+        description: "Explicit job count, or 'project' to preserve preset/environment/build-system defaults.",
+      },
+      outputOnFailure: { type: 'boolean', default: false, description: 'For CTest, request failed-test output without changing test selection.' },
+      noTestsError: { type: 'boolean', default: false, description: 'For CTest, fail if the selected test set executes zero tests.' },
     },
   },
   recommended_workflow: [
@@ -362,6 +492,7 @@ export const CPP_BUILD_PLAN_ACCELERATOR_TOOL = {
     'Pass an explicit preset only when already selected by project/user context; otherwise use the configured build tree.',
     'Execute the returned process object through desktop-core/start_process, then use wait_process for completion.',
     'Let CMake/CTest own generator, compiler, linker, parallelism and preset semantics; execute the returned reviewed env handoff unchanged so configured toolchain/runtime directories stay available.',
+    'Use exact tests only when already selected by project/impact context; the plan escapes them into one anchored CTest regex.',
   ],
   related_capabilities: [
     'build_metadata',

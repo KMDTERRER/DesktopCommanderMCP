@@ -1,19 +1,26 @@
 // Test script to verify enhanced file reading
 import { readFileInternal } from '../dist/tools/filesystem.js';
+import fs from 'fs/promises';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
 // Get the test directory path
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const TEST_FILE_PATH = join(__dirname, 'test_output', 'file_with_1500_lines.txt');
+const TEST_FILE_PATH = join(__dirname, 'test_output', `file_with_1500_lines-${process.pid}.txt`);
 
 async function testEnhancedReading() {
     let testsPassed = 0;
     let totalTests = 3;
     
-    console.log('Testing enhanced file reading with our 1500-line file...');
-    
+    console.log('Testing enhanced file reading with a generated 1500-line file...');
+    await fs.mkdir(dirname(TEST_FILE_PATH), { recursive: true });
+    await fs.writeFile(
+        TEST_FILE_PATH,
+        Array.from({ length: 1500 }, (_, index) => `line ${index + 1}`).join('\n') + '\n',
+        'utf8',
+    );
+
     try {
         // Test 1: Read first 10 lines
         console.log('\n=== Test 1: Read first 10 lines ===');
@@ -81,15 +88,17 @@ async function testEnhancedReading() {
         
         if (testsPassed === totalTests) {
             console.log('🎉 All tests PASSED!');
-            process.exit(0);
+            process.exitCode = 0;
         } else {
             console.log('❌ Some tests FAILED!');
-            process.exit(1);
+            process.exitCode = 1;
         }
         
     } catch (error) {
         console.error('❌ Test suite failed with error:', error);
-        process.exit(1);
+        process.exitCode = 1;
+    } finally {
+        await fs.rm(TEST_FILE_PATH, { force: true }).catch(() => {});
     }
 }
 

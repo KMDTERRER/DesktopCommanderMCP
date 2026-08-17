@@ -206,35 +206,50 @@ function buildDirNameScore(dir: string): number {
   return 0;
 }
 
-async function discoverBuildDir(root: string, requested: unknown, deadlineAt: number) {
-  if (requested !== undefined) {
-    if (typeof requested !== 'string' || !requested.trim()) throw new Error('build_metadata.buildDir must be a non-empty path.');
-    const resolved = path.isAbsolute(requested) ? requested : path.resolve(root, requested);
-    const buildDir = await validatePath(resolved, remaining(deadlineAt));
-    const stats = await runWithAbortableTimeout(
-      (_signal) => fs.stat(buildDir),
-      remaining(deadlineAt),
-      `Stat build_metadata.buildDir ${buildDir}`,
-    );
-    if (!stats.isDirectory()) throw new Error(`build_metadata.buildDir must be a directory: ${requested}`);
-    return { buildDir, discovered: false, searchedDirectories: 1 };
-  }
+type BuildTreeFileStamp = { path: string; size: number; mtimeMs: number; ctimeMs: number };
+type BuildDirCandidate = {
+  dir: string;
+  score: number;
+  compileDatabase: BuildTreeFileStamp | null;
+  cmakeCache: BuildTreeFileStamp | null;
+  hasCmakeReply: boolean;
+};
 
+async function optionalFileStampWithin(
+  rootDir: string, filePath: string, deadlineAt: number, label: string,
+): Promise<BuildTreeFileStamp | null> {
+  try {
+    const canonical = await canonicalPathWithin(rootDir, filePath, deadlineAt, label);
+    const stats = await runWithAbortableTimeout(
+      (_signal) => fs.stat(canonical), remaining(deadlineAt), `Stat ${label} ${canonical}`,
+    );
+    if (!stats.isFile()) return null;
+    return { path: slash(canonical), size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function collectBuildDirCandidates(root: string, deadlineAt: number) {
   const queue: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
-  const candidates: Array<{ dir: string; score: number }> = [];
+  const candidates: BuildDirCandidate[] = [];
   let searchedDirectories = 0;
   const skipped = new Set(['.git', 'node_modules', '.venv', 'venv', '__pycache__']);
   while (queue.length > 0 && searchedDirectories < MAX_DISCOVERY_DIRECTORIES) {
     remaining(deadlineAt);
     const current = queue.shift()!;
     searchedDirectories += 1;
-    const compileDb = path.join(current.dir, 'compile_commands.json');
-    const hasCompileDb = await isFileWithin(current.dir, compileDb, deadlineAt);
-    const cmakeReply = await hasCmakeReply(current.dir, deadlineAt);
-    if (hasCompileDb || cmakeReply) {
+    const [compileDatabase, hasReply, cmakeCache] = await Promise.all([
+      optionalFileStampWithin(current.dir, path.join(current.dir, 'compile_commands.json'), deadlineAt, 'compile database candidate'),
+      hasCmakeReply(current.dir, deadlineAt),
+      optionalFileStampWithin(current.dir, path.join(current.dir, 'CMakeCache.txt'), deadlineAt, 'CMake cache candidate'),
+    ]);
+    if (compileDatabase || hasReply || cmakeCache) {
       candidates.push({
-        dir: current.dir,
-        score: (hasCompileDb ? 100 : 0) + (cmakeReply ? 60 : 0) + buildDirNameScore(current.dir) - current.depth,
+        dir: current.dir, compileDatabase, cmakeCache, hasCmakeReply: hasReply,
+        score: (compileDatabase ? 100 : 0) + (cmakeCache ? 80 : 0) + (hasReply ? 60 : 0)
+          + buildDirNameScore(current.dir) - current.depth,
       });
     }
     if (current.depth >= MAX_DISCOVERY_DEPTH) continue;
@@ -254,11 +269,115 @@ async function discoverBuildDir(root: string, requested: unknown, deadlineAt: nu
     for (const entry of dirs) queue.push({ dir: path.join(current.dir, entry.name), depth: current.depth + 1 });
   }
   candidates.sort((a, b) => b.score - a.score || a.dir.localeCompare(b.dir));
-  return { buildDir: candidates[0]?.dir ?? root, discovered: Boolean(candidates[0]), searchedDirectories };
+  return { candidates, searchedDirectories };
+}
+
+function cmakeCacheValue(text: string, key: string): string | null {
+  for (const rawLine of text.split(/\r?\n/)) {
+    if (!rawLine || rawLine.startsWith('#') || rawLine.startsWith('//')) continue;
+    const equals = rawLine.indexOf('=');
+    const colon = rawLine.indexOf(':');
+    if (equals <= 0 || colon <= 0 || colon > equals || rawLine.slice(0, colon) !== key) continue;
+    return rawLine.slice(equals + 1);
+  }
+  return null;
+}
+
+async function configuredTreeSourceRoot(candidate: BuildDirCandidate, deadlineAt: number): Promise<string> {
+  if (!candidate.cmakeCache) throw new Error('Configured-tree source validation requires CMakeCache.txt.');
+  const loaded = await readTextBoundedStable(
+    candidate.cmakeCache.path, MAX_CMAKE_CACHE_BYTES, deadlineAt, 'CMake cache source identity',
+  );
+  const source = cmakeCacheValue(loaded.text, 'CMAKE_HOME_DIRECTORY');
+  if (!source || !path.isAbsolute(source)) {
+    throw new Error(`CPP_CMAKE_CACHE_SOURCE_UNVERIFIED: CMAKE_HOME_DIRECTORY is missing or non-absolute in ${candidate.cmakeCache.path}.`);
+  }
+  return validatePath(source, Math.min(10_000, remaining(deadlineAt)));
+}
+
+async function projectOwnedCmakeSourceRoot(
+  canonicalRoot: string, candidate: BuildDirCandidate, deadlineAt: number,
+): Promise<string | null> {
+  try {
+    const sourceRoot = await configuredTreeSourceRoot(candidate, deadlineAt);
+    return isInside(canonicalRoot, sourceRoot) ? sourceRoot : null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ETIMEDOUT') throw error;
+    // A malformed/stale CMake cache is never allowed to become authoritative
+    // metadata merely because its directory name or compile database scored well.
+    return null;
+  }
+}
+
+async function discoverBuildDir(root: string, requested: unknown, deadlineAt: number) {
+  if (requested !== undefined) {
+    if (typeof requested !== 'string' || !requested.trim()) throw new Error('build_metadata.buildDir must be a non-empty path.');
+    const resolved = path.isAbsolute(requested) ? requested : path.resolve(root, requested);
+    const buildDir = await validatePath(resolved, remaining(deadlineAt));
+    const stats = await runWithAbortableTimeout(
+      (_signal) => fs.stat(buildDir),
+      remaining(deadlineAt),
+      `Stat build_metadata.buildDir ${buildDir}`,
+    );
+    if (!stats.isDirectory()) throw new Error(`build_metadata.buildDir must be a directory: ${requested}`);
+    return { buildDir, discovered: false, searchedDirectories: 1 };
+  }
+  const canonicalRoot = await runWithAbortableTimeout(
+    (_signal) => fs.realpath(root), remaining(deadlineAt), `Resolve build_metadata project root ${root}`,
+  );
+  const { candidates, searchedDirectories } = await collectBuildDirCandidates(root, deadlineAt);
+  let compileDatabaseFallback: BuildDirCandidate | null = null;
+  for (const candidate of candidates) {
+    if (candidate.cmakeCache) {
+      if (await projectOwnedCmakeSourceRoot(canonicalRoot, candidate, deadlineAt)) {
+        return { buildDir: candidate.dir, discovered: true, searchedDirectories };
+      }
+      continue;
+    }
+    // A File API reply without its CMakeCache is a stale/unverifiable CMake tree.
+    if (candidate.hasCmakeReply) continue;
+    if (candidate.compileDatabase && !compileDatabaseFallback) compileDatabaseFallback = candidate;
+  }
+  return {
+    buildDir: compileDatabaseFallback?.dir ?? root,
+    discovered: Boolean(compileDatabaseFallback),
+    searchedDirectories,
+  };
+}
+
+export async function discoverConfiguredCmakeTrees(rootValue: string, timeoutMs = 10_000) {
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > MAX_OPERATION_TIMEOUT_MS) {
+    throw new Error(`Configured CMake tree discovery timeout must be an integer from 100 to ${MAX_OPERATION_TIMEOUT_MS}ms.`);
+  }
+  if (!rootValue) throw new Error('Configured CMake tree discovery root is required.');
+  const deadlineAt = Date.now() + timeoutMs;
+  const root = await validatePath(rootValue, remaining(deadlineAt));
+  const canonicalRoot = await runWithAbortableTimeout(
+    (_signal) => fs.realpath(root), remaining(deadlineAt), `Resolve configured-tree project root ${root}`,
+  );
+  const { candidates, searchedDirectories } = await collectBuildDirCandidates(root, deadlineAt);
+  const trees = [];
+  for (const candidate of candidates) {
+    if (!candidate.cmakeCache) continue;
+    const sourceRoot = await projectOwnedCmakeSourceRoot(canonicalRoot, candidate, deadlineAt);
+    if (!sourceRoot) continue;
+    trees.push({
+      buildDir: slash(candidate.dir),
+      sourceRoot: slash(sourceRoot),
+      cachePath: candidate.cmakeCache.path,
+      cacheSize: candidate.cmakeCache.size,
+      cacheMtimeMs: candidate.cmakeCache.mtimeMs,
+      cacheCtimeMs: candidate.cmakeCache.ctimeMs,
+      score: candidate.score,
+      compileDatabaseFound: Boolean(candidate.compileDatabase),
+      fileApiReplyFound: candidate.hasCmakeReply,
+    });
+  }
+  return { repositoryRoot: slash(canonicalRoot), searchedDirectories, trees };
 }
 
 const CMAKE_CACHE_KEYS = new Set([
-  'CMAKE_COMMAND', 'CMAKE_CTEST_COMMAND', 'CMAKE_MAKE_PROGRAM', 'CMAKE_GENERATOR',
+  'CMAKE_COMMAND', 'CMAKE_CTEST_COMMAND', 'CMAKE_MAKE_PROGRAM', 'CMAKE_GENERATOR', 'CMAKE_HOME_DIRECTORY',
   'CMAKE_BUILD_TYPE', 'CMAKE_CONFIGURATION_TYPES', 'CMAKE_C_COMPILER', 'CMAKE_CXX_COMPILER',
   // Tool/runtime roots generated by configured CMake projects. cpp_build_plan
   // uses only these reviewed values to preserve project-owned toolchain/runtime
@@ -990,10 +1109,26 @@ export async function callBuildMetadataAcceleratorTool(
   if (configuration !== undefined && !configuration.trim()) throw new Error('build_metadata.configuration must be non-empty.');
 
   const discovered = await discoverBuildDir(root, args.buildDir, deadlineAt);
-  const [compileDatabase, cmake, cmakeCache] = await Promise.all([
+  // CMakeCache owns the source/build-tree association. Validate it before
+  // reading potentially large compile-database or File API payloads from an
+  // explicit tree so a foreign-but-authorized directory never becomes
+  // authoritative metadata for this root even transiently.
+  const cmakeCache = await readCmakeCache(discovered.buildDir, deadlineAt);
+  if (cmakeCache.found) {
+    const home = cmakeCache.values.CMAKE_HOME_DIRECTORY;
+    if (typeof home !== 'string' || !path.isAbsolute(home)) {
+      throw new Error(`BUILD_METADATA_CMAKE_SOURCE_UNVERIFIED: ${cmakeCache.path} has no absolute CMAKE_HOME_DIRECTORY.`);
+    }
+    const sourceRoot = await validatePath(home, Math.min(10_000, remaining(deadlineAt)));
+    if (!isInside(root, sourceRoot)) {
+      throw new Error(
+        `BUILD_METADATA_SOURCE_MISMATCH: configured tree ${discovered.buildDir} belongs to ${sourceRoot}, not ${root}.`,
+      );
+    }
+  }
+  const [compileDatabase, cmake] = await Promise.all([
     readCompilationDatabase(root, discovered.buildDir, files, includeArguments, maxEntries, deadlineAt),
     readCmakeMetadata(discovered.buildDir, configuration, maxTargets, deadlineAt),
-    readCmakeCache(discovered.buildDir, deadlineAt),
   ]);
   return {
     repositoryRoot: slash(root),

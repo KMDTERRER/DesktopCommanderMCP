@@ -11,6 +11,7 @@ import { DeviceAuthenticator } from '../dist/remote-device/device-authenticator.
 import {
   DesktopCommanderIntegration,
   buildLocalMcpChildEnvironment,
+  localMcpRequestTimeoutMs,
 } from '../dist/remote-device/desktop-commander-integration.js';
 import { isTransientRemoteError } from '../dist/remote-device/transient-remote-error.js';
 import {
@@ -23,6 +24,7 @@ import { validatePathAuthority } from '../dist/tools/path-security.js';
 import { handleGetRecentToolCalls } from '../dist/handlers/history-handlers.js';
 import { toolHistory } from '../dist/utils/toolHistory.js';
 import { featureFlagManager } from '../dist/utils/feature-flags.js';
+import { usageTracker } from '../dist/utils/usageTracker.js';
 import {
   currentClient,
   getToolCallContext,
@@ -43,6 +45,24 @@ async function test(name, fn) {
     console.error(`FAIL ${name}: ${error?.message || error}`);
   }
 }
+await test('usage accounting cannot gate an already-completed tool response', async () => {
+  const originalTrackSuccess = usageTracker.trackSuccess;
+  let started = false;
+  try {
+    usageTracker.trackSuccess = async () => {
+      started = true;
+      return new Promise(() => {});
+    };
+    const startedAt = Date.now();
+    const returned = usageTracker.trackOutcomeNonBlocking('get_more_search_results', true);
+    assert.equal(returned, undefined);
+    assert.equal(started, true, 'background accounting was not started');
+    assert(Date.now() - startedAt < 50, 'non-blocking usage accounting waited for its unresolved operation');
+  } finally {
+    usageTracker.trackSuccess = originalTrackSuccess;
+  }
+});
+
 await test('tool-call context stays isolated across overlapping async work', async () => {
   setCurrentClient({ name: 'local-client', version: '1' });
   const seen = [];
@@ -79,6 +99,18 @@ await test('remote MCP integration preserves the exact argument object', async (
   assert.deepEqual(seenRequest.arguments, args);
   assert.equal(seenRequest._meta.remote, true);
   assert.equal(seenRequest._meta.source, 'regression');
+});
+
+await test('remote MCP client reserves return-path time for cpp_build_execute', async () => {
+  const downstream = { root: 'C:/repo', operation: 'build', timeoutMs: 120_000 };
+  const expected = 135_000;
+  assert.equal(localMcpRequestTimeoutMs('write_file', {
+    path: 'mcp://desktop-accelerators/cpp_build_execute?timeout_ms=130000',
+    content: JSON.stringify(downstream), mode: 'rewrite',
+  }), expected);
+  assert.equal(localMcpRequestTimeoutMs('mcp_call_tool', {
+    server: 'desktop-accelerators', tool: 'cpp_build_execute', arguments: downstream, timeout_ms: 130_000,
+  }), expected);
 });
 
 await test('local MCP child inherits only allowlisted runtime environment controls', async () => {

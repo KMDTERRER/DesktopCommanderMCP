@@ -40,6 +40,7 @@ export interface SearchSession {
   totalMatches: number;
   totalContextLines: number;  // Stored context lines; bounded independently from matches
   resultLimitReached?: boolean;
+  deadlineReached?: boolean;
   wasIncomplete?: boolean;  // Track whether the search ended before a complete scan
   ripgrepComplete: boolean;
   ripgrepExitCode?: number | null;
@@ -188,8 +189,12 @@ function normalizeSearchOptions(options: SearchSessionOptions): SearchSessionOpt
     if (timeoutMs) {
       session.deadlineTimer = setTimeout(() => {
         if (session.isComplete) return;
+        session.deadlineReached = true;
         session.wasIncomplete = true;
         this.stopSearchProcess(session);
+        // ripgrep may already have closed while a non-abortable auxiliary parser
+        // is still running. The deadline itself is terminal for the session.
+        this.finalizeSearchSessionIfReady(session);
       }, timeoutMs);
     }
 
@@ -219,11 +224,14 @@ function normalizeSearchOptions(options: SearchSessionOptions): SearchSessionOpt
         options.literalSearch, // Respect literalSearch flag for Office files
         session.auxiliaryAbortController.signal
       ).then(excelResults => {
+        if (session.isComplete || session.deadlineReached) return;
         // Merge through the same global session budget as ripgrep results.
         for (const result of excelResults) {
           if (!this.storeSearchResult(session, result, false)) break;
         }
       }).catch((err) => {
+        if (session.auxiliaryAbortController.signal.aborted &&
+            (session.deadlineReached || session.resultLimitReached || session.isComplete)) return;
         const message = err instanceof Error ? err.message : String(err);
         session.wasIncomplete = true;
         this.appendSearchError(session, `Excel search incomplete: ${message}\n`);
@@ -249,10 +257,13 @@ function normalizeSearchOptions(options: SearchSessionOptions): SearchSessionOpt
         options.literalSearch, // Respect literalSearch flag for Office files
         session.auxiliaryAbortController.signal
       ).then(docxResults => {
+        if (session.isComplete || session.deadlineReached) return;
         for (const result of docxResults) {
           if (!this.storeSearchResult(session, result, false)) break;
         }
       }).catch((err) => {
+        if (session.auxiliaryAbortController.signal.aborted &&
+            (session.deadlineReached || session.resultLimitReached || session.isComplete)) return;
         const message = err instanceof Error ? err.message : String(err);
         session.wasIncomplete = true;
         this.appendSearchError(session, `DOCX search incomplete: ${message}\n`);
@@ -948,6 +959,7 @@ function normalizeSearchOptions(options: SearchSessionOptions): SearchSessionOpt
   }
 
   private storeSearchResult(session: SearchSession, result: SearchResult, isContext: boolean): boolean {
+    if (session.isComplete || session.deadlineReached) return false;
     const maxMatches = session.options.maxResults ?? DEFAULT_SEARCH_MAX_RESULTS;
     if (isContext) {
       if (session.resultLimitReached) return false;
@@ -981,7 +993,9 @@ function normalizeSearchOptions(options: SearchSessionOptions): SearchSessionOpt
   }
 
   private finalizeSearchSessionIfReady(session: SearchSession): void {
-    if (session.isComplete || !session.ripgrepComplete || session.pendingAuxiliary > 0) return;
+    if (session.isComplete || !session.ripgrepComplete) return;
+    const terminalWithoutAuxiliary = session.deadlineReached || session.resultLimitReached;
+    if (!terminalWithoutAuxiliary && session.pendingAuxiliary > 0) return;
     if (session.deadlineTimer) {
       clearTimeout(session.deadlineTimer);
       session.deadlineTimer = undefined;

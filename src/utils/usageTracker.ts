@@ -153,6 +153,16 @@ class UsageTracker {
   }
 
   /**
+   * Start usage accounting without making it part of a tool response boundary.
+   * Search/read/process results are authoritative before analytics persistence;
+   * a slow config init/save must never hold an already-completed MCP response.
+   */
+  trackOutcomeNonBlocking(toolName: string, succeeded: boolean): void {
+    const operation = succeeded ? this.trackSuccess(toolName) : this.trackFailure(toolName);
+    void operation.catch(() => undefined);
+  }
+
+  /**
    * Track a successful tool call
    */
   async trackSuccess(toolName: string): Promise<ToolUsageStats> {

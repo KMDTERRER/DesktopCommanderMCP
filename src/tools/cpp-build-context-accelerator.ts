@@ -12,6 +12,7 @@ const MAX_METADATA_TARGETS = 500;
 const MAX_RETURNED_TARGETS = 250;
 const MAX_RETURNED_TESTS = 500;
 const MAX_PLAN_TARGETS = 50;
+const MAX_PLAN_TESTS = 50;
 
 type JsonRecord = Record<string, unknown>;
 type ImpactResult = Awaited<ReturnType<typeof callCppBuildImpactAcceleratorTool>>;
@@ -46,7 +47,8 @@ function fingerprint(value: unknown): string {
 function assertArguments(args: Record<string, unknown>): void {
   const allowed = new Set([
     'root', 'buildDir', 'changedFiles', 'configuration', 'includeTests', 'includeProfile',
-    'operation', 'preset', 'targets', 'maxTargets', 'maxTests', 'useAffectedTargets',
+    'operation', 'preset', 'targets', 'tests', 'maxTargets', 'maxTests', 'useAffectedTargets', 'useAffectedTests',
+    'parallelism', 'outputOnFailure', 'noTestsError',
   ]);
   const unknown = Object.keys(args).filter((key) => !allowed.has(key)).sort();
   if (unknown.length > 0) throw new Error(`cpp_build_context received unsupported argument(s): ${unknown.join(', ')}.`);
@@ -57,11 +59,17 @@ function assertArguments(args: Record<string, unknown>): void {
   if (args.includeTests !== undefined && typeof args.includeTests !== 'boolean') throw new Error('cpp_build_context.includeTests must be boolean.');
   if (args.includeProfile !== undefined && typeof args.includeProfile !== 'boolean') throw new Error('cpp_build_context.includeProfile must be boolean.');
   if (args.useAffectedTargets !== undefined && typeof args.useAffectedTargets !== 'boolean') throw new Error('cpp_build_context.useAffectedTargets must be boolean.');
+  if (args.useAffectedTests !== undefined && typeof args.useAffectedTests !== 'boolean') throw new Error('cpp_build_context.useAffectedTests must be boolean.');
+  if (args.tests !== undefined && (!Array.isArray(args.tests) || args.tests.length < 1 || args.tests.length > MAX_PLAN_TESTS)) {
+    throw new Error(`cpp_build_context.tests must contain 1-${MAX_PLAN_TESTS} names when provided.`);
+  }
+  if (args.outputOnFailure !== undefined && typeof args.outputOnFailure !== 'boolean') throw new Error('cpp_build_context.outputOnFailure must be boolean.');
+  if (args.noTestsError !== undefined && typeof args.noTestsError !== 'boolean') throw new Error('cpp_build_context.noTestsError must be boolean.');
   if (args.operation !== undefined && args.operation !== 'build' && args.operation !== 'test') {
     throw new Error("cpp_build_context.operation must be 'build' or 'test'.");
   }
-  if (args.operation === undefined && (args.preset !== undefined || args.targets !== undefined)) {
-    throw new Error('cpp_build_context preset/targets require operation.');
+  if (args.operation === undefined && (args.preset !== undefined || args.targets !== undefined || args.tests !== undefined || args.parallelism !== undefined || args.outputOnFailure !== undefined || args.noTestsError !== undefined)) {
+    throw new Error('cpp_build_context preset/targets/tests/parallelism/outputOnFailure/noTestsError require operation.');
   }
 }
 
@@ -112,6 +120,7 @@ export async function callCppBuildContextAcceleratorTool(
   const includeTests = args.includeTests !== false;
   const includeProfile = args.includeProfile !== false;
   const useAffectedTargets = args.useAffectedTargets !== false;
+  const useAffectedTests = args.useAffectedTests !== false;
   const changedFiles = Array.isArray(args.changedFiles) ? args.changedFiles : [];
 
   const metadata = await callBuildMetadataAcceleratorTool({
@@ -177,7 +186,7 @@ export async function callCppBuildContextAcceleratorTool(
 
   let plan: PlanResult | null = null;
   let metadataSnapshots = 1;
-  let planSelection: 'none' | 'explicit-targets' | 'affected-targets' | 'default-operation' | 'snapshot-changed-default' = 'none';
+  let planSelection: 'none' | 'explicit-targets' | 'affected-targets' | 'explicit-tests' | 'affected-tests' | 'default-operation' | 'snapshot-changed-default' = 'none';
   if (args.operation !== undefined) {
     const planArgs: Record<string, unknown> = {
       root: args.root,
@@ -185,9 +194,13 @@ export async function callCppBuildContextAcceleratorTool(
       operation: args.operation,
       configuration,
       preset: args.preset,
+      parallelism: args.parallelism,
+      outputOnFailure: args.outputOnFailure,
+      noTestsError: args.noTestsError,
     };
     const explicitTargets = Array.isArray(args.targets) ? args.targets : [];
-    if (explicitTargets.length > 0) {
+    const explicitTests = Array.isArray(args.tests) ? args.tests : [];
+    if (args.operation === 'build' && explicitTargets.length > 0) {
       planArgs.targets = explicitTargets;
       planSelection = 'explicit-targets';
     } else if (
@@ -197,6 +210,16 @@ export async function callCppBuildContextAcceleratorTool(
     ) {
       planArgs.targets = impact.affectedTargets;
       planSelection = 'affected-targets';
+    } else if (args.operation === 'test' && explicitTests.length > 0) {
+      planArgs.tests = explicitTests;
+      planSelection = 'explicit-tests';
+    } else if (
+      snapshotValidation.current && args.operation === 'test' && useAffectedTests && impact &&
+      impact.recommendFullTests === false && impact.selectionComplete === true &&
+      impact.affectedTests.length > 0 && impact.affectedTests.length <= MAX_PLAN_TESTS
+    ) {
+      planArgs.tests = impact.affectedTests;
+      planSelection = 'affected-tests';
     } else {
       planSelection = snapshotValidation.current ? 'default-operation' : 'snapshot-changed-default';
     }
@@ -259,15 +282,24 @@ export const CPP_BUILD_CONTEXT_ACCELERATOR_TOOL = {
       operation: { type: 'string', enum: ['build', 'test'] },
       preset: { type: 'string' },
       targets: { type: 'array', minItems: 1, maxItems: MAX_PLAN_TARGETS, items: { type: 'string' } },
+      tests: { type: 'array', minItems: 1, maxItems: MAX_PLAN_TESTS, items: { type: 'string' } },
       maxTargets: { type: 'integer', minimum: 1, maximum: MAX_RETURNED_TARGETS, default: 100 },
       maxTests: { type: 'integer', minimum: 1, maximum: MAX_RETURNED_TESTS, default: 200 },
       useAffectedTargets: { type: 'boolean', default: true },
+      useAffectedTests: { type: 'boolean', default: true },
+      parallelism: {
+        oneOf: [{ type: 'integer', minimum: 1, maximum: 256 }, { type: 'string', enum: ['project'] }],
+        default: 'project',
+      },
+      outputOnFailure: { type: 'boolean', default: false },
+      noTestsError: { type: 'boolean', default: false },
     },
   },
   recommended_workflow: [
     'Use workspace_delta to obtain changed C/C++ paths.',
     'Call cpp_build_context once to reuse a single authoritative build snapshot.',
     'Use profile.serenaHandoff for clangd/Serena, impact for build/test scope, and plan.process for native start_process.',
+    'For test plans, explicit tests win; otherwise a complete non-conservative affected test set may be selected exactly.',
     'Treat conservative impact as a request for wider build/test verification rather than guessing missing dependencies.',
   ],
   related_capabilities: [

@@ -32,7 +32,7 @@ function parseCompatProcessRequest(toolName: string, args: Record<string, unknow
     const server = url.hostname;
     const tool = url.pathname.split('/').filter(Boolean)[0] ?? '';
     const local = (server === 'desktop-core' && (tool === 'start_process' || tool === 'read_process_output' || tool === 'interact_with_process')) ||
-        (server === 'desktop-accelerators' && tool === 'wait_process');
+        (server === 'desktop-accelerators' && (tool === 'wait_process' || tool === 'cpp_build_execute'));
     if (!local) return null;
     let downstream: Record<string, unknown> = {};
     try {
@@ -52,7 +52,7 @@ function localProcessRequest(toolName: string, args: Record<string, unknown>): L
         const server = args.server;
         const tool = args.tool;
         if ((server === 'desktop-core' && (tool === 'start_process' || tool === 'read_process_output' || tool === 'interact_with_process')) ||
-            (server === 'desktop-accelerators' && tool === 'wait_process')) {
+            (server === 'desktop-accelerators' && (tool === 'wait_process' || tool === 'cpp_build_execute'))) {
             return {
                 tool: String(tool),
                 args: normalizeMcpArgumentsObject(args.arguments, 'Remote mcp_call_tool.arguments'),

@@ -16,7 +16,10 @@
  */
 
 import { formatRemoteToolTrace, MCPDevice } from '../dist/remote-device/device.js';
-import { createRemoteOutcomeIdentity, RemoteChannel } from '../dist/remote-device/remote-channel.js';
+import { RemoteChannel } from '../dist/remote-device/remote-channel.js';
+import { createRemoteOutcomeIdentity } from '../dist/remote-device/remote-result-contract.js';
+import { RemoteResultTransport } from '../dist/remote-device/remote-result-transport.js';
+import { SessionTokenOwner } from '../dist/remote-device/session-token-owner.js';
 import { DesktopCommanderIntegration } from '../dist/remote-device/desktop-commander-integration.js';
 import fs from 'fs/promises';
 import os from 'os';
@@ -115,6 +118,9 @@ function makeDevice({ claimResults = [] } = {}) {
     getCurrentUserId: () => 'user-1',
     getCallClaimToken: () => 'test-claim-token',
     getCallClaimMetadata: () => ({ _desktop_commander_claim_token: 'test-claim-token' }),
+    releaseCallClaim: () => {},
+  };
+  device.resultTransport = {
     updateCallResult: async () => {},
     notifyResult: async () => ({ acknowledged: true, attempts: 1, lastStatus: 'test:ok' }),
   };
@@ -248,6 +254,15 @@ function makeRemoteChannel(opts = {}) {
   return { rc, client };
 }
 
+function makeResultTransport(opts = {}) {
+  const tokens = new SessionTokenOwner();
+  tokens.replace({ access_token: 'test-access', refresh_token: 'test-refresh' });
+  const rt = new RemoteResultTransport(tokens);
+  const client = makeFakeClient(opts);
+  rt.client = client;
+  return { rt, client, tokens };
+}
+
 const payloadFor = (id, deviceId = DEVICE_ID) => ({
   new: {
     id,
@@ -256,6 +271,35 @@ const payloadFor = (id, deviceId = DEVICE_ID) => ({
     device_id: deviceId,
     metadata: {},
   },
+});
+
+await test('remote call_id correlation survives out-of-order tool completion', async () => {
+  const { device } = makeDevice();
+  const delivered = [];
+  device.desktop.callClientTool = async (_toolName, args) => {
+    await new Promise((resolve) => realSetTimeout(resolve, args.label === 'slow' ? 120 : 10));
+    return { content: [{ type: 'text', text: args.label }] };
+  };
+  device.resultTransport.updateCallResult = async (callId, status, result, errorMessage) => {
+    delivered.push({ callId, status, text: result?.content?.[0]?.text ?? null, errorMessage });
+  };
+  const routedPayload = (id, label) => ({
+    new: { id, tool_name: 'route_test', tool_args: { label }, device_id: DEVICE_ID, metadata: {} },
+  });
+  const slow = device.handleNewToolCall(routedPayload('call-slow', 'slow'));
+  await new Promise((resolve) => realSetTimeout(resolve, 5));
+  const fast = device.handleNewToolCall(routedPayload('call-fast', 'fast'));
+  await Promise.all([slow, fast]);
+  for (let attempt = 0; attempt < 100 && delivered.length < 2; attempt++) {
+    await new Promise((resolve) => realSetTimeout(resolve, 5));
+  }
+  assert(delivered.length === 2, `expected two delivered outcomes, got ${JSON.stringify(delivered)}`);
+  assert(delivered[0].callId === 'call-fast', `fast call did not complete first: ${JSON.stringify(delivered)}`);
+  const byId = new Map(delivered.map((entry) => [entry.callId, entry]));
+  assert(byId.get('call-fast')?.text === 'fast', `fast result routed to wrong call: ${JSON.stringify(delivered)}`);
+  assert(byId.get('call-slow')?.text === 'slow', `slow result routed to wrong call: ${JSON.stringify(delivered)}`);
+  assert([...byId.values()].every((entry) => entry.status === 'completed' && entry.errorMessage === null),
+    `terminal status/error was cross-routed: ${JSON.stringify(delivered)}`);
 });
 
 await test('non-persistent run preserves an existing persisted auth session', async () => {
@@ -284,10 +328,10 @@ await test('non-persistent run preserves an existing persisted auth session', as
   }
 });
 
-await test('TOKEN_REFRESHED forwards the rotated refresh token to device persistence', async () => {
-  const rc = new RemoteChannel();
+await test('TOKEN_REFRESHED atomically updates the shared session token owner', async () => {
+  const tokens = new SessionTokenOwner();
+  const rc = new RemoteChannel(tokens);
   let authCallback = null;
-  let persisted = null;
   rc.client = {
     auth: {
       setSession: async () => ({ error: null }),
@@ -295,22 +339,67 @@ await test('TOKEN_REFRESHED forwards the rotated refresh token to device persist
       getSession: async () => ({ data: { session: { access_token: 'current-access', refresh_token: 'current-refresh' } } }),
       onAuthStateChange: (callback) => { authCallback = callback; return { data: { subscription: { unsubscribe() {} } } }; },
     },
-    realtime: { setAuth() {} },
+    realtime: { setAuth: async () => {} },
   };
-  rc.setSessionUpdateHandler((session) => { persisted = session; });
 
   await rc.setSession({ access_token: 'old-access', refresh_token: 'old-refresh' });
   assert(authCallback, 'auth state listener was not registered');
   authCallback('TOKEN_REFRESHED', { access_token: 'rotated-access', refresh_token: 'rotated-refresh' });
+  await new Promise((resolve) => setImmediate(resolve));
 
-  assert(persisted?.refresh_token === 'rotated-refresh', 'rotated refresh token was not forwarded to persistence');
-  assert(persisted?.access_token === 'rotated-access', 'rotated access token was not forwarded to persistence');
+  const snapshot = tokens.snapshot();
+  assert(snapshot?.refresh_token === 'rotated-refresh', 'rotated refresh token did not reach token owner');
+  assert(snapshot?.access_token === 'rotated-access', 'rotated access token did not reach token owner');
+});
+
+await test('outbound token lookup is memory-only and reflects rotation immediately', async () => {
+  const tokens = new SessionTokenOwner();
+  tokens.replace({ access_token: 'first-access', refresh_token: 'first-refresh' });
+  assert(await tokens.accessToken() === 'first-access', 'initial token snapshot was not readable');
+  tokens.replace({ access_token: 'rotated-access', refresh_token: 'rotated-refresh' });
+  assert(await tokens.accessToken() === 'rotated-access', 'rotated token was not immediately visible to outbound transport');
+});
+
+await test('result wake uses one HTTP broadcast and has no WebSocket fallback path', async () => {
+  const transport = new RemoteResultTransport(new SessionTokenOwner());
+  let httpCalls = 0;
+  transport.wakeChannel = {
+    httpSend: async () => { httpCalls++; return { success: true }; },
+    send: async () => { throw new Error('WebSocket must not participate in outbound result wake'); },
+  };
+  const outcome = await transport.notifyResult('http-only-result');
+  assert(outcome.acknowledged === true, 'HTTP result wake was not acknowledged');
+  assert(outcome.attempts === 1 && httpCalls === 1, `expected one HTTP wake, got ${httpCalls}`);
 });
 
 
 // --- 1. Exactly-once under dual delivery ------------------------------------
 // Both transports deliver every call during the transition. The DB claim fails
 // OPEN on a transient error, so the in-memory guard is the real guarantee.
+
+await test('operator trace exposes a received call before slow remote claim completes', async () => {
+  const { device } = makeDevice();
+  let releaseClaim;
+  device.remoteChannel.markCallExecuting = async () =>
+    await new Promise((resolve) => { releaseClaim = () => resolve(true); });
+  const originalWrite = process.stderr.write;
+  const lines = [];
+  process.env.DESKTOP_COMMANDER_REMOTE_TOOL_TRACE = 'true';
+  process.stderr.write = ((chunk) => { lines.push(String(chunk)); return true; });
+  try {
+    const pending = device.handleNewToolCall(payloadFor('claim-visible'));
+    await new Promise((resolve) => setImmediate(resolve));
+    const beforeClaim = lines.join('');
+    assert(beforeClaim.includes('[TOOL] ◆ RECV'), `received call stayed invisible behind claim: ${beforeClaim}`);
+    assert(!beforeClaim.includes('▶ START'), `execution start was logged before claim ownership: ${beforeClaim}`);
+    releaseClaim();
+    await pending;
+    assert(lines.join('').includes('▶ START'), 'execution start was not logged after claim ownership');
+  } finally {
+    process.stderr.write = originalWrite;
+    process.env.DESKTOP_COMMANDER_REMOTE_TOOL_TRACE = 'false';
+  }
+});
 
 await test('Remote parent operator trace identifies mcp:// tools without leaking arguments', async () => {
   const { device } = makeDevice();
@@ -336,7 +425,9 @@ await test('Remote parent operator trace identifies mcp:// tools without leaking
     process.env.DESKTOP_COMMANDER_REMOTE_TOOL_TRACE = 'false';
   }
   const trace = lines.join('');
+  assert(trace.includes('[TOOL] ◆ RECV  | call=trace-call-1 | read_file -> mcp://desktop-accelerators/ast_rewrite'), `missing receive trace: ${trace}`);
   assert(trace.includes('[TOOL] ▶ START | call=trace-call-1 | read_file -> mcp://desktop-accelerators/ast_rewrite'), `missing start trace: ${trace}`);
+  assert(trace.indexOf('◆ RECV') < trace.indexOf('▶ START'), `receive trace did not precede execution start: ${trace}`);
   assert(/\[TOOL\] ✓ OK\s+\| call=trace-call-1 \| \d+ms \| read_file -> mcp:\/\/desktop-accelerators\/ast_rewrite/.test(trace), `missing completion trace: ${trace}`);
   assert(!trace.includes('MUST_NOT_REACH_OPERATOR_TRACE'), 'tool arguments leaked into operator trace');
   assert(!trace.includes('timeout_ms'), 'mcp URI query leaked into operator trace');
@@ -394,7 +485,7 @@ await test('the seen-call-id set stays bounded', async () => {
 await test('a completed tool result stays in the durable outbox until remote persistence succeeds', async () => {
   const { device, executed, outboxEntries } = makeDevice();
   let writes = 0;
-  device.remoteChannel.updateCallResult = async () => {
+  device.resultTransport.updateCallResult = async () => {
     writes++;
     if (writes === 1) throw new TypeError('fetch failed');
   };
@@ -415,7 +506,7 @@ await test('slow remote persistence cannot block completed handlers under parall
   let releaseWrites;
   const writeGate = new Promise((resolve) => { releaseWrites = resolve; });
   const deliveryModes = [];
-  device.remoteChannel.updateCallResult = async (_callId, _status, _result, _error, _claim, mode) => {
+  device.resultTransport.updateCallResult = async (_callId, _status, _result, _error, _claim, mode) => {
     deliveryModes.push(mode);
     await writeGate;
   };
@@ -442,19 +533,17 @@ await test('slow remote persistence cannot block completed handlers under parall
   assert(outboxEntries.size === 0, 'released live deliveries did not retire their outbox entries');
 });
 
-await test('live result persistence uses two bounded attempts before durable replay takes over', async () => {
-  const { rc } = makeRemoteChannel();
+await test('live result persistence uses one short bounded attempt before durable replay takes over', async () => {
+  const { rt } = makeResultTransport();
   const client = makeNeverSettlingClient();
-  rc.client = client;
-  rc.callClaimTokens.set('live-never-result', 'test-claim-token');
-  rc.sleep = () => Promise.resolve();
+  rt.client = client;
 
   let error;
   try {
     await withAcceleratedRemoteDeadlines(() =>
-      rc.updateCallResult(
+      rt.updateCallResult(
         'live-never-result', 'completed', { content: [{ type: 'text', text: 'ok' }] },
-        null, undefined, 'live'
+        null, 'test-claim-token', 'live'
       )
     );
   } catch (caught) {
@@ -462,10 +551,9 @@ await test('live result persistence uses two bounded attempts before durable rep
   }
 
   assert(error, 'unconfirmed live persistence must defer to the durable outbox');
-  assert(client.updates.length === 2, `expected exactly two bounded live writes, got ${client.updates.length}`);
+  assert(client.updates.length === 1, `expected exactly one bounded live write, got ${client.updates.length}`);
   assert(client.signals.length >= 1 && client.signals.every((signal) => signal.aborted),
     'live timeout must abort its in-flight remote requests');
-  assert(rc.callClaimTokens.has('live-never-result'), 'deferred live delivery must preserve claim ownership');
 });
 
 await test('a stale non-transient outbox entry does not block later deliverable results', async () => {
@@ -473,7 +561,7 @@ await test('a stale non-transient outbox entry does not block later deliverable 
   outboxEntries.set('poison', { version: 1, callId: 'poison', userId: 'user-1', claimToken: 'claim-poison', status: 'completed', result: { content: [] }, errorMessage: null, createdAt: new Date().toISOString() });
   outboxEntries.set('good', { version: 1, callId: 'good', userId: 'user-1', claimToken: 'claim-good', status: 'completed', result: { content: [] }, errorMessage: null, createdAt: new Date().toISOString() });
   const writes = [];
-  device.remoteChannel.updateCallResult = async (callId) => {
+  device.resultTransport.updateCallResult = async (callId) => {
     writes.push(callId);
     if (callId === 'poison') throw new Error('claim ownership changed');
   };
@@ -489,7 +577,7 @@ await test('an outbox entry whose remote call is confirmed gone is discarded ins
   const { device, outboxEntries } = makeDevice();
   outboxEntries.set('gone', { version: 1, callId: 'gone', userId: 'user-1', claimToken: 'claim-gone', status: 'completed', result: { content: [] }, errorMessage: null, createdAt: new Date().toISOString() });
   const error = Object.assign(new Error('remote call no longer exists'), { code: 'EREMOTECALLGONE' });
-  device.remoteChannel.updateCallResult = async () => { throw error; };
+  device.resultTransport.updateCallResult = async () => { throw error; };
 
   await device.flushResultOutbox();
 
@@ -500,11 +588,11 @@ await test('a slow result for one call does not block another call delivery', as
   let releaseSlow;
   const slowGate = new Promise((resolve) => { releaseSlow = resolve; });
   const order = [];
-  device.remoteChannel.updateCallResult = async (callId) => {
+  device.resultTransport.updateCallResult = async (callId) => {
     if (callId === 'slow-call') await slowGate;
     order.push(`write:${callId}`);
   };
-  device.remoteChannel.notifyResult = async (callId) => {
+  device.resultTransport.notifyResult = async (callId) => {
     order.push(`notify:${callId}`);
     return { acknowledged: true, attempts: 1, lastStatus: 'test:ok' };
   };
@@ -544,7 +632,7 @@ await test('background outbox replay cannot reserve the delivery pool ahead of t
   const delivered = [];
   let activeWrites = 0;
   let maxActiveWrites = 0;
-  device.remoteChannel.updateCallResult = async (callId) => {
+  device.resultTransport.updateCallResult = async (callId) => {
     activeWrites++;
     maxActiveWrites = Math.max(maxActiveWrites, activeWrites);
     try {
@@ -678,7 +766,7 @@ await test('markCallExecuting fails closed when DB ownership cannot be establish
 });
 
 await test('transient result persistence failure retries without discarding a successful tool result', async () => {
-  const { rc } = makeRemoteChannel();
+  const { rt } = makeResultTransport();
   const claimToken = 'transient-result-claim';
   let updateAttempts = 0;
   let reconcileAttempts = 0;
@@ -707,20 +795,20 @@ await test('transient result persistence failure retries without discarding a su
       return { data: { status: 'executing', metadata: { _desktop_commander_claim_token: claimToken } }, error: null };
     },
   };
-  rc.client = {
+  rt.client = {
     from: () => ({
       update: (payload) => updateChain(payload),
       select: () => selectChain,
     }),
   };
-  rc.sleep = () => Promise.resolve();
-  rc.callClaimTokens.set('transient-result', claimToken);
 
-  await rc.updateCallResult('transient-result', 'completed', { content: [{ type: 'text', text: 'valuable result' }] });
+  await rt.updateCallResult(
+    'transient-result', 'completed', { content: [{ type: 'text', text: 'valuable result' }] },
+    null, claimToken,
+  );
 
   assert(updateAttempts === 2, `expected one transient retry, got ${updateAttempts} updates`);
   assert(fallbackWrites === 0, 'a transient transport failure must not replace the successful result with fallback');
-  assert(!rc.callClaimTokens.has('transient-result'), 'confirmed result must release local claim ownership');
 });
 
 await test('remote outcome hash is canonical and includes terminal status', async () => {
@@ -733,7 +821,7 @@ await test('remote outcome hash is canonical and includes terminal status', asyn
 });
 
 await test('ambiguous terminal write rejects a different remote outcome for the same claim', async () => {
-  const { rc } = makeRemoteChannel();
+  const { rt } = makeResultTransport();
   const claimToken = 'identity-mismatch-claim';
   const expectedResult = { content: [{ type: 'text', text: 'expected' }] };
   const remoteResult = { content: [{ type: 'text', text: 'different' }] };
@@ -751,22 +839,20 @@ await test('ambiguous terminal write rejects a different remote outcome for the 
       error: null,
     }),
   };
-  rc.client = { from: () => ({ update: () => updateChain, select: () => selectChain }) };
-  rc.callClaimTokens.set('identity-mismatch', claimToken);
+  rt.client = { from: () => ({ update: () => updateChain, select: () => selectChain }) };
 
   let error;
   try {
-    await rc.updateCallResult('identity-mismatch', 'completed', expectedResult);
+    await rt.updateCallResult('identity-mismatch', 'completed', expectedResult, null, claimToken);
   } catch (caught) {
     error = caught;
   }
 
   assert(/outcome identity mismatch/i.test(error?.message || ''), `expected identity mismatch, got ${error?.message}`);
-  assert(rc.callClaimTokens.has('identity-mismatch'), 'mismatched remote outcome must retain local claim for replay/forensics');
 });
 
 await test('ambiguous terminal write accepts the exact legacy remote outcome without identity metadata', async () => {
-  const { rc } = makeRemoteChannel();
+  const { rt } = makeResultTransport();
   const claimToken = 'identity-match-claim';
   const expectedResult = { content: [{ type: 'text', text: 'same' }], structuredContent: { z: 1, a: 2 } };
   const remoteResult = { structuredContent: { a: 2, z: 1 }, content: [{ text: 'same', type: 'text' }] };
@@ -784,15 +870,13 @@ await test('ambiguous terminal write accepts the exact legacy remote outcome wit
       error: null,
     }),
   };
-  rc.client = { from: () => ({ update: () => updateChain, select: () => selectChain }) };
-  rc.callClaimTokens.set('identity-match', claimToken);
+  rt.client = { from: () => ({ update: () => updateChain, select: () => selectChain }) };
 
-  await rc.updateCallResult('identity-match', 'completed', expectedResult);
-  assert(!rc.callClaimTokens.has('identity-match'), 'exact legacy remote outcome should reconcile and release claim');
+  await rt.updateCallResult('identity-match', 'completed', expectedResult, null, claimToken);
 });
 
 await test('terminal result classifies a confirmed missing remote row as gone', async () => {
-  const { rc } = makeRemoteChannel();
+  const { rt } = makeResultTransport();
   const claimToken = 'gone-result-claim';
   const updateChain = {
     eq: () => updateChain,
@@ -805,31 +889,32 @@ await test('terminal result classifies a confirmed missing remote row as gone', 
     abortSignal: () => selectChain,
     maybeSingle: async () => ({ data: null, error: null }),
   };
-  rc.client = { from: () => ({ update: () => updateChain, select: () => selectChain }) };
-  rc.callClaimTokens.set('gone-result', claimToken);
+  rt.client = { from: () => ({ update: () => updateChain, select: () => selectChain }) };
 
   let error;
   try {
-    await rc.updateCallResult('gone-result', 'completed', { content: [{ type: 'text', text: 'ok' }] });
+    await rt.updateCallResult(
+      'gone-result', 'completed', { content: [{ type: 'text', text: 'ok' }] }, null, claimToken,
+    );
   } catch (caught) {
     error = caught;
   }
 
   assert(error?.code === 'EREMOTECALLGONE', `expected EREMOTECALLGONE, got ${error?.code || error?.message}`);
-  assert(rc.callClaimTokens.has('gone-result'), 'gone classification should not mutate claim state before outbox cleanup');
 });
 
 await test('result write stays bounded, claim-fenced, and replayable when DB I/O never settles', async () => {
-  const { rc } = makeRemoteChannel();
+  const { rt } = makeResultTransport();
   const client = makeNeverSettlingClient();
-  rc.client = client;
-  rc.callClaimTokens.set('never-result', 'test-claim-token');
-  rc.sleep = () => Promise.resolve();
+  rt.client = client;
 
   let error;
   try {
     await withAcceleratedRemoteDeadlines(() =>
-      rc.updateCallResult('never-result', 'completed', { content: [{ type: 'text', text: 'ok' }] })
+      rt.updateCallResult(
+        'never-result', 'completed', { content: [{ type: 'text', text: 'ok' }] },
+        null, 'test-claim-token',
+      )
     );
   } catch (caught) {
     error = caught;
@@ -840,7 +925,6 @@ await test('result write stays bounded, claim-fenced, and replayable when DB I/O
   assert(client.updates.every((value) => value.status === 'completed'), 'persistence retries must never synthesize a failed outcome');
   assert(client.signals.length >= 4, `expected bounded writes + reconciliation reads, got ${client.signals.length}`);
   assert(client.signals.every((signal) => signal.aborted), 'every timed-out terminal/reconcile query must be aborted');
-  assert(rc.callClaimTokens.has('never-result'), 'unconfirmed result must retain local claim ownership for durable replay');
 });
 
 // --- 2b. Handler rejections are observed -------------------------------------
@@ -876,8 +960,8 @@ await test('a synchronously throwing handler is contained too', async () => {
 await test('the result row is written BEFORE the doorbell is rung', async () => {
   const order = [];
   const { device, executed } = makeDevice();
-  device.remoteChannel.updateCallResult = async () => { order.push('write'); };
-  device.remoteChannel.notifyResult = async () => { order.push('doorbell'); };
+  device.resultTransport.updateCallResult = async () => { order.push('write'); };
+  device.resultTransport.notifyResult = async () => { order.push('doorbell'); };
   await device.handleNewToolCall(payloadFor('call-order'));
   assert(executed.length === 1, 'tool should have run');
   const deliveryDeadline = Date.now() + 500;
@@ -887,39 +971,24 @@ await test('the result row is written BEFORE the doorbell is rung', async () => 
   assert(order.join(',') === 'write,doorbell', `expected write,doorbell — got ${order.join(',')}`);
 });
 
-await test('result notification falls back to REST after a WebSocket ACK timeout', async () => {
-  const rc = new RemoteChannel();
-  const transports = [];
-  rc.channel = {
-    state: 'joined',
-    send: async (_message, options) => { transports.push(`ws:${options.timeout}`); return 'timed out'; },
-    httpSend: async (_event, _payload, options) => { transports.push(`http:${options.timeout}`); return { success: true }; },
-  };
-  rc.sleep = () => Promise.resolve();
-
-  const outcome = await rc.notifyResult('notify-fallback');
-
-  assert(outcome.acknowledged === true, 'REST fallback should confirm notification acceptance');
-  assert(outcome.attempts === 2, `expected exactly two attempts, got ${outcome.attempts}`);
-  assert(transports.length === 2 && transports[0].startsWith('ws:') && transports[1].startsWith('http:'),
-    `unexpected notification transports: ${transports.join(',')}`);
+await test('back-to-back result wakes use only HTTP and preserve call ids', async () => {
+  const transport = new RemoteResultTransport(new SessionTokenOwner());
+  const delivered = [];
+  transport.wakeChannel = { httpSend: async (_event, payload) => { delivered.push(payload.call_id); return { success: true }; } };
+  const outcomes = await Promise.all([
+    transport.notifyResult('start-search-result'), transport.notifyResult('read-file-result'), transport.notifyResult('write-file-result'),
+  ]);
+  assert(outcomes.every((outcome) => outcome.acknowledged && outcome.attempts === 1), 'every result wake must complete through one HTTP attempt');
+  assert(delivered.join(',') === 'start-search-result,read-file-result,write-file-result', 'result wake call ids were cross-routed');
 });
 
-await test('result notification stops after two unconfirmed attempts', async () => {
-  const rc = new RemoteChannel();
+await test('unconfirmed result wake stops after one bounded HTTP attempt', async () => {
+  const transport = new RemoteResultTransport(new SessionTokenOwner());
   let attempts = 0;
-  rc.channel = {
-    state: 'joined',
-    send: async () => { attempts++; return 'timed out'; },
-    httpSend: async () => { attempts++; throw new TypeError('network path alive but no result ACK'); },
-  };
-  rc.sleep = () => Promise.resolve();
-
-  const outcome = await rc.notifyResult('notify-unconfirmed');
-
-  assert(outcome.acknowledged === false, 'two missing confirmations must remain unconfirmed');
-  assert(outcome.attempts === 2, `expected two attempts, got ${outcome.attempts}`);
-  assert(attempts === 2, `notification retried more than twice: ${attempts}`);
+  transport.wakeChannel = { httpSend: async () => { attempts++; throw new TypeError('network path alive but no result ACK'); } };
+  const outcome = await transport.notifyResult('notify-unconfirmed');
+  assert(outcome.acknowledged === false, 'missing HTTP confirmation must remain unconfirmed');
+  assert(outcome.attempts === 1 && attempts === 1, 'notification retried unexpectedly');
 });
 
 // --- 4. Heartbeat cadence tiers ---------------------------------------------

@@ -15,7 +15,7 @@ import { cancelToolCallOwnedWork, getToolCallSessionIdentity } from '../utils/cl
 import { cancellationCauseOf, makeCancellationError } from '../utils/cancellation.js';
 import {
   PROCESS_TRANSPORT_RESERVE_MS, PROCESS_TRANSPORT_TIMEOUT_MAX_MS,
-  processToolWaitMs,
+  PROCESS_WAIT_DEFAULT_MS, PROCESS_WAIT_MAX_MS, processToolWaitMs,
 } from '../utils/process-wait-contract.js';
 import {
   AggregateByteBudget,
@@ -129,7 +129,7 @@ function operationTimeout(timeoutMs: number): number {
 function isLocalProcessWaitTarget(server: string, tool: string): boolean {
   return (server === BUILTIN_CORE_SERVER_ID && (
     tool === 'start_process' || tool === 'read_process_output' || tool === 'interact_with_process'
-  )) || (server === BUILTIN_SERVER_ID && tool === 'wait_process');
+  )) || (server === BUILTIN_SERVER_ID && (tool === 'wait_process' || tool === 'cpp_build_execute'));
 }
 
 function localProcessTransportBudget(server: string, tool: string, args: Record<string, unknown>): number | null {
@@ -281,7 +281,7 @@ async function closeRuntimeBounded(
 }
 
 export const EXTERNAL_MCP_ROUTING_GUIDANCE =
-  'For repository work, start with desktop-accelerators/workspace_snapshot instead of repeating Git preflight shell calls. Reuse desktop-accelerators/workspace_delta cursors between turns to avoid rediscovering unchanged worktree state. For one broad context request that needs CRG impact plus bounded source retrieval, prefer desktop-context/code_context; add explicit symbolQueries only when exact symbol names are already known, because this deterministic layer never infers symbol identity from natural-language prose. For bulk or multi-symbol code_context lookups, keep include_info=false; request hover/type enrichment only for the small number of exact symbols that actually need it. For narrow retrieval or already-known graph/semantic steps, keep using context_pack, CRG, or Serena directly; when CRG already produced impacted_files, pass those paths as context_pack.seedFiles rather than repeating graph discovery. For C/C++ changes that need toolchain profile, build impact, and/or a build plan together, prefer desktop-accelerators/cpp_build_context: it reuses one request-scoped build_metadata snapshot and runs independent profile/impact derivation in parallel. For narrow questions, keep using build_metadata, cpp_toolchain_profile, cpp_build_impact, or cpp_build_plan directly. Use CRG/context_pack/Serena separately where architecture or symbol semantics matter. For configured CMake build/test work, prefer cpp_build_context -> structured desktop-core/start_process -> wait_process so CMake/CTest retain compiler, generator, linker, preset and parallelism ownership. Prefer desktop-accelerators/edit_file for multiple exact edits in one text file, desktop-accelerators/apply_patch for bounded multi-file text changes, desktop-accelerators/safe_fix for preview-only engine-classified safe fixes before applying them through the mutation tools, and desktop-accelerators/wait_process for finite builds/tests instead of repeated read_process_output polling. Use desktop-accelerators/ast_search or ast_rule_search for bounded structural syntax queries before broad grep/read loops. When the same syntax shape must be changed repeatedly, prefer ast_rewrite in preview mode before text edits; apply only with its regenerated preview identity/exact file set, and keep Serena/LSP preferred for semantic rename/type-aware refactoring. For configured programmatic CRG adapters, use get_impact_radius_tool/get_review_context_tool with explicit changed_files when the task already has a bounded change set, and use query_graph_tool only for explicit graph relationships. The adapter owns mandatory freshness reconciliation; do not call CRG build/update, semantic-search, or traversal tools from the agent path. Use Serena or SCIP for type- and symbol-aware semantics. When a configured external MCP server provides a task-specific semantic tool, prefer it over generic filesystem text search/read or shell emulation. For code intelligence, discover the bound server with mcp_list_tools and prefer semantic symbols, references, implementations, diagnostics, and refactoring tools when applicable; use native search/read as fallback. Inspect an exact tool schema before calling it unless already known. Frozen clients use read_file(mcp://<server>/<tool>) for schema discovery when options are omitted. Trusted read-only desktop-accelerators and external tools explicitly allowlisted by the local DESKTOP_COMMANDER_MCP_READ_ONLY_POLICY may be invoked with read_file(path=mcp://<server>/<tool>?timeout_ms=..., options=<flat downstream arguments>); the URI owns the bridge deadline so any downstream timeout_ms field remains available to the tool. Downstream MCP readOnlyHint annotations never grant this route. Mutating and not-yet-trusted tools continue through write_file(path=mcp://<server>/<tool>, content=<the downstream arguments JSON object>). The content is passed as the tool arguments without reinterpretation. If a bridge deadline is needed, put it in the URI query, e.g. mcp://<server>/<tool>?timeout_ms=45000. The historical {arguments:{...},timeout_ms:N} wrapper is supported when unambiguous; for an open/dynamic downstream schema use ?envelope=legacy explicitly. desktop-core mirrors current Desktop Commander core schemas through the same stable path.';
+  'For repository work, start with desktop-accelerators/workspace_snapshot instead of repeating Git preflight shell calls. Reuse desktop-accelerators/workspace_delta cursors between turns to avoid rediscovering unchanged worktree state. For one broad context request that needs CRG impact plus bounded source retrieval, prefer desktop-context/code_context; add explicit symbolQueries only when exact symbol names are already known, because this deterministic layer never infers symbol identity from natural-language prose. For bulk or multi-symbol code_context lookups, keep include_info=false; request hover/type enrichment only for the small number of exact symbols that actually need it. For narrow retrieval or already-known graph/semantic steps, keep using context_pack, CRG, or Serena directly; when CRG already produced impacted_files, pass those paths as context_pack.seedFiles rather than repeating graph discovery. For C/C++ changes that need toolchain profile, build impact, and/or a build plan together, prefer desktop-accelerators/cpp_build_context: it reuses one request-scoped build_metadata snapshot and runs independent profile/impact derivation in parallel. For narrow questions, keep using build_metadata, cpp_toolchain_profile, cpp_build_impact, or cpp_build_plan directly. Use CRG/context_pack/Serena separately where architecture or symbol semantics matter. For routine configured CMake build/test verification, prefer desktop-accelerators/cpp_build_execute: omit buildDir when one configured CMake tree is unambiguous, or use configureMode=if_missing with an explicit project-owned configurePreset so CMake owns binaryDir, generator, compiler, linker, toolchain, preset and parallelism semantics. It reuses cpp_build_context/plan plus the native start/wait owner and returns bounded normalized diagnostics in one call. Keep cpp_build_context -> desktop-core/start_process -> wait_process for custom orchestration and debugging. Prefer desktop-accelerators/edit_file for multiple exact edits in one text file, desktop-accelerators/apply_patch for bounded multi-file text changes, desktop-accelerators/safe_fix for preview-only engine-classified safe fixes before applying them through the mutation tools, and desktop-accelerators/wait_process for finite builds/tests instead of repeated read_process_output polling. Use desktop-accelerators/ast_search or ast_rule_search for bounded structural syntax queries before broad grep/read loops. When the same syntax shape must be changed repeatedly, prefer ast_rewrite in preview mode before text edits; apply only with its regenerated preview identity/exact file set, and keep Serena/LSP preferred for semantic rename/type-aware refactoring. For configured programmatic CRG adapters, use get_impact_radius_tool/get_review_context_tool with explicit changed_files when the task already has a bounded change set, and use query_graph_tool only for explicit graph relationships. The adapter owns mandatory freshness reconciliation; do not call CRG build/update, semantic-search, or traversal tools from the agent path. Use Serena or SCIP for type- and symbol-aware semantics. When a configured external MCP server provides a task-specific semantic tool, prefer it over generic filesystem text search/read or shell emulation. For code intelligence, discover the bound server with mcp_list_tools and prefer semantic symbols, references, implementations, diagnostics, and refactoring tools when applicable; use native search/read as fallback. Inspect an exact tool schema before calling it unless already known. Frozen clients use read_file(mcp://<server>/<tool>) for schema discovery when options are omitted. Trusted read-only desktop-accelerators and external tools explicitly allowlisted by the local DESKTOP_COMMANDER_MCP_READ_ONLY_POLICY may be invoked with read_file(path=mcp://<server>/<tool>?timeout_ms=..., options=<flat downstream arguments>); the URI owns the bridge deadline so any downstream timeout_ms field remains available to the tool. Downstream MCP readOnlyHint annotations never grant this route. Mutating and not-yet-trusted tools continue through write_file(path=mcp://<server>/<tool>, content=<the downstream arguments JSON object>). The content is passed as the tool arguments without reinterpretation. If a bridge deadline is needed, put it in the URI query, e.g. mcp://<server>/<tool>?timeout_ms=45000. The historical {arguments:{...},timeout_ms:N} wrapper is supported when unambiguous; for an open/dynamic downstream schema use ?envelope=legacy explicitly. desktop-core mirrors current Desktop Commander core schemas through the same stable path.';
 
 type ConfigSourceStamp = { source: string; size: number; mtimeMs: number; ctimeMs: number };
 
@@ -997,7 +997,7 @@ async function selectSerenaTemplate(
     const bound = await resolveExternalMcpWorkspaceDefinition(definition, deadlineAt).catch(() => undefined);
     if (bound && comparableRoot(bound) === comparableRoot(root)) return { definition, exactRoot: true };
   }
-  const fallback = candidates[0];
+  const fallback = candidates.includes('serena-ai-agent') ? 'serena-ai-agent' : candidates[0];
   if (!fallback) throw new Error('No configured Serena MCP template is available.');
   return { definition: runtime.getDefinition(fallback), exactRoot: false };
 }
@@ -1238,7 +1238,11 @@ export async function callSessionSerenaTool(args: Record<string, unknown>, timeo
     let pending = binding.pendingReads.get(cacheKey);
     if (!pending) {
       const callDeadline = Date.now() + MCP_CALL_TIMEOUT_MAX_MS;
-      pending = withRuntimeLease(callDeadline, async (runtime, state) => {
+      let pendingPromise!: Promise<unknown>;
+      const releasePending = () => {
+        if (binding.pendingReads.get(cacheKey) === pendingPromise) binding.pendingReads.delete(cacheKey);
+      };
+      pendingPromise = withRuntimeLease(callDeadline, async (runtime, state) => {
         await ensureSerenaDefinition(runtime, binding, callDeadline);
         try {
           return { result: await callRuntimeTool(runtime, binding.serverName, tool, toolArguments, callDeadline), runtimeGeneration: state.generation };
@@ -1246,26 +1250,35 @@ export async function callSessionSerenaTool(args: Record<string, unknown>, timeo
           if (!isExternalMcpDisconnectedError(error)) throw error;
           return { result: await callRuntimeTool(runtime, binding.serverName, tool, toolArguments, callDeadline), runtimeGeneration: state.generation };
         }
-      }).then(async ({ result, runtimeGeneration }) => {
+      }).then(({ result, runtimeGeneration }) => {
         binding.semanticReady = true;
         binding.lastError = undefined;
         if (dependency) {
-          const dependencyAfter = await serenaFileCacheDependency(
+          // The semantic result is already complete. Cache bookkeeping must never
+          // delay its return path; keep the resolved pending read reusable until
+          // the post-read dependency check either publishes or declines the cache.
+          void serenaFileCacheDependency(
             binding, tool, toolArguments, Date.now() + 5_000,
-          ).catch(() => undefined);
-          if (dependencyAfter && dependencyAfter.relativePath === dependency.relativePath &&
-              dependencyAfter.contentHash === dependency.contentHash) {
-            binding.completedReads.set(cacheKey, {
-              result, runtimeGeneration, relativePath: dependency.relativePath, contentHash: dependency.contentHash,
-            });
-            while (binding.completedReads.size > 16) binding.completedReads.delete(binding.completedReads.keys().next().value!);
-          }
+          ).then((dependencyAfter) => {
+            if (serenaSessionBindings.get(binding.token) !== binding) return;
+            if (dependencyAfter && dependencyAfter.relativePath === dependency.relativePath &&
+                dependencyAfter.contentHash === dependency.contentHash) {
+              binding.completedReads.set(cacheKey, {
+                result, runtimeGeneration, relativePath: dependency.relativePath, contentHash: dependency.contentHash,
+              });
+              while (binding.completedReads.size > 16) binding.completedReads.delete(binding.completedReads.keys().next().value!);
+            }
+          }).catch(() => undefined).finally(releasePending);
+        } else {
+          queueMicrotask(releasePending);
         }
         return result;
       }).catch((error) => {
         binding.lastError = error instanceof Error ? error.message : String(error);
+        releasePending();
         throw error;
-      }).finally(() => binding.pendingReads.delete(cacheKey));
+      });
+      pending = pendingPromise;
       binding.pendingReads.set(cacheKey, pending);
       void pending.catch(() => undefined);
     }
@@ -1477,7 +1490,21 @@ export async function callExternalMcpTool(args: {
       const { callBuiltinAcceleratorTool } = await builtinAccelerators();
       return callBuiltinAcceleratorTool(args.tool, toolArguments, operationTimeoutMs);
     })();
-    return textResult(await waitForPromiseUntil(operation, responseDeadlineAt, 'Builtin MCP accelerator call'));
+    try {
+      return textResult(await waitForPromiseUntil(operation, responseDeadlineAt, 'Builtin MCP accelerator call'));
+    } catch (error) {
+      // cpp_build_execute can own a native child through start_process. If the
+      // compatibility response boundary wins the race, terminate request-owned
+      // work just like desktop-core/start_process so no identity-less build keeps
+      // mutating its output after the caller has already observed a timeout.
+      if (args.tool === 'cpp_build_execute') {
+        cancelToolCallOwnedWork(
+          cancellationCauseOf(error) ?? 'client_cancelled',
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      throw error;
+    }
   }
 
   if (args.server === BUILTIN_CORE_SERVER_ID) {

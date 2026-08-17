@@ -49,6 +49,48 @@ async function main() {
     assert(pageText.includes('Showing results 10-14'), pageText);
     assert.equal((pageText.match(/📄/g) ?? []).length, 5, 'pagination returned the wrong number of results');
 
+    const originalExcelSearch = searchManager.searchExcelFiles.bind(searchManager);
+    const auxiliarySessionIds = [];
+    try {
+      // Model an Office parser that has entered a library call which ignores the
+      // SearchManager AbortSignal. A full result set must not wait for it.
+      searchManager.searchExcelFiles = async () => new Promise(() => {});
+      await fs.writeFile(path.join(root, 'limit.xlsx'), 'AUX_LIMIT_MARKER\n', 'utf8');
+
+      const limitStarted = await handleStartSearch({
+        path: root, pattern: 'AUX_LIMIT_MARKER', searchType: 'content', literalSearch: true,
+        filePattern: '*.xlsx', maxResults: 1, contextLines: 0, timeout_ms: 5000,
+      });
+      const limitMatch = textOf(limitStarted).match(/session:\s*(search_[^\s]+)/);
+      assert(limitMatch, `limit search did not publish a session id: ${textOf(limitStarted)}`);
+      auxiliarySessionIds.push(limitMatch[1]);
+      let limitState;
+      for (let attempt = 0; attempt < 50; attempt++) {
+        limitState = searchManager.readSearchResults(limitMatch[1], 0, 10);
+        if (limitState.isComplete) break;
+        await sleep(20);
+      }
+      assert(limitState?.isComplete, 'maxResults search waited for a non-abortable auxiliary provider');
+      assert.equal(limitState.limitReached, true, 'limit terminal state was not preserved');
+
+      const deadlineStarted = await handleStartSearch({
+        path: root, pattern: 'AUX_NEVER_MATCH', searchType: 'content', literalSearch: true,
+        filePattern: '*.xlsx', maxResults: 10, contextLines: 0, timeout_ms: 150,
+      });
+      const deadlineMatch = textOf(deadlineStarted).match(/session:\s*(search_[^\s]+)/);
+      assert(deadlineMatch, `deadline search did not publish a session id: ${textOf(deadlineStarted)}`);
+      auxiliarySessionIds.push(deadlineMatch[1]);
+      await sleep(250);
+      const deadlineState = searchManager.readSearchResults(deadlineMatch[1], 0, 10);
+      assert.equal(deadlineState.isComplete, true, 'search deadline waited for a non-abortable auxiliary provider');
+      assert.equal(deadlineState.wasIncomplete, true, 'deadline completion did not retain incomplete evidence');
+    } finally {
+      searchManager.searchExcelFiles = originalExcelSearch;
+      for (const id of auxiliarySessionIds) {
+        await handleStopSearch({ sessionId: id }).catch(() => undefined);
+      }
+    }
+
     const originalStartSearch = searchManager.startSearch.bind(searchManager);
     const originalReadResults = searchManager.readSearchResults.bind(searchManager);
     const originalTerminate = searchManager.terminateSearch.bind(searchManager);

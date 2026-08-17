@@ -114,9 +114,29 @@ function parsePositivePid(text: string, prefix: string): number | null {
   return Number.isInteger(pid) && pid > 0 ? pid : null;
 }
 
+function boundedStartupBudget(value: number): number {
+  return Math.max(1, Math.min(HELPER_CONTROL_TIMEOUT_MS, Math.floor(value)));
+}
+
+async function waitForPromiseWithin<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} exceeded ${timeoutMs}ms startup budget.`)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function waitForTargetPid(
   child: ChildProcessWithoutNullStreams,
   filteredStderr: PassThrough,
+  timeoutMs = HELPER_CONTROL_TIMEOUT_MS,
 ): Promise<number> {
   return new Promise<number>((resolve, reject) => {
     let settled = false;
@@ -131,8 +151,8 @@ async function waitForTargetPid(
     };
     const fail = (error: Error) => finish(undefined, error);
     timer = setTimeout(() => {
-      fail(new Error(`Windows Job helper did not publish target PID within ${HELPER_CONTROL_TIMEOUT_MS}ms.`));
-    }, HELPER_CONTROL_TIMEOUT_MS);
+      fail(new Error(`Windows Job helper did not publish target PID within ${timeoutMs}ms.`));
+    }, timeoutMs);
     timer.unref?.();
     child.stderr.on('data', (chunk: Buffer) => {
       if (settled) {
@@ -175,10 +195,23 @@ export async function spawnWindowsJobOwnedProcess(
   args: string[],
   options: SpawnOptionsWithoutStdio,
   windowsVerbatim = false,
+  startupTimeoutMs = HELPER_CONTROL_TIMEOUT_MS,
 ): Promise<WindowsJobOwnedProcess | null> {
   if (process.platform !== 'win32') return null;
-  const helper = await getWindowsJobHelperPath();
+  const startupBudget = boundedStartupBudget(startupTimeoutMs);
+  const deadlineAt = Date.now() + startupBudget;
+  let helper: string | null;
+  try {
+    // Do not cancel the process-cached compilation on a caller deadline. The
+    // current launch falls back to pid_tree; a later launch can reuse the
+    // helper once compilation completes.
+    helper = await waitForPromiseWithin(getWindowsJobHelperPath(), startupBudget, 'Windows Job helper preparation');
+  } catch (error) {
+    helperFailure = errorText(error);
+    return null;
+  }
   if (!helper) return null;
+  helperFailure = undefined;
   const child = spawn(helper, targetArguments(executable, args, windowsVerbatim), {
     cwd: options.cwd,
     env: options.env,
@@ -188,7 +221,8 @@ export async function spawnWindowsJobOwnedProcess(
   });
   const filteredStderr = new PassThrough();
   try {
-    const pid = await waitForTargetPid(child, filteredStderr);
+    const controlBudget = Math.max(1, deadlineAt - Date.now());
+    const pid = await waitForTargetPid(child, filteredStderr, controlBudget);
     return { process: child, pid, stdout: child.stdout, stderr: filteredStderr, owner: 'windows_job' };
   } catch (error) {
     helperFailure = errorText(error);

@@ -4,6 +4,7 @@ import path from 'path';
 import { callBuildMetadataAcceleratorTool, revalidateBuildMetadataSnapshot, type BuildMetadataSnapshot } from './build-metadata-accelerator.js';
 import { runBoundedSubprocess } from '../utils/bounded-subprocess.js';
 import { runWithAbortableTimeout } from '../utils/withTimeout.js';
+import { requireConfiguredExecutable } from '../utils/configured-executable.js';
 
 const MAX_OPERATION_TIMEOUT_MS = 45_000;
 const MAX_CHANGED_FILES = 100;
@@ -20,6 +21,10 @@ const SOURCE_EXTENSIONS = new Set([
   '.ixx', '.cppm', '.mpp', '.ccm',
 ]);
 const TU_EXTENSIONS = new Set(['.c', '.cc', '.cp', '.cpp', '.cxx', '.c++', '.ixx', '.cppm', '.mpp', '.ccm']);
+
+export function cppBuildImpactPathSupported(value: string): boolean {
+  return SOURCE_EXTENSIONS.has(path.extname(value).toLowerCase());
+}
 
 type JsonRecord = Record<string, unknown>;
 type TargetInfo = {
@@ -91,7 +96,7 @@ async function normalizeChangedFile(root: string, value: unknown, deadlineAt: nu
   if (!relative || relative === '.git' || relative.startsWith('.git/')) {
     throw new Error(`cpp_build_impact changed path is unsupported: ${value}`);
   }
-  if (!SOURCE_EXTENSIONS.has(path.extname(relative).toLowerCase())) {
+  if (!cppBuildImpactPathSupported(relative)) {
     throw new Error(`cpp_build_impact only accepts C/C++ source/header/module paths: ${value}`);
   }
   try {
@@ -146,24 +151,10 @@ async function trustedProbeExecutable(
   buildDir: string,
   deadlineAt: number,
 ): Promise<string> {
-  if (typeof value !== 'string' || !path.isAbsolute(value)) {
-    throw new Error(`Configured ${expectedName} executable is unavailable or not absolute.`);
-  }
-  const canonical = await runWithAbortableTimeout(
-    (_signal) => fs.realpath(value), remaining(deadlineAt), `Resolve configured ${expectedName} executable`,
-  );
-  const basename = path.basename(canonical).toLowerCase();
-  if (basename !== expectedName && basename !== `${expectedName}.exe`) {
-    throw new Error(`Configured build tool is not ${expectedName}: ${canonical}`);
-  }
-  if (isInside(repositoryRoot, canonical) || isInside(buildDir, canonical)) {
-    throw new Error(`Configured ${expectedName} executable is inside the repository/build tree and is not trusted for read-only probing.`);
-  }
-  const stats = await runWithAbortableTimeout(
-    (_signal) => fs.stat(canonical), remaining(deadlineAt), `Stat configured ${expectedName} executable`,
-  );
-  if (!stats.isFile()) throw new Error(`Configured ${expectedName} executable is not a file: ${canonical}`);
-  return canonical;
+  return requireConfiguredExecutable(value, {
+    repositoryRoot, buildDir, deadlineAt,
+    label: `Configured ${expectedName} executable`, expectedNames: [expectedName],
+  });
 }
 
 function parseNinjaDeps(stdout: string): NinjaDepsBlock[] {
