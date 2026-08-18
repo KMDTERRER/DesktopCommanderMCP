@@ -1,4 +1,4 @@
-import { createClient, type RealtimeChannel, type SupabaseClient } from '@supabase/supabase-js';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { captureRemote } from '../utils/capture.js';
 import { makeCancellationError } from '../utils/cancellation.js';
 import { runWithAbortableTimeout } from '../utils/withTimeout.js';
@@ -14,19 +14,12 @@ const RESULT_WRITE_TIMEOUT_MS = 60_000;
 const RESULT_WRITE_ATTEMPTS = 3;
 const RESULT_ATTEMPT_TIMEOUT_MS = 15_000;
 const RESULT_RECONCILE_TIMEOUT_MS = 5_000;
-const LIVE_WRITE_TIMEOUT_MS = 1_800;
+const LIVE_WRITE_TIMEOUT_MS = 6_500;
 const LIVE_WRITE_ATTEMPTS = 1;
-const LIVE_ATTEMPT_TIMEOUT_MS = 1_000;
-const LIVE_RECONCILE_TIMEOUT_MS = 500;
+const LIVE_ATTEMPT_TIMEOUT_MS = 5_000;
+const LIVE_RECONCILE_TIMEOUT_MS = 1_000;
 const FALLBACK_WRITE_TIMEOUT_MS = 15_000;
 const FALLBACK_WRITE_ATTEMPTS = 2;
-const RESULT_NOTIFICATION_TIMEOUT_MS = 750;
-
-export interface ResultNotificationOutcome {
-    acknowledged: boolean;
-    attempts: number;
-    lastStatus: string;
-}
 
 /**
  * Outbound-only result transport. It intentionally has no Supabase Auth owner:
@@ -34,12 +27,14 @@ export interface ResultNotificationOutcome {
  */
 export class RemoteResultTransport {
     private client: SupabaseClient | null = null;
-    private wakeChannel: RealtimeChannel | null = null;
-    private wakeUserId: string | null = null;
+    private baseUrl: string | null = null;
+    private anonKey: string | null = null;
 
     constructor(private readonly tokens: SessionTokenOwner) {}
 
     initialize(url: string, key: string): void {
+        this.baseUrl = url.replace(/\/$/, '');
+        this.anonKey = key;
         this.client = createClient(url, key, {
             // Supplying accessToken disables Supabase Auth on this client. The
             // callback reads SessionTokenOwner memory only and never refreshes.
@@ -47,13 +42,81 @@ export class RemoteResultTransport {
         });
     }
 
-    configureUser(userId: string): void {
+    private async rawPatchCall(
+        callId: string, updateData: Record<string, unknown>, label: string,
+    ): Promise<void> {
+        const token = this.tokens.snapshot()?.access_token;
+        if (!this.baseUrl || !this.anonKey || !token) {
+            throw new Error('Raw result transport is not initialized/authenticated');
+        }
+        await runWithAbortableTimeout(async (signal) => {
+            const response = await fetch(
+                `${this.baseUrl}/rest/v1/mcp_remote_calls?id=eq.${encodeURIComponent(callId)}`,
+                {
+                    method: 'PATCH',
+                    signal,
+                    headers: {
+                        apikey: this.anonKey!,
+                        Authorization: `Bearer ${token}`,
+                        'Content-Type': 'application/json',
+                        Prefer: 'return=minimal',
+                    },
+                    body: JSON.stringify(updateData),
+                },
+            );
+            if (!response.ok) {
+                const detail = (await response.text().catch(() => '')).slice(0, 512);
+                throw new Error(`${label} failed with HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
+            }
+        }, 5_000, label);
+    }
+
+    async markCallExecutingRaw(callId: string): Promise<void> {
+        await this.rawPatchCall(callId, { status: 'executing' }, `Raw executing write ${callId}`);
+    }
+
+    async updateCallResultRaw(
+        callId: string, status: string, result: any, errorMessage: string | null,
+    ): Promise<void> {
+        const identity = createRemoteOutcomeIdentity(status, result, errorMessage);
+        const updateData: Record<string, unknown> = { status, completed_at: new Date().toISOString() };
+        if (identity.result !== null) updateData.result = identity.result;
+        if (identity.errorMessage !== null) updateData.error_message = identity.errorMessage;
+        await this.rawPatchCall(callId, updateData, `Raw terminal write ${callId}`);
+    }
+
+    async markCallExecutingSimple(callId: string): Promise<void> {
         if (!this.client) throw new Error('Result transport not initialized');
-        if (this.wakeChannel && this.wakeUserId === userId) return;
-        this.wakeUserId = userId;
-        this.wakeChannel = this.client.channel(`user:${userId}`, {
-            config: { private: true },
-        });
+        const { error } = await runWithAbortableTimeout(
+            async (signal) => await this.client!
+                .from('mcp_remote_calls')
+                .update({ status: 'executing' })
+                .eq('id', callId)
+                .abortSignal(signal),
+            5_000,
+            `Simple executing write ${callId}`,
+        );
+        if (error) throw error;
+    }
+
+    async updateCallResultSimple(
+        callId: string, status: string, result: any, errorMessage: string | null,
+    ): Promise<void> {
+        if (!this.client) throw new Error('Result transport not initialized');
+        const identity = createRemoteOutcomeIdentity(status, result, errorMessage);
+        const updateData: Record<string, unknown> = { status, completed_at: new Date().toISOString() };
+        if (identity.result !== null) updateData.result = identity.result;
+        if (identity.errorMessage !== null) updateData.error_message = identity.errorMessage;
+        const { error } = await runWithAbortableTimeout(
+            async (signal) => await this.client!
+                .from('mcp_remote_calls')
+                .update(updateData)
+                .eq('id', callId)
+                .abortSignal(signal),
+            5_000,
+            `Simple terminal write ${callId}`,
+        );
+        if (error) throw error;
     }
 
     private async readCallState(callId: string, timeoutMs: number): Promise<any | null> {
@@ -198,22 +261,5 @@ export class RemoteResultTransport {
             error: error?.message || String(error), callId, status, deliveryMode,
         });
         throw error;
-    }
-
-    async notifyResult(callId: string): Promise<ResultNotificationOutcome> {
-        const channel = this.wakeChannel;
-        if (!channel) {
-            return { acknowledged: false, attempts: 0, lastStatus: 'wake-channel-unconfigured' };
-        }
-        try {
-            const result = await channel.httpSend(
-                'result', { call_id: callId }, { timeout: RESULT_NOTIFICATION_TIMEOUT_MS },
-            );
-            return result.success
-                ? { acknowledged: true, attempts: 1, lastStatus: 'http:accepted' }
-                : { acknowledged: false, attempts: 1, lastStatus: `http:${result.status}` };
-        } catch (error: any) {
-            return { acknowledged: false, attempts: 1, lastStatus: `http:error:${error?.message || String(error)}` };
-        }
     }
 }

@@ -135,6 +135,12 @@ export function buildLocalMcpChildEnvironment(configEnv?: Record<string, string>
     }
     Object.assign(env, configEnv);
     env.DC_REMOTE_DEVICE = 'true';
+    // The remote-device process already owns remote lifecycle/error telemetry.
+    // Its spawned local MCP child must not emit a second HTTPS analytics request
+    // for every tool call; that traffic competes with the result channel without
+    // adding an independent operational signal. Keep the kill-switch scoped to
+    // this child so parent captureRemote diagnostics remain available.
+    env.DESKTOP_COMMANDER_DISABLE_TELEMETRY = 'true';
     return env;
 }
 

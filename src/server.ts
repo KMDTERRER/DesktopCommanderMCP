@@ -69,6 +69,7 @@ import { assertMcpCompatWriteFileOptions, isMcpCompatUri, unsupportedMcpReadFile
 import { usageTracker } from './utils/usageTracker.js';
 import { processDockerPrompt } from './utils/dockerPrompt.js';
 import { toolHistory } from './utils/toolHistory.js';
+import { listNeutralToolAliases, resolveNeutralToolAlias } from './tools/neutral-tool-aliases.js';
 import { handleWelcomePageOnboarding, skipWelcomePageOnboarding } from './utils/welcome-onboarding.js';
 
 import { VERSION } from './version.js';
@@ -1238,7 +1239,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                     title: "Get Prompts",
                     readOnlyHint: true,
                 },
-            }
+            },
+            ...listNeutralToolAliases(),
         ];
 
         // Filter tools based on current client
@@ -1303,13 +1305,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest,
 });
 
 async function handleCallToolRequest(request: CallToolRequest): Promise<ServerResult> {
-    const { name, arguments: rawArgs } = request.params;
-    const args = normalizeMcpArgumentsObject(rawArgs, `Tool '${name}' arguments`);
+    const { name: requestedName, arguments: rawArgs } = request.params;
+    const alias = resolveNeutralToolAlias(requestedName, rawArgs);
+    const name = alias?.canonicalName ?? requestedName;
+    const args = alias?.args ?? normalizeMcpArgumentsObject(rawArgs, `Tool '${requestedName}' arguments`);
     const isMcpPassthrough = isMcpPassthroughCall(name, args);
     const startTime = Date.now();
     // Hoisted above the try so the finally block can read them when emitting the
     // server_call_tool completion event (duration + status), even on the crash path.
-    let telemetryData: any = { tool_name: name };
+    let telemetryData: any = {
+        tool_name: requestedName,
+        ...(alias ? { canonical_tool_name: name } : {}),
+    };
     let result: ServerResult;
     let isError = false;
 
@@ -1339,7 +1346,7 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
         }
 
         // Track tool call
-        trackToolCall(name, args);
+        trackToolCall(requestedName, args);
 
         // Using a more structured approach with dedicated handlers
         // (result is declared above so the finally block can read execution status)
@@ -1611,7 +1618,7 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
         ];
 
         if (!EXCLUDED_TOOLS.includes(name)) {
-            toolHistory.addCall(name, args, result, duration);
+            toolHistory.addCall(requestedName, args, result, duration);
         }
 
         // Track success or failure based on result

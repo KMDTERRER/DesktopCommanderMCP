@@ -5,6 +5,7 @@ import { VERSION } from '../version.js';
 import { randomUUID } from 'crypto';
 import { SessionTokenOwner, type AuthSession } from './session-token-owner.js';
 import { CLAIM_METADATA_KEY, stripNullBytes } from './remote-result-contract.js';
+import type { RemoteInboundMode } from './remote-runtime-config.js';
 
 const DEVICE_SESSION_CAPABILITY_KEY = 'device_session_v1';
 
@@ -106,6 +107,8 @@ export class RemoteChannel {
     private transportCapableWritten: boolean | null = null;
     /** Presence push in flight for the current private-channel generation. */
     private trackingPresenceGeneration: number | null = null;
+    private minimalInboundMode: RemoteInboundMode | null = null;
+    private minimalInboundSwitch: Promise<void> = Promise.resolve();
 
     // Track last device status to prevent duplicate log messages
     private lastDeviceStatus: 'online' | 'offline' = 'offline';
@@ -120,10 +123,19 @@ export class RemoteChannel {
     private _user: User | null = null;
     get user(): User | null { return this._user; }
 
-    constructor(private readonly tokens: SessionTokenOwner = new SessionTokenOwner()) {}
+    constructor(
+        private readonly tokens: SessionTokenOwner = new SessionTokenOwner(),
+        private readonly minimalLiveTest = false,
+    ) {}
 
     initialize(url: string, key: string): void {
-        this.client = createClient(url, key);
+        this.client = createClient(url, key, this.minimalLiveTest ? {
+            auth: {
+                autoRefreshToken: false,
+                persistSession: false,
+                detectSessionInUrl: false,
+            },
+        } : undefined);
     }
 
     private async syncRealtimeAuth(token: string | null, reason: string): Promise<void> {
@@ -385,6 +397,16 @@ export class RemoteChannel {
             // Create and subscribe to the channel
             console.debug('[DEBUG] Calling createChannel()');
 
+            if (this.minimalLiveTest) {
+                // A/B benchmark path matching the installed upstream 0.2.47:
+                // one postgres_changes stream carrying the complete row. No
+                // private doorbell, Presence, result wake or transport tier.
+                this.transportCapableWritten = false;
+                await this.createMinimalLiveChannel();
+                this.minimalInboundMode = 'postgres_changes';
+                return;
+            }
+
             // Independent safety net for the doorbell transport.
             this.createLegacyChannel();
 
@@ -537,6 +559,78 @@ export class RemoteChannel {
         });
     }
 
+    /** Strict minimal transport used only for live A/B latency testing. */
+    private createMinimalLiveChannel(): Promise<void> {
+        return new Promise((resolve, reject) => {
+            if (!this.client || !this.user?.id || !this.onToolCall) {
+                reject(new Error('Minimal live channel missing client/user/handler'));
+                return;
+            }
+            let settled = false;
+            const finish = (error?: unknown) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                error ? reject(error) : resolve();
+            };
+            const channel = this.client
+                .channel('device_tool_call_queue')
+                .on(
+                    'postgres_changes' as any,
+                    { event: 'INSERT', schema: 'public', table: 'mcp_remote_calls', filter: `user_id=eq.${this.user.id}` },
+                    (payload: any) => this.dispatchToolCall(payload),
+                );
+            this.legacyChannel = channel;
+            const timer = setTimeout(() => finish(new Error('Minimal live channel subscribe timed out')), 15_000);
+            timer.unref?.();
+            channel.subscribe((status: string, error: any) => {
+                if (status === 'SUBSCRIBED') finish();
+                else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+                    finish(error ?? new Error(`Minimal live channel ${status}`));
+                }
+            });
+        });
+    }
+
+    async setMinimalInboundMode(mode: RemoteInboundMode): Promise<void> {
+        if (!this.minimalLiveTest) return;
+        const run = this.minimalInboundSwitch.then(() => this.applyMinimalInboundMode(mode));
+        this.minimalInboundSwitch = run.catch(() => {});
+        await run;
+    }
+
+    private async applyMinimalInboundMode(mode: RemoteInboundMode): Promise<void> {
+        if (mode === this.minimalInboundMode) return;
+        if (!this.deviceId || !this.user || !this.onToolCall) return;
+
+        if (mode === 'broadcast_doorbell') {
+            await this.createChannel();
+            if (this.channel?.state !== 'joined' || !this.presenceTracked || this.transportCapableWritten !== true) {
+                await this.removePrivateChannelForMinimalTest();
+                throw new Error('Broadcast doorbell transport did not become reachable');
+            }
+            await this.removeLegacyChannel();
+            this.minimalInboundMode = mode;
+            console.log('⚙ INBOUND switched to broadcast_doorbell');
+            return;
+        }
+
+        await this.createMinimalLiveChannel();
+        await this.setTransportCapable(false);
+        await this.removePrivateChannelForMinimalTest();
+        this.minimalInboundMode = mode;
+        console.log('⚙ INBOUND switched to postgres_changes');
+    }
+
+    private async removePrivateChannelForMinimalTest(): Promise<void> {
+        const channel = this.channel;
+        if (!channel || !this.client) return;
+        this.channelGeneration += 1;
+        if (this.channel === channel) this.channel = null;
+        this.presenceTracked = false;
+        try { await this.client.removeChannel(channel); } catch { /* best effort */ }
+    }
+
     /**
      * Legacy postgres_changes listener on its own public channel. Best-effort:
      * failures are logged, never thrown. Removed at the flip (009).
@@ -678,6 +772,36 @@ export class RemoteChannel {
                         finish(new Error('Tool call channel closed during subscribe'));
                     }
                 });
+        });
+    }
+
+    /**
+     * Wake the server after a terminal row is committed. Reuse the already joined
+     * Realtime channel: this is a signal only, never an owner of result durability.
+     */
+    signalResultAvailable(callId: string): void {
+        const channel = this.channel;
+        if (!channel || channel.state !== 'joined') {
+            if (process.env.DEBUG_MODE === 'true') {
+                console.debug('[DEBUG] Result wake skipped — realtime channel not joined:', callId);
+            }
+            return;
+        }
+        const wakeStartedAt = Date.now();
+        void channel.send(
+            { type: 'broadcast', event: 'result', payload: { call_id: callId } },
+            { timeout: 1_000 },
+        ).then((status: string) => {
+            console.log(`↗ RESULT WAKE ${callId.slice(0, 8)} ${status} ${Date.now() - wakeStartedAt}ms`);
+            if (status !== 'ok' && process.env.DEBUG_MODE === 'true') {
+                console.debug(`[DEBUG] Result wake not acknowledged (${status}):`, callId);
+            }
+        }).catch((error: any) => {
+            console.log(`↗ RESULT WAKE ${callId.slice(0, 8)} error ${Date.now() - wakeStartedAt}ms`);
+            console.debug('[DEBUG] Result wake failed; recovery remains authoritative:', error?.message);
+            void captureRemote('remote_channel_result_wake_failed', {
+                call_id: callId, error: error?.message || String(error),
+            });
         });
     }
 
@@ -1007,6 +1131,41 @@ export class RemoteChannel {
         } finally {
             this.isRecreatingChannel = false;
         }
+    }
+
+    async markCallExecutingMinimal(callId: string): Promise<void> {
+        if (!this.client) throw new Error('Client not initialized');
+        const startedAt = Date.now();
+        const { error } = await this.runDbQuery(
+            `Minimal mark executing ${callId}`, REMOTE_CALL_CLAIM_TIMEOUT_MS,
+            (signal) => this.client!
+                .from('mcp_remote_calls')
+                .update({ status: 'executing' })
+                .eq('id', callId)
+                .abortSignal(signal),
+        );
+        if (error) throw error;
+        console.log(`↗ MINIMAL EXEC ${callId.slice(0, 8)} ${Date.now() - startedAt}ms`);
+    }
+
+    async updateCallResultMinimal(
+        callId: string, status: string, result: unknown | null, errorMessage: string | null,
+    ): Promise<void> {
+        if (!this.client) throw new Error('Client not initialized');
+        const updateData: Record<string, unknown> = { status, completed_at: new Date().toISOString() };
+        if (result !== null) updateData.result = result;
+        if (errorMessage !== null) updateData.error_message = errorMessage;
+        const startedAt = Date.now();
+        const { error } = await this.runDbQuery(
+            `Minimal terminal result ${callId}`, REMOTE_CONTROL_QUERY_TIMEOUT_MS,
+            (signal) => this.client!
+                .from('mcp_remote_calls')
+                .update(updateData)
+                .eq('id', callId)
+                .abortSignal(signal),
+        );
+        if (error) throw error;
+        console.log(`↗ MINIMAL RESULT ${callId.slice(0, 8)} ${Date.now() - startedAt}ms`);
     }
 
     private async readCallClaimState(

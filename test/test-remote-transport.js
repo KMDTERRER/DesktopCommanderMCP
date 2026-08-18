@@ -19,6 +19,9 @@ import { formatRemoteToolTrace, MCPDevice } from '../dist/remote-device/device.j
 import { RemoteChannel } from '../dist/remote-device/remote-channel.js';
 import { createRemoteOutcomeIdentity } from '../dist/remote-device/remote-result-contract.js';
 import { RemoteResultTransport } from '../dist/remote-device/remote-result-transport.js';
+import { RemoteCallMetrics } from '../dist/remote-device/remote-call-metrics.js';
+import { listNeutralToolAliases, resolveNeutralToolAlias } from '../dist/tools/neutral-tool-aliases.js';
+import { REMOTE_LATENCY_BASELINE_CONFIG, REMOTE_LATENCY_BASELINE_PROFILE } from '../dist/remote-device/remote-runtime-config.js';
 import { SessionTokenOwner } from '../dist/remote-device/session-token-owner.js';
 import { DesktopCommanderIntegration } from '../dist/remote-device/desktop-commander-integration.js';
 import fs from 'fs/promises';
@@ -50,6 +53,95 @@ async function test(name, fn) {
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
+
+await test('neutral aliases keep compact arguments while preserving canonical semantics and risk metadata', async () => {
+  const put = resolveNeutralToolAlias('file_put', { path: 'C:/tmp/x.txt', data: 'abc', append: true });
+  assert(put?.canonicalName === 'write_file', 'file_put did not resolve to write_file');
+  assert(put?.args.content === 'abc' && put?.args.mode === 'append', 'file_put argument mapping drifted');
+  const stop = resolveNeutralToolAlias('session_stop', { id: 42 });
+  assert(stop?.canonicalName === 'force_terminate' && stop?.args.pid === 42, 'session_stop mapping drifted');
+  const defs = listNeutralToolAliases();
+  const putDef = defs.find((tool) => tool.name === 'file_put');
+  const stopDef = defs.find((tool) => tool.name === 'session_stop');
+  assert(putDef?.annotations?.destructiveHint === true, 'file_put lost mutating/destructive metadata');
+  assert(stopDef?.annotations?.destructiveHint === true, 'session_stop lost destructive metadata');
+  assert(!defs.some((tool) => /delete|kill|terminate/i.test(tool.name)), 'neutral alias catalog contains legacy destructive wording');
+});
+
+await test('remote call metrics record sizes and timings without retaining payload contents', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dc-remote-metrics-'));
+  try {
+    const logPath = path.join(dir, 'metrics.jsonl');
+    const metrics = new RemoteCallMetrics(logPath);
+    const receivedAtMs = Date.now();
+    const secretInput = 'DO_NOT_LOG_INPUT';
+    const secretResult = 'DO_NOT_LOG_RESULT';
+    metrics.record({
+      stage: 'recv', callId: 'metric-1', tool: 'write_file',
+      args: { path: 'C:/missing/metric.txt', content: secretInput },
+      profile: 'test', inbound: 'postgres_changes', terminalWrite: 'simple',
+      receivedAtMs, createdAt: new Date(receivedAtMs - 123).toISOString(), laneWaitMs: 7,
+    });
+    metrics.record({
+      stage: 'terminal_done', callId: 'metric-1', tool: 'write_file',
+      args: { path: 'C:/missing/metric.txt', content: secretInput },
+      result: { content: [{ type: 'text', text: secretResult }] },
+      profile: 'test', inbound: 'postgres_changes', terminalWrite: 'simple',
+      receivedAtMs, createdAt: new Date(receivedAtMs - 123).toISOString(), laneWaitMs: 7,
+      toolMs: 11, terminalMs: 13, totalMs: 31,
+    });
+    await metrics.flush();
+    const text = await fs.readFile(logPath, 'utf8');
+    assert(!text.includes(secretInput) && !text.includes(secretResult), 'metrics leaked payload contents');
+    const rows = text.trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    assert(rows.length === 2, `expected two metric stages, got ${rows.length}`);
+    assert(rows[0].outerContentBytes === Buffer.byteLength(secretInput), 'input byte count is wrong');
+    assert(rows[0].inboundLagMs === 123 && rows[0].laneWaitMs === 7, 'inbound timing fields are wrong');
+    assert(rows[1].resultTextBytes === Buffer.byteLength(secretResult), 'result byte count is wrong');
+    assert(rows[1].toolMs === 11 && rows[1].terminalMs === 13 && rows[1].totalMs === 31, 'stage timing fields are wrong');
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+await test('latency baseline contract stays minimal and parallel', async () => {
+  assert(REMOTE_LATENCY_BASELINE_CONFIG.profile === REMOTE_LATENCY_BASELINE_PROFILE, 'baseline profile name drifted');
+  assert(REMOTE_LATENCY_BASELINE_CONFIG.inbound === 'broadcast_doorbell', 'baseline inbound drifted');
+  assert(REMOTE_LATENCY_BASELINE_CONFIG.executingWrite === 'none', 'baseline added an executing write');
+  assert(REMOTE_LATENCY_BASELINE_CONFIG.terminalWrite === 'simple', 'baseline terminal write drifted');
+  assert(REMOTE_LATENCY_BASELINE_CONFIG.outbox === false, 'baseline reintroduced outbox');
+  assert(REMOTE_LATENCY_BASELINE_CONFIG.resultWake === false, 'baseline reintroduced result wake');
+  assert(REMOTE_LATENCY_BASELINE_CONFIG.heartbeatMs === 15_000, 'baseline heartbeat drifted');
+  assert(REMOTE_LATENCY_BASELINE_CONFIG.maxParallelCalls === 8, 'baseline parallel lane count drifted');
+});
+
+await test('minimal live admission executes independent calls in parallel up to its configured bound', async () => {
+  const device = new MCPDevice({ minimalLiveTest: true });
+  const policy = { ...REMOTE_LATENCY_BASELINE_CONFIG, profile: 'parallel-test', maxParallelCalls: 2, diagnostics: false };
+  device.deviceId = DEVICE_ID;
+  device.runtimeConfig = { current: () => policy };
+  device.callMetrics = { record: () => {} };
+  let active = 0;
+  let maxActive = 0;
+  let completed = 0;
+  device.desktop = {
+    callClientTool: async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      active -= 1;
+      completed += 1;
+      return { content: [{ type: 'text', text: 'ok' }] };
+    },
+  };
+  device.resultTransport = { updateCallResultSimple: async () => {} };
+  const payload = (id) => ({ new: { id, tool_name: 'read_file', tool_args: {}, device_id: DEVICE_ID } });
+  await Promise.all(['p1', 'p2', 'p3', 'p4'].map((id) => device.handleNewToolCall(payload(id))));
+  assert(completed === 4, `expected all parallel calls to complete, got ${completed}`);
+  assert(maxActive === 2, `expected two concurrent calls, observed ${maxActive}`);
+  assert(device.minimalCallActive === 0, 'parallel admission leaked an active lane');
+  assert(device.minimalCallWaiters.length === 0, 'parallel admission leaked queued waiters');
+});
 
 await test('remote tool trace formatter keeps plain logs clean and color changes presentation only', async () => {
   const descriptor = 'read_file -> mcp://desktop-accelerators/workspace_delta';
@@ -119,10 +211,10 @@ function makeDevice({ claimResults = [] } = {}) {
     getCallClaimToken: () => 'test-claim-token',
     getCallClaimMetadata: () => ({ _desktop_commander_claim_token: 'test-claim-token' }),
     releaseCallClaim: () => {},
+    signalResultAvailable: () => {},
   };
   device.resultTransport = {
     updateCallResult: async () => {},
-    notifyResult: async () => ({ acknowledged: true, attempts: 1, lastStatus: 'test:ok' }),
   };
   return { device, executed, outboxEntries };
 }
@@ -360,16 +452,19 @@ await test('outbound token lookup is memory-only and reflects rotation immediate
   assert(await tokens.accessToken() === 'rotated-access', 'rotated token was not immediately visible to outbound transport');
 });
 
-await test('result wake uses one HTTP broadcast and has no WebSocket fallback path', async () => {
-  const transport = new RemoteResultTransport(new SessionTokenOwner());
-  let httpCalls = 0;
-  transport.wakeChannel = {
-    httpSend: async () => { httpCalls++; return { success: true }; },
-    send: async () => { throw new Error('WebSocket must not participate in outbound result wake'); },
+await test('result wake reuses the already joined realtime channel', async () => {
+  const rc = new RemoteChannel(new SessionTokenOwner());
+  const sent = [];
+  rc.channel = {
+    state: 'joined',
+    send: async (payload, opts) => { sent.push({ payload, opts }); return 'ok'; },
   };
-  const outcome = await transport.notifyResult('http-only-result');
-  assert(outcome.acknowledged === true, 'HTTP result wake was not acknowledged');
-  assert(outcome.attempts === 1 && httpCalls === 1, `expected one HTTP wake, got ${httpCalls}`);
+  rc.signalResultAvailable('joined-result');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert(sent.length === 1, `expected one websocket wake, got ${sent.length}`);
+  assert(sent[0].payload?.event === 'result' && sent[0].payload?.payload?.call_id === 'joined-result',
+    'result wake payload was routed incorrectly');
+  assert(sent[0].opts?.timeout === 1000, 'result wake must stay bounded');
 });
 
 
@@ -592,9 +687,8 @@ await test('a slow result for one call does not block another call delivery', as
     if (callId === 'slow-call') await slowGate;
     order.push(`write:${callId}`);
   };
-  device.resultTransport.notifyResult = async (callId) => {
+  device.remoteChannel.signalResultAvailable = (callId) => {
     order.push(`notify:${callId}`);
-    return { acknowledged: true, attempts: 1, lastStatus: 'test:ok' };
   };
 
   const slow = device.handleNewToolCall(payloadFor('slow-call'));
@@ -961,7 +1055,7 @@ await test('the result row is written BEFORE the doorbell is rung', async () => 
   const order = [];
   const { device, executed } = makeDevice();
   device.resultTransport.updateCallResult = async () => { order.push('write'); };
-  device.resultTransport.notifyResult = async () => { order.push('doorbell'); };
+  device.remoteChannel.signalResultAvailable = () => { order.push('doorbell'); };
   await device.handleNewToolCall(payloadFor('call-order'));
   assert(executed.length === 1, 'tool should have run');
   const deliveryDeadline = Date.now() + 500;
@@ -971,24 +1065,24 @@ await test('the result row is written BEFORE the doorbell is rung', async () => 
   assert(order.join(',') === 'write,doorbell', `expected write,doorbell — got ${order.join(',')}`);
 });
 
-await test('back-to-back result wakes use only HTTP and preserve call ids', async () => {
-  const transport = new RemoteResultTransport(new SessionTokenOwner());
+await test('back-to-back result wakes preserve call ids on the joined websocket', async () => {
+  const rc = new RemoteChannel(new SessionTokenOwner());
   const delivered = [];
-  transport.wakeChannel = { httpSend: async (_event, payload) => { delivered.push(payload.call_id); return { success: true }; } };
-  const outcomes = await Promise.all([
-    transport.notifyResult('start-search-result'), transport.notifyResult('read-file-result'), transport.notifyResult('write-file-result'),
-  ]);
-  assert(outcomes.every((outcome) => outcome.acknowledged && outcome.attempts === 1), 'every result wake must complete through one HTTP attempt');
+  rc.channel = { state: 'joined', send: async (payload) => { delivered.push(payload.payload.call_id); return 'ok'; } };
+  rc.signalResultAvailable('start-search-result');
+  rc.signalResultAvailable('read-file-result');
+  rc.signalResultAvailable('write-file-result');
+  await new Promise((resolve) => setImmediate(resolve));
   assert(delivered.join(',') === 'start-search-result,read-file-result,write-file-result', 'result wake call ids were cross-routed');
 });
 
-await test('unconfirmed result wake stops after one bounded HTTP attempt', async () => {
-  const transport = new RemoteResultTransport(new SessionTokenOwner());
-  let attempts = 0;
-  transport.wakeChannel = { httpSend: async () => { attempts++; throw new TypeError('network path alive but no result ACK'); } };
-  const outcome = await transport.notifyResult('notify-unconfirmed');
-  assert(outcome.acknowledged === false, 'missing HTTP confirmation must remain unconfirmed');
-  assert(outcome.attempts === 1 && attempts === 1, 'notification retried unexpectedly');
+await test('result wake does not create a fallback HTTP path when realtime is not joined', async () => {
+  const rc = new RemoteChannel(new SessionTokenOwner());
+  let sends = 0;
+  rc.channel = { state: 'closed', send: async () => { sends++; return 'ok'; } };
+  rc.signalResultAvailable('offline-result');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert(sends === 0, 'unjoined realtime channel must defer to durable server recovery');
 });
 
 // --- 4. Heartbeat cadence tiers ---------------------------------------------

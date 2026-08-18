@@ -71,9 +71,13 @@ async function runServer() {
       await configManager.loadConfig();
       deferLog('info', 'Configuration loaded successfully');
 
-      // Initialize feature flags (non-blocking)
-      deferLog('info', 'Initializing feature flags...');
-      await featureFlagManager.initialize();
+      // A spawned remote executor is a local tool host, not a product/UI
+      // session. Keep its background network surface empty: feature flags are
+      // only used for UI/onboarding/feedback experiments, never tool semantics.
+      if (process.env.DC_REMOTE_DEVICE !== 'true') {
+        deferLog('info', 'Initializing feature flags...');
+        await featureFlagManager.initialize();
+      }
     } catch (configError) {
       deferLog('error', `Failed to load configuration: ${configError instanceof Error ? configError.message : String(configError)}`);
       if (configError instanceof Error && configError.stack) {
@@ -143,8 +147,12 @@ async function runServer() {
       transport.sendLog('info', 'Server connected successfully');
       transport.sendLog('info', 'MCP fully initialized, all startup messages sent');
 
-      // Preemptively check/download Chrome for PDF generation (runs in background)
-      ensureChromeAvailable();
+      // Remote executors must not start an unsolicited browser download. PDF
+      // generation still resolves/installs Chrome lazily when that tool is
+      // explicitly invoked.
+      if (process.env.DC_REMOTE_DEVICE !== 'true') {
+        ensureChromeAvailable();
+      }
     };
 
     await server.connect(transport);

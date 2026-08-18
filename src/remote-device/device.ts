@@ -3,6 +3,8 @@
 import { RemoteChannel } from './remote-channel.js';
 import { SessionTokenOwner, type AuthSession } from './session-token-owner.js';
 import { RemoteResultTransport } from './remote-result-transport.js';
+import { RemoteRuntimeConfigStore, type RemoteRuntimeConfig } from './remote-runtime-config.js';
+import { RemoteCallMetrics } from './remote-call-metrics.js';
 import { createRemoteOutcomeIdentity, type RemoteResultDeliveryMode } from './remote-result-contract.js';
 import { DeviceAuthenticator } from './device-authenticator.js';
 import { DesktopCommanderIntegration } from './desktop-commander-integration.js';
@@ -25,6 +27,7 @@ const REMOTE_CONFIG_MAX_BYTES = 1024 * 1024;
 
 export interface MCPDeviceOptions {
     persistSession?: boolean;
+    minimalLiveTest?: boolean;
 }
 
 /**
@@ -175,6 +178,12 @@ export class MCPDevice {
     private isShuttingDown: boolean;
     private configPath: string;
     private persistSession: boolean;
+    private minimalLiveTest: boolean;
+    private runtimeConfig: RemoteRuntimeConfigStore | null;
+    private runtimeHeartbeatTimer: NodeJS.Timeout | null = null;
+    private callMetrics: RemoteCallMetrics;
+    private minimalCallActive = 0;
+    private minimalCallWaiters: Array<() => void> = [];
     private desktop: DesktopCommanderIntegration;
     private resultOutbox: RemoteResultOutbox;
     private resultOutboxFlushPromise: Promise<void> | null = null;
@@ -197,8 +206,28 @@ export class MCPDevice {
     constructor(options: MCPDeviceOptions = {}) {
         this.baseServerUrl = process.env.MCP_SERVER_URL || 'https://mcp.desktopcommander.app';
         this.tokenOwner = new SessionTokenOwner();
-        this.remoteChannel = new RemoteChannel(this.tokenOwner);
+        this.minimalLiveTest = options.minimalLiveTest === true;
+        this.remoteChannel = new RemoteChannel(this.tokenOwner, this.minimalLiveTest);
         this.resultTransport = new RemoteResultTransport(this.tokenOwner);
+        this.runtimeConfig = this.minimalLiveTest
+            ? new RemoteRuntimeConfigStore(
+                process.env.DC_REMOTE_RUNTIME_CONFIG
+                    || path.join(os.homedir(), '.desktop-commander-device', 'remote-runtime.json')
+            )
+            : null;
+        this.callMetrics = new RemoteCallMetrics(
+            process.env.DC_REMOTE_METRICS_LOG
+                || path.join(os.homedir(), '.desktop-commander-device', 'remote-call-metrics.jsonl')
+        );
+        this.runtimeConfig?.subscribe((config) => {
+            this.scheduleRuntimeHeartbeat();
+            this.drainMinimalCallWaiters();
+            if (this.deviceId) {
+                void this.remoteChannel.setMinimalInboundMode(config.inbound).catch((error: any) => {
+                    console.warn(`⚠ Inbound hot-switch failed; keeping current channel: ${error?.message || error}`);
+                });
+            }
+        });
         this.deviceId = undefined;
         this.isShuttingDown = false;
         this.configPath = path.join(os.homedir(), '.desktop-commander-device', 'device.json');
@@ -218,6 +247,30 @@ export class MCPDevice {
 
         // Initialize desktop integration. Construction itself must stay process-lifecycle neutral.
         this.desktop = new DesktopCommanderIntegration();
+    }
+
+    private scheduleRuntimeHeartbeat(): void {
+        if (this.runtimeHeartbeatTimer) {
+            clearTimeout(this.runtimeHeartbeatTimer);
+            this.runtimeHeartbeatTimer = null;
+        }
+        if (!this.minimalLiveTest || !this.runtimeConfig || !this.deviceId || this.isShuttingDown) return;
+        const intervalMs = this.runtimeConfig.current().heartbeatMs;
+        if (intervalMs <= 0) return;
+        this.runtimeHeartbeatTimer = setTimeout(async () => {
+            try { await this.remoteChannel.updateHeartbeat(this.deviceId!); }
+            finally { this.scheduleRuntimeHeartbeat(); }
+        }, intervalMs);
+        this.runtimeHeartbeatTimer.unref?.();
+    }
+
+    private stopRuntimeHeartbeat(): void {
+        if (this.runtimeHeartbeatTimer) clearTimeout(this.runtimeHeartbeatTimer);
+        this.runtimeHeartbeatTimer = null;
+    }
+
+    private shouldSignalResult(): boolean {
+        return !this.minimalLiveTest || this.runtimeConfig?.current().resultWake === true;
     }
 
     private setupShutdownHandlers() {
@@ -293,12 +346,14 @@ export class MCPDevice {
 
             // Initialize desktop integration
             await this.desktop.initialize();
+            if (this.runtimeConfig) await this.runtimeConfig.initialize();
 
             console.log(`⏳ Connecting to Remote MCP ${this.baseServerUrl}`);
             const { supabaseUrl, anonKey } = await this.fetchSupabaseConfig();
             console.log(`   - 🔌 Connected to Remote MCP`);
 
-            // Initialize independent inbound/control and outbound-result clients.
+            // Result transport has no Auth lifecycle or Realtime socket; in test
+            // mode it is also the owner of minimal/raw DB write variants.
             this.remoteChannel.initialize(supabaseUrl, anonKey);
             this.resultTransport.initialize(supabaseUrl, anonKey);
 
@@ -345,11 +400,6 @@ export class MCPDevice {
                 if (error) throw error;
             }
 
-
-            const currentUser = this.remoteChannel.user;
-            if (!currentUser) throw new Error('Authenticated user missing before result transport setup');
-            this.resultTransport.configureUser(currentUser.id);
-
             // Force save the current session immediately to ensure it's persisted
             await this.savePersistedConfig();
 
@@ -362,24 +412,33 @@ export class MCPDevice {
                 deviceName,
                 (payload: any) => this.handleNewToolCall(payload)
             );
-            this.desktop.setToolsChangedHandler(async () => {
-                if (!this.deviceId || this.isShuttingDown) return;
-                const capabilities = await this.desktop.listClientTools();
-                await this.remoteChannel.refreshDeviceCapabilities(capabilities);
-            });
+            if (this.minimalLiveTest && this.runtimeConfig) {
+                await this.remoteChannel.setMinimalInboundMode(this.runtimeConfig.current().inbound);
+            }
+            if (!this.minimalLiveTest) {
+                this.desktop.setToolsChangedHandler(async () => {
+                    if (!this.deviceId || this.isShuttingDown) return;
+                    const capabilities = await this.desktop.listClientTools();
+                    await this.remoteChannel.refreshDeviceCapabilities(capabilities);
+                });
 
-            this.startResultOutboxRetry();
-            void this.scheduleResultOutboxFlush().catch((error) => {
-                console.error('[DEBUG] Initial result outbox flush failed:', error?.message);
-            });
+                this.startResultOutboxRetry();
+                void this.scheduleResultOutboxFlush().catch((error) => {
+                    console.error('[DEBUG] Initial result outbox flush failed:', error?.message);
+                });
+            } else {
+                console.log('⚡ Minimal live transport test: postgres_changes → tool → terminal UPDATE');
+            }
 
             console.log('✅ Device ready:');
             console.log(`   - User:         ${this.remoteChannel.user!.email}`);
             console.log(`   - Device ID:    ${this.deviceId}`);
             console.log(`   - Device Name:  ${deviceName}`);
 
-            // Keep process alive
-            this.remoteChannel.startHeartbeat(this.deviceId!);
+            // Production keeps the normal tier-aware heartbeat. Test mode uses
+            // the hot-configured minimal lease so it remains reachable during long A/B runs.
+            if (this.minimalLiveTest) this.scheduleRuntimeHeartbeat();
+            else this.remoteChannel.startHeartbeat(this.deviceId!);
 
         } catch (error: any) {
             console.error(' - ❌ Device startup failed:', error.message);
@@ -633,29 +692,24 @@ export class MCPDevice {
                 // Once the database confirms it, retire the local retry entry BEFORE
                 // notification so an unconfirmed wake-up can never create an
                 // unbounded notification loop. Server-side recovery owns resume.
+                const terminalCommitStartedAt = Date.now();
                 await this.resultTransport.updateCallResult(
                     entry.callId, entry.status, entry.result, entry.errorMessage, entry.claimToken, priority, {
                         outcomeRevision: entry.outcomeRevision, outcomeHash: entry.outcomeHash, claimMetadata: entry.claimMetadata,
                     }
                 );
+                console.log(`↗ RESULT COMMIT ${entry.callId.slice(0, 8)} ${Date.now() - terminalCommitStartedAt}ms`);
                 this.remoteChannel.releaseCallClaim(entry.callId);
-                await this.resultOutbox.remove(entry.callId);
 
-                try {
-                    const notification = await this.resultTransport.notifyResult(entry.callId);
-                    if (notification && !notification.acknowledged && process.env.DEBUG_MODE === 'true') {
-                        console.debug(
-                            `[DEBUG] Result ${entry.callId} persisted; notification unconfirmed after ${notification.attempts} attempt(s).`
-                        );
+                // Terminal persistence is the handoff boundary. Wake the server
+                // immediately, then retire the local replay copy independently;
+                // neither wake acknowledgement nor filesystem cleanup owns this slot.
+                if (this.shouldSignalResult()) this.remoteChannel.signalResultAvailable(entry.callId);
+                void this.resultOutbox.remove(entry.callId).catch((cleanupError: any) => {
+                    if (process.env.DEBUG_MODE === 'true') {
+                        console.debug(`[DEBUG] Deferred result outbox cleanup for ${entry.callId}:`, cleanupError?.message);
                     }
-                } catch (notificationError: any) {
-                    // Never resurrect a durable result merely because the optional
-                    // wake-up path regressed. The server can recover the terminal row.
-                    console.debug(`[DEBUG] Result notification failed after persistence for ${entry.callId}:`, notificationError?.message);
-                    captureRemote('remote_device_result_notification_failed', {
-                        call_id: entry.callId, error: notificationError?.message
-                    }).catch(() => {});
-                }
+                });
             } finally {
                 release();
             }
@@ -692,15 +746,10 @@ export class MCPDevice {
                     }
                     throw error;
                 }
-                // Remote terminal persistence is authoritative even if the optional
-                // wake-up notification cannot be acknowledged.
+                // Remote terminal persistence is authoritative. Notification is
+                // best-effort acceleration and must not retain the delivery slot.
                 this.volatileOutcomes.delete(entry.callId);
-                try { await this.resultTransport.notifyResult(entry.callId); }
-                catch (notificationError: any) {
-                    captureRemote('remote_device_result_notification_failed', {
-                        call_id: entry.callId, error: notificationError?.message
-                    }).catch(() => {});
-                }
+                if (this.shouldSignalResult()) this.remoteChannel.signalResultAvailable(entry.callId);
             } finally {
                 release();
             }
@@ -806,12 +855,7 @@ export class MCPDevice {
             );
             this.remoteChannel.releaseCallClaim(callId);
             this.volatileOutcomes.delete(callId);
-            try { await this.resultTransport.notifyResult(callId); }
-            catch (notificationError: any) {
-                captureRemote('remote_device_result_notification_failed', {
-                    call_id: callId, error: notificationError?.message
-                }).catch(() => {});
-            }
+            if (this.shouldSignalResult()) this.remoteChannel.signalResultAvailable(callId);
             return;
         }
 
@@ -834,6 +878,29 @@ export class MCPDevice {
         });
     }
 
+    private async acquireMinimalCallLane(limit: number): Promise<() => void> {
+        if (this.minimalCallActive < limit) {
+            this.minimalCallActive += 1;
+        } else {
+            await new Promise<void>((resolve) => this.minimalCallWaiters.push(resolve));
+        }
+        let released = false;
+        return () => {
+            if (released) return;
+            released = true;
+            this.minimalCallActive = Math.max(0, this.minimalCallActive - 1);
+            this.drainMinimalCallWaiters();
+        };
+    }
+
+    private drainMinimalCallWaiters(): void {
+        const limit = this.runtimeConfig?.current().maxParallelCalls ?? 1;
+        while (this.minimalCallWaiters.length > 0 && this.minimalCallActive < limit) {
+            this.minimalCallActive += 1;
+            this.minimalCallWaiters.shift()?.();
+        }
+    }
+
     /** Record a handled call id, evicting the oldest once the cap is reached. */
     private rememberCallId(callId: string) {
         this.seenCallIds.add(callId);
@@ -844,7 +911,129 @@ export class MCPDevice {
         }
     }
 
+    private async handleMinimalLiveToolCall(
+        payload: any, policy: RemoteRuntimeConfig, receivedAtMs: number, laneWaitMs: number,
+    ): Promise<void> {
+        const toolCall = payload?.new;
+        if (!toolCall) return;
+        const { id: call_id, tool_name, tool_args, device_id, metadata = {}, created_at } = toolCall;
+        if (device_id && device_id !== this.deviceId) return;
+        if (this.seenCallIds.has(call_id)) return;
+        this.rememberCallId(call_id);
+        this.callMetrics.record({
+            stage: 'recv', callId: call_id, tool: tool_name, args: tool_args,
+            profile: policy.profile, inbound: policy.inbound, terminalWrite: policy.terminalWrite,
+            receivedAtMs, createdAt: created_at, laneWaitMs,
+        });
+
+        const descriptor = describeRemoteToolCall(tool_name, tool_args);
+        if (policy.diagnostics) {
+            const createdMs = Date.parse(String(created_at ?? ''));
+            if (Number.isFinite(createdMs)) {
+                console.log(`↘ INBOUND ${policy.inbound} ${call_id.slice(0, 8)} ${Math.max(0, Date.now() - createdMs)}ms`);
+            }
+            writeRemoteToolTrace('RECV', call_id, descriptor);
+        }
+
+        const executingStartedAt = Date.now();
+        let fencedClaim = false;
+        if (policy.executingWrite === 'simple') {
+            await this.resultTransport.markCallExecutingSimple(call_id);
+        } else if (policy.executingWrite === 'raw') {
+            await this.resultTransport.markCallExecutingRaw(call_id);
+        } else if (policy.executingWrite === 'fenced') {
+            fencedClaim = await this.remoteChannel.markCallExecuting(call_id, metadata);
+            if (!fencedClaim) return;
+        }
+        if (policy.diagnostics) {
+            console.log(`↗ DB EXEC ${policy.executingWrite} ${call_id.slice(0, 8)} ${Date.now() - executingStartedAt}ms`);
+        }
+
+        const startedAt = Date.now();
+        if (policy.diagnostics) writeRemoteToolTrace('START', call_id, descriptor);
+        let status: RemoteResultStatus = 'completed';
+        let result: unknown | null = null;
+        let errorMessage: string | null = null;
+        let shutdownRequested = false;
+        try {
+            if (tool_name === 'ping') {
+                result = { content: [{ type: 'text', text: `pong ${new Date().toISOString()}` }] };
+            } else if (tool_name === 'shutdown') {
+                result = { content: [{ type: 'text', text: `Shutdown initialized at ${new Date().toISOString()}` }] };
+                shutdownRequested = true;
+            } else {
+                result = await this.desktop.callClientTool(tool_name, tool_args, metadata);
+            }
+        } catch (error: any) {
+            status = 'failed';
+            errorMessage = error?.message ?? String(error);
+            console.error(`❌ Tool call ${tool_name} failed:`, errorMessage);
+        }
+        const toolMs = Date.now() - startedAt;
+        if (policy.diagnostics) {
+            writeRemoteToolTrace(status === 'completed' ? 'OK' : 'FAIL', call_id, descriptor, toolMs);
+        }
+        this.callMetrics.record({
+            stage: 'tool_done', callId: call_id, tool: tool_name, args: tool_args, result,
+            profile: policy.profile, inbound: policy.inbound, terminalWrite: policy.terminalWrite,
+            receivedAtMs, createdAt: created_at, laneWaitMs, toolMs, totalMs: Date.now() - receivedAtMs,
+        });
+
+        const terminalStartedAt = Date.now();
+        if (policy.outbox) {
+            await this.persistToolOutcome(call_id, status, result, errorMessage);
+        } else if (policy.terminalWrite === 'simple') {
+            await this.resultTransport.updateCallResultSimple(call_id, status, result, errorMessage);
+        } else if (policy.terminalWrite === 'raw') {
+            await this.resultTransport.updateCallResultRaw(call_id, status, result, errorMessage);
+        } else {
+            const claimToken = this.remoteChannel.getCallClaimToken(call_id);
+            if (!claimToken || !fencedClaim) throw new Error(`Missing fenced claim for terminal write ${call_id}`);
+            const claimMetadata = this.remoteChannel.getCallClaimMetadata(call_id) ?? undefined;
+            const identity = createRemoteOutcomeIdentity(status, result, errorMessage);
+            await this.resultTransport.updateCallResult(
+                call_id, status, identity.result, identity.errorMessage, claimToken, 'live', {
+                    outcomeRevision: identity.outcomeRevision,
+                    outcomeHash: identity.outcomeHash,
+                    claimMetadata,
+                },
+            );
+        }
+        if (!policy.outbox && fencedClaim) this.remoteChannel.releaseCallClaim(call_id);
+        if (policy.resultWake && !policy.outbox) this.remoteChannel.signalResultAvailable(call_id);
+        const terminalMs = Date.now() - terminalStartedAt;
+        if (policy.diagnostics) {
+            const stage = policy.outbox ? 'OUTBOX' : `DB TERMINAL ${policy.terminalWrite}`;
+            console.log(`↗ ${stage} ${call_id.slice(0, 8)} ${terminalMs}ms`);
+        }
+        this.callMetrics.record({
+            stage: 'terminal_done', callId: call_id, tool: tool_name, args: tool_args, result,
+            profile: policy.profile, inbound: policy.inbound, terminalWrite: policy.terminalWrite,
+            receivedAtMs, createdAt: created_at, laneWaitMs, toolMs, terminalMs, totalMs: Date.now() - receivedAtMs,
+        });
+
+        if (shutdownRequested) {
+            setTimeout(async () => {
+                await this.shutdown();
+                process.exit(0);
+            }, 1000);
+        }
+    }
+
     async handleNewToolCall(payload: any) {
+        if (this.minimalLiveTest) {
+            const receivedAtMs = Date.now();
+            const policy = this.runtimeConfig?.current();
+            if (!policy) throw new Error('Remote runtime config is unavailable in minimal live mode');
+            const releaseLane = await this.acquireMinimalCallLane(policy.maxParallelCalls);
+            const laneWaitMs = Date.now() - receivedAtMs;
+            try {
+                await this.handleMinimalLiveToolCall(payload, policy, receivedAtMs, laneWaitMs);
+            } finally {
+                releaseLane();
+            }
+            return;
+        }
         const toolCall = payload.new;
         // Expect toolCall to include a device_id field used to route calls to this device instance.
         const { id: call_id, tool_name, tool_args, device_id, metadata = {} } = toolCall;
@@ -998,6 +1187,8 @@ export class MCPDevice {
         }
 
         this.isShuttingDown = true;
+        this.stopRuntimeHeartbeat();
+        this.runtimeConfig?.stop();
         this.stopResultOutboxRetry();
         console.log('\n🛑 Shutting down device...');
         console.debug('[DEBUG] Shutdown initiated for device:', this.deviceId);
