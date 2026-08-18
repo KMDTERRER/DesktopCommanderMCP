@@ -11,6 +11,9 @@ import { BUILTIN_CONTEXT_SERVER_ID, callCodeContextOrchestrator, listBuiltinCont
 import { normalizeMcpArgumentsObject } from '../utils/mcp-arguments.js';
 import { isMcpCompatUri } from '../utils/mcp-uri.js';
 import { runWithAbortableTimeout } from '../utils/withTimeout.js';
+import { OperationScope, remainingOperationMs, waitForOperationUntil } from '../utils/operation-scope.js';
+import { retryWithPolicy } from '../utils/retry-policy.js';
+import { SerializedOperationOwner } from '../utils/serialized-operation-owner.js';
 import { cancelToolCallOwnedWork, getToolCallSessionIdentity } from '../utils/client-context.js';
 import { cancellationCauseOf, makeCancellationError } from '../utils/cancellation.js';
 import {
@@ -49,6 +52,8 @@ const MCP_READ_ONLY_POLICY_MAX_SERVERS = 128;
 const MCP_READ_ONLY_POLICY_MAX_TOOLS_PER_SERVER = 256;
 const MCP_READ_ONLY_POLICY_NAME = /^[A-Za-z0-9_.-]{1,128}$/;
 const SERENA_COLD_START_WAIT_MS = 15_000;
+const SERENA_READ_BATCH_MAX_CALLS = 16;
+const SERENA_READ_BATCH_MAX_CONCURRENCY = 8;
 const SERENA_SESSION_MAX = 32;
 const SERENA_SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const SERENA_FILE_CACHE_MAX_BYTES = 16 * 1024 * 1024;
@@ -174,16 +179,6 @@ function compatDispatchTimeout(
   return Math.min(totalTimeout, Math.max(processRequired, genericBudget));
 }
 
-function remainingDeadline(deadlineAt: number, label: string): number {
-  const remaining = deadlineAt - Date.now();
-  if (remaining <= 0) {
-    const error = new Error(`${label} deadline exceeded.`) as NodeJS.ErrnoException;
-    error.code = 'ETIMEDOUT';
-    throw error;
-  }
-  return remaining;
-}
-
 async function builtinAccelerators() {
   return import('./workspace-accelerators.js');
 }
@@ -207,7 +202,7 @@ async function assertExternalContextWorkspace(
   const bounded = boundedTimeout(timeoutMs, 10_000, MCP_CALL_TIMEOUT_MAX_MS, 'code_context workspace timeout');
   const deadlineAt = Date.now() + bounded;
   const requested = await runWithAbortableTimeout(
-    (_signal) => fs.realpath(path.resolve(requestedRoot)), remainingDeadline(deadlineAt, 'code_context requested workspace'),
+    (_signal) => fs.realpath(path.resolve(requestedRoot)), remainingOperationMs(deadlineAt, 'code_context requested workspace'),
     `Resolve code_context requested workspace ${requestedRoot}`,
   );
   const bound = await withRuntimeLease(deadlineAt, async (runtime) => {
@@ -216,7 +211,7 @@ async function assertExternalContextWorkspace(
   });
   if (!bound) throw new Error(`MCP server '${server}' has no authoritative workspace binding and cannot be used by code_context.`);
   const canonicalBound = await runWithAbortableTimeout(
-    (_signal) => fs.realpath(bound), remainingDeadline(deadlineAt, 'code_context bound workspace'),
+    (_signal) => fs.realpath(bound), remainingOperationMs(deadlineAt, 'code_context bound workspace'),
     `Resolve code_context bound workspace ${bound}`,
   );
   const exact = sameWorkspacePath(requested, canonicalBound);
@@ -241,25 +236,37 @@ async function callTrustedReadOnlyExternalMcpTool(
   return callExternalMcpTool({ server, tool, arguments: args, timeout_ms: timeoutMs });
 }
 
-function deadlineError(label: string): NodeJS.ErrnoException {
-  return makeCancellationError(
-    'deadline_exceeded', `${label} deadline exceeded.`, 'ETIMEDOUT',
-  ) as NodeJS.ErrnoException;
+async function assertSessionSerenaContextWorkspace(
+  session: string, requestedRoot: string, timeoutMs: number,
+): Promise<{ requestedRoot: string; boundRoot: string }> {
+  const bounded = boundedTimeout(timeoutMs, 10_000, MCP_CALL_TIMEOUT_MAX_MS, 'code_context Serena session workspace timeout');
+  const deadlineAt = Date.now() + bounded;
+  const binding = serenaBindingForCall(session);
+  const requested = await validateSerenaWorkspaceRoot(requestedRoot, deadlineAt);
+  const [canonicalRequested, canonicalBound] = await Promise.all([
+    waitForOperationUntil(fs.realpath(requested), deadlineAt, 'Resolve code_context Serena requested workspace'),
+    waitForOperationUntil(fs.realpath(binding.root), deadlineAt, 'Resolve code_context Serena session workspace'),
+  ]);
+  if (!sameWorkspacePath(canonicalRequested, canonicalBound)) {
+    throw new Error(
+      `Serena workspace session '${binding.token}' is bound to '${canonicalBound}' and cannot provide context for requested root '${canonicalRequested}'.`,
+    );
+  }
+  return { requestedRoot: canonicalRequested, boundRoot: canonicalBound };
 }
 
-async function waitForPromiseUntil<T>(promise: PromiseLike<T>, deadlineAt: number, label: string): Promise<T> {
-  const remaining = remainingDeadline(deadlineAt, label);
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      Promise.resolve(promise),
-      new Promise<T>((_resolve, reject) => {
-        timer = setTimeout(() => reject(deadlineError(label)), remaining);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
+async function callTrustedReadOnlySessionSerenaTool(
+  session: string, tool: string, args: Record<string, unknown>, timeoutMs: number,
+): Promise<unknown> {
+  const outcome = await callSessionSerenaTool({ tool, arguments: args, session }, timeoutMs, true);
+  if (outcome.status !== 'ready' || !('result' in outcome)) {
+    const error = new Error(
+      `Serena workspace session '${session}' is still ${outcome.status}; retry code_context with the same semanticSession.`,
+    ) as NodeJS.ErrnoException;
+    error.code = 'EAGAIN';
+    throw error;
   }
+  return outcome.result;
 }
 
 async function closeRuntimeBounded(
@@ -281,7 +288,7 @@ async function closeRuntimeBounded(
 }
 
 export const EXTERNAL_MCP_ROUTING_GUIDANCE =
-  'For repository work, start with desktop-accelerators/workspace_snapshot instead of repeating Git preflight shell calls. Reuse desktop-accelerators/workspace_delta cursors between turns to avoid rediscovering unchanged worktree state. For one broad context request that needs CRG impact plus bounded source retrieval, prefer desktop-context/code_context; add explicit symbolQueries only when exact symbol names are already known, because this deterministic layer never infers symbol identity from natural-language prose. For bulk or multi-symbol code_context lookups, keep include_info=false; request hover/type enrichment only for the small number of exact symbols that actually need it. For narrow retrieval or already-known graph/semantic steps, keep using context_pack, CRG, or Serena directly; when CRG already produced impacted_files, pass those paths as context_pack.seedFiles rather than repeating graph discovery. For C/C++ changes that need toolchain profile, build impact, and/or a build plan together, prefer desktop-accelerators/cpp_build_context: it reuses one request-scoped build_metadata snapshot and runs independent profile/impact derivation in parallel. For narrow questions, keep using build_metadata, cpp_toolchain_profile, cpp_build_impact, or cpp_build_plan directly. Use CRG/context_pack/Serena separately where architecture or symbol semantics matter. For routine configured CMake build/test verification, prefer desktop-accelerators/cpp_build_execute: omit buildDir when one configured CMake tree is unambiguous, or use configureMode=if_missing with an explicit project-owned configurePreset so CMake owns binaryDir, generator, compiler, linker, toolchain, preset and parallelism semantics. It reuses cpp_build_context/plan plus the native start/wait owner and returns bounded normalized diagnostics in one call. Keep cpp_build_context -> desktop-core/start_process -> wait_process for custom orchestration and debugging. Prefer desktop-accelerators/edit_file for multiple exact edits in one text file, desktop-accelerators/apply_patch for bounded multi-file text changes, desktop-accelerators/safe_fix for preview-only engine-classified safe fixes before applying them through the mutation tools, and desktop-accelerators/wait_process for finite builds/tests instead of repeated read_process_output polling. Use desktop-accelerators/ast_search or ast_rule_search for bounded structural syntax queries before broad grep/read loops. When the same syntax shape must be changed repeatedly, prefer ast_rewrite in preview mode before text edits; apply only with its regenerated preview identity/exact file set, and keep Serena/LSP preferred for semantic rename/type-aware refactoring. For configured programmatic CRG adapters, use get_impact_radius_tool/get_review_context_tool with explicit changed_files when the task already has a bounded change set, and use query_graph_tool only for explicit graph relationships. The adapter owns mandatory freshness reconciliation; do not call CRG build/update, semantic-search, or traversal tools from the agent path. Use Serena or SCIP for type- and symbol-aware semantics. When a configured external MCP server provides a task-specific semantic tool, prefer it over generic filesystem text search/read or shell emulation. For code intelligence, discover the bound server with mcp_list_tools and prefer semantic symbols, references, implementations, diagnostics, and refactoring tools when applicable; use native search/read as fallback. Inspect an exact tool schema before calling it unless already known. Frozen clients use read_file(mcp://<server>/<tool>) for schema discovery when options are omitted. Trusted read-only desktop-accelerators and external tools explicitly allowlisted by the local DESKTOP_COMMANDER_MCP_READ_ONLY_POLICY may be invoked with read_file(path=mcp://<server>/<tool>?timeout_ms=..., options=<flat downstream arguments>); the URI owns the bridge deadline so any downstream timeout_ms field remains available to the tool. Downstream MCP readOnlyHint annotations never grant this route. Mutating and not-yet-trusted tools continue through write_file(path=mcp://<server>/<tool>, content=<the downstream arguments JSON object>). The content is passed as the tool arguments without reinterpretation. If a bridge deadline is needed, put it in the URI query, e.g. mcp://<server>/<tool>?timeout_ms=45000. The historical {arguments:{...},timeout_ms:N} wrapper is supported when unambiguous; for an open/dynamic downstream schema use ?envelope=legacy explicitly. desktop-core mirrors current Desktop Commander core schemas through the same stable path.';
+  'For repository work, start with desktop-accelerators/workspace_snapshot instead of repeating Git preflight shell calls. For code-text discovery that would otherwise require start_search -> get_more_search_results -> read_file, prefer one desktop-accelerators/context_pack call; use ast_search for structural syntax and keep generic start_search for non-code/background discovery. Reuse desktop-accelerators/workspace_delta cursors between turns to avoid rediscovering unchanged worktree state. For one broad context request that needs CRG impact plus bounded source retrieval, prefer desktop-context/code_context; add explicit symbolQueries only when exact symbol names are already known, because this deterministic layer never infers symbol identity from natural-language prose. When serena_workspace already owns the task workspace, pass its workspaceSession as code_context.semanticSession instead of rebinding a fixed Serena server or issuing separate serena_call rounds. Exact Serena hits expand to bounded cross-file references by default, and those files are promoted into context_pack; use semanticExpand=all only when implementations matter. For bulk or multi-symbol code_context lookups, keep include_info=false; request hover/type enrichment only for the small number of exact symbols that actually need it. For several already-known independent Serena read queries in one workspace, prefer desktop-context/serena_read_batch instead of serial serena_call rounds. For narrow retrieval or a single graph/semantic step, keep using context_pack, CRG, or Serena directly; when CRG already produced impacted_files, pass those paths as context_pack.seedFiles rather than repeating graph discovery. For C/C++ changes that need toolchain profile, build impact, and/or a build plan together, prefer desktop-accelerators/cpp_build_context: it reuses one request-scoped build_metadata snapshot and runs independent profile/impact derivation in parallel. For narrow questions, keep using build_metadata, cpp_toolchain_profile, cpp_build_impact, or cpp_build_plan directly. Use CRG/context_pack/Serena separately where architecture or symbol semantics matter. For routine configured CMake build/test verification, prefer desktop-accelerators/cpp_build_execute: omit buildDir when one configured CMake tree is unambiguous, or use configureMode=if_missing with an explicit project-owned configurePreset so CMake owns binaryDir, generator, compiler, linker, toolchain, preset and parallelism semantics. It reuses cpp_build_context/plan plus the native start/wait owner and returns bounded normalized diagnostics in one call. Keep cpp_build_context -> desktop-core/start_process -> wait_process for custom orchestration and debugging. Prefer desktop-accelerators/edit_file for multiple exact edits in one text file, desktop-accelerators/apply_patch for bounded multi-file text changes, desktop-accelerators/safe_fix for preview-only engine-classified safe fixes before applying them through the mutation tools, and desktop-accelerators/wait_process for finite builds/tests instead of repeated read_process_output polling. Use desktop-accelerators/ast_search or ast_rule_search for bounded structural syntax queries before broad grep/read loops. When the same syntax shape must be changed repeatedly, prefer ast_rewrite in preview mode before text edits; apply only with its regenerated preview identity/exact file set, and keep Serena/LSP preferred for semantic rename/type-aware refactoring. For configured programmatic CRG adapters, use get_impact_radius_tool/get_review_context_tool with explicit changed_files when the task already has a bounded change set, and use query_graph_tool only for explicit graph relationships. The adapter owns mandatory freshness reconciliation; do not call CRG build/update, semantic-search, or traversal tools from the agent path. Use Serena or SCIP for type- and symbol-aware semantics. When a configured external MCP server provides a task-specific semantic tool, prefer it over generic filesystem text search/read or shell emulation. For code intelligence, discover the bound server with mcp_list_tools and prefer semantic symbols, references, implementations, diagnostics, and refactoring tools when applicable; use native search/read as fallback. Inspect an exact tool schema before calling it unless already known. Frozen clients use read_file(mcp://<server>/<tool>) for schema discovery when options are omitted. Trusted read-only desktop-accelerators and external tools explicitly allowlisted by the local DESKTOP_COMMANDER_MCP_READ_ONLY_POLICY may be invoked with read_file(path=mcp://<server>/<tool>?timeout_ms=..., options=<flat downstream arguments>); the URI owns the bridge deadline so any downstream timeout_ms field remains available to the tool. Downstream MCP readOnlyHint annotations never grant this route. Mutating and not-yet-trusted tools continue through write_file(path=mcp://<server>/<tool>, content=<the downstream arguments JSON object>). The content is passed as the tool arguments without reinterpretation. If a bridge deadline is needed, put it in the URI query, e.g. mcp://<server>/<tool>?timeout_ms=45000. The historical {arguments:{...},timeout_ms:N} wrapper is supported when unambiguous; for an open/dynamic downstream schema use ?envelope=legacy explicitly. desktop-core mirrors current Desktop Commander core schemas through the same stable path.';
 
 type ConfigSourceStamp = { source: string; size: number; mtimeMs: number; ctimeMs: number };
 
@@ -332,23 +339,19 @@ let runtimeState: RuntimeState | undefined;
 let runtimeGenerationCounter = 0;
 const serenaSessionBindings = new Map<string, SerenaSessionBinding>();
 const serenaImplicitSessions = new Map<string, string>();
-let runtimeMutationTail: Promise<void> = Promise.resolve();
+const runtimeMutationOwner = new SerializedOperationOwner();
 
 async function withRuntimeMutationLock<T>(
   deadlineAt: number,
   operation: () => Promise<T>,
 ): Promise<T> {
-  const previous = runtimeMutationTail.catch(() => undefined);
-  let release!: () => void;
-  const turn = new Promise<void>((resolve) => { release = resolve; });
-  runtimeMutationTail = previous.then(() => turn);
+  const scope = new OperationScope({ label: 'External MCP runtime state mutation', deadlineAt });
   try {
-    await waitForPromiseUntil(previous, deadlineAt, 'Wait for external MCP runtime state lock');
-    return await operation();
+    return await runtimeMutationOwner.runExclusive(
+      scope, operation, 'Wait for external MCP runtime state lock',
+    );
   } finally {
-    // If this caller timed out before acquiring its turn, pre-resolving the turn
-    // keeps the chain moving as soon as the previous owner releases it.
-    release();
+    scope.dispose();
   }
 }
 
@@ -359,11 +362,7 @@ async function configuredPath(deadlineAt = Date.now() + MCP_CALL_TIMEOUT_MAX_MS)
   const fromEnv = process.env.DESKTOP_COMMANDER_MCP_CONFIG?.trim();
   if (fromEnv) return path.resolve(fromEnv);
 
-  const fromConfig = await waitForPromiseUntil(
-    configManager.getValue('externalMcpConfigPath'),
-    deadlineAt,
-    'Read external MCP config path',
-  );
+  const fromConfig = await waitForOperationUntil(configManager.getValue('externalMcpConfigPath'), deadlineAt, 'Read external MCP config path');
   const raw = typeof fromConfig === 'string' ? fromConfig.trim() : '';
   if (!raw) {
     throw new Error('External MCP is not configured. Set externalMcpConfigPath.');
@@ -381,11 +380,7 @@ type RuntimeDescriptor = {
 
 async function statConfigSources(sources: string[], deadlineAt: number): Promise<ConfigSourceStamp[]> {
   return Promise.all([...sources].sort().map(async (source) => {
-    const stats = await waitForPromiseUntil(
-      fs.stat(source),
-      deadlineAt,
-      `Stat external MCP config source ${source}`,
-    );
+    const stats = await waitForOperationUntil(fs.stat(source), deadlineAt, `Stat external MCP config source ${source}`);
     return { source, size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs };
   }));
 }
@@ -419,7 +414,7 @@ async function fingerprintConfigSources(sources: string[], deadlineAt: number): 
     const readLabel = `Read external MCP config source ${source}`;
     hash.update(await runWithAbortableTimeout(
       (signal) => fs.readFile(source, { signal }),
-      remainingDeadline(deadlineAt, readLabel),
+      remainingOperationMs(deadlineAt, readLabel),
       readLabel,
     ));
     hash.update('\0');
@@ -428,15 +423,11 @@ async function fingerprintConfigSources(sources: string[], deadlineAt: number): 
 }
 
 async function loadStableRuntimeDescriptor(configPath: string, deadlineAt: number): Promise<RuntimeDescriptor> {
-  const module = await waitForPromiseUntil(import('mcporter'), deadlineAt, 'Load mcporter config module');
+  const module = await waitForOperationUntil(import('mcporter'), deadlineAt, 'Load mcporter config module');
   let previousFingerprint: string | undefined;
   let previousSources: string[] | undefined;
   for (let attempt = 0; attempt < 4; attempt++) {
-    const servers = await waitForPromiseUntil(
-      module.loadServerDefinitions({ configPath, rootDir: MCP_RUNTIME_ROOT_DIR }),
-      deadlineAt,
-      'Load external MCP server definitions',
-    );
+    const servers = await waitForOperationUntil(module.loadServerDefinitions({ configPath, rootDir: MCP_RUNTIME_ROOT_DIR }), deadlineAt, 'Load external MCP server definitions');
     const configSources = definitionSourcePaths(configPath, servers);
     const stampsBeforeFingerprint = await statConfigSources(configSources, deadlineAt);
     const configFingerprint = await fingerprintConfigSources(configSources, deadlineAt);
@@ -477,16 +468,11 @@ function createRuntimeStartup(
     rootDir: MCP_RUNTIME_ROOT_DIR,
     clientInfo: { name: 'desktop-commander', version: VERSION },
   });
-  let timer: NodeJS.Timeout | undefined;
-  const startup = new Promise<Runtime>((resolve, reject) => {
-    timer = setTimeout(
-      () => reject(deadlineError('External MCP runtime startup')),
-      MCP_RUNTIME_STARTUP_TIMEOUT_MS,
-    );
-    rawStartup.then(resolve, reject);
-  }).finally(() => {
-    if (timer) clearTimeout(timer);
-  });
+  const startup = waitForOperationUntil(
+    rawStartup,
+    Date.now() + MCP_RUNTIME_STARTUP_TIMEOUT_MS,
+    'External MCP runtime startup',
+  );
   const state: RuntimeState = {
     generation: ++runtimeGenerationCounter,
     configPath: descriptor.configPath,
@@ -514,11 +500,7 @@ function createRuntimeStartup(
 async function closeRuntimeStateBounded(state: RuntimeState, timeoutMs: number): Promise<void> {
   const deadlineAt = Date.now() + Math.max(1, timeoutMs);
   try {
-    const runtime = await waitForPromiseUntil(
-      state.startup,
-      deadlineAt,
-      'Wait for external MCP runtime before close',
-    );
+    const runtime = await waitForOperationUntil(state.startup, deadlineAt, 'Wait for external MCP runtime before close');
     const remaining = Math.max(1, deadlineAt - Date.now());
     await closeRuntimeBounded(runtime, remaining);
   } catch {
@@ -543,7 +525,7 @@ async function waitForRuntimeIdle(state: RuntimeState, deadlineAt: number): Prom
   const idle = new Promise<void>((resolve) => { resolveIdle = resolve; });
   state.idleWaiters.add(resolveIdle);
   try {
-    await waitForPromiseUntil(idle, deadlineAt, 'Wait for active external MCP calls before reload');
+    await waitForOperationUntil(idle, deadlineAt, 'Wait for active external MCP calls before reload');
   } finally {
     state.idleWaiters.delete(resolveIdle);
   }
@@ -583,16 +565,12 @@ async function acquireRuntime(deadlineAt = Date.now() + MCP_CALL_TIMEOUT_MAX_MS)
       if (runtimeState === current) runtimeState = undefined;
       const closeBudget = Math.min(
         MCP_RUNTIME_CLOSE_TIMEOUT_MS,
-        remainingDeadline(deadlineAt, 'Reload external MCP runtime'),
+        remainingOperationMs(deadlineAt, 'Reload external MCP runtime'),
       );
       await closeRuntimeStateBounded(current, closeBudget);
     }
 
-    const module = await waitForPromiseUntil(
-      import('mcporter'),
-      deadlineAt,
-      'Load mcporter runtime module',
-    );
+    const module = await waitForOperationUntil(import('mcporter'), deadlineAt, 'Load mcporter runtime module');
     const next = createRuntimeStartup(descriptor, module.createRuntime);
     next.activeUsers = 1;
     runtimeState = next;
@@ -602,7 +580,7 @@ async function acquireRuntime(deadlineAt = Date.now() + MCP_CALL_TIMEOUT_MAX_MS)
   try {
     // Do not hold the mutation lock while the stdio server performs its potentially
     // slow initialization; concurrent callers share this one startup promise.
-    const runtime = await waitForPromiseUntil(selected.startup, deadlineAt, 'External MCP runtime startup');
+    const runtime = await waitForOperationUntil(selected.startup, deadlineAt, 'External MCP runtime startup');
     return { state: selected, runtime };
   } catch (error) {
     releaseRuntimeLease(selected);
@@ -680,14 +658,12 @@ async function recoverDisconnectedRuntimeServer(
   }
   const existing = recoveries.get(server);
   if (existing) {
-    await waitForPromiseUntil(existing, deadlineAt, `Recover disconnected MCP server ${server}`);
+    await waitForOperationUntil(existing, deadlineAt, `Recover disconnected MCP server ${server}`);
     return;
   }
 
   invalidateToolList(runtime, server);
-  const recovery = waitForPromiseUntil(
-    runtime.close(server), deadlineAt, `Reset disconnected MCP server ${server}`,
-  );
+  const recovery = waitForOperationUntil(runtime.close(server), deadlineAt, `Reset disconnected MCP server ${server}`);
   recoveries.set(server, recovery);
   try {
     await recovery;
@@ -759,13 +735,9 @@ async function listRuntimeTools(
 ): Promise<DiscoveredTool[]> {
   const timeoutMs = Math.min(
     MCP_LIST_TIMEOUT_MAX_MS,
-    remainingDeadline(deadlineAt, 'External MCP tool discovery'),
+    remainingOperationMs(deadlineAt, 'External MCP tool discovery'),
   );
-  const context = await waitForPromiseUntil(
-    runtime.connect(server, { disableOAuth: true, oauthTimeoutMs: timeoutMs }),
-    deadlineAt,
-    `Connect MCP server ${server} for tool discovery`,
-  );
+  const context = await waitForOperationUntil(runtime.connect(server, { disableOAuth: true, oauthTimeoutMs: timeoutMs }), deadlineAt, `Connect MCP server ${server} for tool discovery`);
   const cache = toolCacheFor(runtime);
   installToolListChangeInvalidation(runtime, server, context.client);
   const cached = cache.get(server);
@@ -782,16 +754,12 @@ async function listRuntimeTools(
     let snapshotNodes = 0;
 
     for (let page = 0; page < MCP_LIST_MAX_PAGES; page++) {
-      const requestTimeout = Math.min(timeoutMs, remainingDeadline(deadlineAt, 'External MCP tool discovery'));
-      const response = await waitForPromiseUntil(
-        context.client.listTools(cursor ? { cursor } : undefined, {
-          timeout: requestTimeout,
-          resetTimeoutOnProgress: true,
-          maxTotalTimeout: requestTimeout,
-        }),
-        deadlineAt,
-        `List raw MCP tools for ${server}`,
-      );
+      const requestTimeout = Math.min(timeoutMs, remainingOperationMs(deadlineAt, 'External MCP tool discovery'));
+      const response = await waitForOperationUntil(context.client.listTools(cursor ? { cursor } : undefined, {
+        timeout: requestTimeout,
+        resetTimeoutOnProgress: true,
+        maxTotalTimeout: requestTimeout,
+      }), deadlineAt, `List raw MCP tools for ${server}`);
 
       // A tools/list_changed received while this page was in flight invalidates
       // the whole paginated snapshot. Never mix pages or publish/cache a list
@@ -858,6 +826,7 @@ async function callRuntimeTool(
   tool: string,
   args: Record<string, unknown>,
   deadlineAt: number,
+  provenRetrySafety?: 'read_only',
 ) {
   if (!toolAllowedByDefinition(runtime, server, tool)) {
     throw new Error(`Tool '${tool}' is not accessible on MCP server '${server}' (blocked by configuration).`);
@@ -865,39 +834,48 @@ async function callRuntimeTool(
   const invokeOnce = async () => {
     const connectTimeout = Math.min(
       MCP_CALL_TIMEOUT_MAX_MS,
-      remainingDeadline(deadlineAt, 'Connect external MCP tool call'),
+      remainingOperationMs(deadlineAt, 'Connect external MCP tool call'),
     );
-    const context = await waitForPromiseUntil(
-      runtime.connect(server, { disableOAuth: true, oauthTimeoutMs: connectTimeout }),
-      deadlineAt,
-      `Connect MCP server ${server} for tool call`,
-    );
+    const context = await waitForOperationUntil(runtime.connect(server, { disableOAuth: true, oauthTimeoutMs: connectTimeout }), deadlineAt, `Connect MCP server ${server} for tool call`);
     const requestTimeout = Math.min(
       MCP_CALL_TIMEOUT_MAX_MS,
-      remainingDeadline(deadlineAt, 'External MCP tool call'),
+      remainingOperationMs(deadlineAt, 'External MCP tool call'),
     );
     // Call the raw MCP client instead of Runtime.callTool(). mcporter's wrapper
     // resets/closes the shared cached context for any ordinary Error, including a
     // single request timeout. Raw request-level timeouts keep unrelated concurrent
     // calls on the same stdio connection alive.
-    return waitForPromiseUntil(
-      context.client.callTool(
-        { name: tool, arguments: args },
-        { timeout: requestTimeout, resetTimeoutOnProgress: true, maxTotalTimeout: requestTimeout },
-      ),
-      deadlineAt,
-      `Call MCP tool ${server}/${tool}`,
-    );
+    return waitForOperationUntil(context.client.callTool(
+      { name: tool, arguments: args },
+      { timeout: requestTimeout, resetTimeoutOnProgress: true, maxTotalTimeout: requestTimeout },
+    ), deadlineAt, `Call MCP tool ${server}/${tool}`);
   };
 
+  const retryReadOnly = provenRetrySafety === 'read_only' || isLocallyTrustedReadOnlyExternalTool(server, tool);
+  if (!retryReadOnly) {
+    try {
+      return await invokeOnce();
+    } catch (error) {
+      if (isExternalMcpDisconnectedError(error)) {
+        await recoverDisconnectedRuntimeServer(runtime, server, deadlineAt);
+      }
+      throw error;
+    }
+  }
+
+  const retryScope = new OperationScope({
+    label: `Retry trusted read-only MCP tool ${server}/${tool}`, deadlineAt,
+  });
   try {
-    return await invokeOnce();
-  } catch (error) {
-    if (!isExternalMcpDisconnectedError(error)) throw error;
-    const retryReadOnly = isLocallyTrustedReadOnlyExternalTool(server, tool);
-    await recoverDisconnectedRuntimeServer(runtime, server, deadlineAt);
-    if (!retryReadOnly) throw error;
-    return invokeOnce();
+    return await retryWithPolicy(retryScope, {
+      safety: 'read_only', maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0, jitter: 'none',
+      isRetryable: (error) => isExternalMcpDisconnectedError(error),
+    }, async ({ attempt }) => {
+      if (attempt > 1) await recoverDisconnectedRuntimeServer(runtime, server, deadlineAt);
+      return invokeOnce();
+    });
+  } finally {
+    retryScope.dispose();
   }
 }
 
@@ -958,8 +936,8 @@ async function validateSerenaWorkspaceRoot(value: unknown, deadlineAt: number): 
   if (typeof value !== 'string' || !value.trim() || value.length > 4096) {
     throw new Error('serena_workspace.root must be a non-empty project directory path.');
   }
-  const validated = await validatePath(value.trim(), remainingDeadline(deadlineAt, 'Validate Serena workspace root'));
-  const stats = await waitForPromiseUntil(fs.stat(validated), deadlineAt, 'Stat Serena workspace root');
+  const validated = await validatePath(value.trim(), remainingOperationMs(deadlineAt, 'Validate Serena workspace root'));
+  const stats = await waitForOperationUntil(fs.stat(validated), deadlineAt, 'Stat Serena workspace root');
   if (!stats.isDirectory()) throw new Error(`Serena workspace root is not a directory: ${validated}`);
   return validated;
 }
@@ -1180,8 +1158,8 @@ async function serenaFileCacheDependency(
   if (!requested || path.isAbsolute(requested)) return undefined;
   const lexical = path.resolve(binding.root, requested);
   const [rootReal, fileReal] = await Promise.all([
-    waitForPromiseUntil(fs.realpath(binding.root), deadlineAt, 'Resolve Serena cache workspace root'),
-    waitForPromiseUntil(fs.realpath(lexical), deadlineAt, 'Resolve Serena cache dependency'),
+    waitForOperationUntil(fs.realpath(binding.root), deadlineAt, 'Resolve Serena cache workspace root'),
+    waitForOperationUntil(fs.realpath(lexical), deadlineAt, 'Resolve Serena cache dependency'),
   ]).catch((error) => {
     if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return [undefined, undefined] as const;
     throw error;
@@ -1189,11 +1167,11 @@ async function serenaFileCacheDependency(
   if (!rootReal || !fileReal) return undefined;
   const relative = path.relative(rootReal, fileReal);
   if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return undefined;
-  const stats = await waitForPromiseUntil(fs.stat(fileReal), deadlineAt, 'Stat Serena cache dependency');
+  const stats = await waitForOperationUntil(fs.stat(fileReal), deadlineAt, 'Stat Serena cache dependency');
   if (!stats.isFile() || stats.size > SERENA_FILE_CACHE_MAX_BYTES) return undefined;
   const bytes = await runWithAbortableTimeout(
     (signal) => fs.readFile(fileReal, { signal }),
-    remainingDeadline(deadlineAt, 'Read Serena cache dependency'),
+    remainingOperationMs(deadlineAt, 'Read Serena cache dependency'),
     'Read Serena cache dependency',
   );
   return {
@@ -1202,7 +1180,9 @@ async function serenaFileCacheDependency(
   };
 }
 
-export async function callSessionSerenaTool(args: Record<string, unknown>, timeoutMs = MCP_CALL_TIMEOUT_DEFAULT_MS) {
+export async function callSessionSerenaTool(
+  args: Record<string, unknown>, timeoutMs = MCP_CALL_TIMEOUT_DEFAULT_MS, requireReadOnly = false,
+) {
   const allowed = new Set(['tool', 'arguments', 'session']);
   const unknown = Object.keys(args).filter((key) => !allowed.has(key));
   if (unknown.length) throw new Error(`serena_call received unsupported argument(s): ${unknown.join(', ')}.`);
@@ -1224,7 +1204,12 @@ export async function callSessionSerenaTool(args: Record<string, unknown>, timeo
     return { tool: found, runtimeGeneration: state.generation };
   });
 
-  if (discoveredToolReadOnly(selected.tool)) {
+  const selectedReadOnly = discoveredToolReadOnly(selected.tool);
+  if (requireReadOnly && !selectedReadOnly) {
+    throw new Error(`Serena read batch requires a read-only tool; '${tool}' is not read-only.`);
+  }
+
+  if (selectedReadOnly) {
     const cacheKey = serenaReadCacheKey(tool, toolArguments);
     const dependency = await serenaFileCacheDependency(binding, tool, toolArguments, discoveryDeadline);
     const cached = binding.completedReads.get(cacheKey);
@@ -1244,12 +1229,12 @@ export async function callSessionSerenaTool(args: Record<string, unknown>, timeo
       };
       pendingPromise = withRuntimeLease(callDeadline, async (runtime, state) => {
         await ensureSerenaDefinition(runtime, binding, callDeadline);
-        try {
-          return { result: await callRuntimeTool(runtime, binding.serverName, tool, toolArguments, callDeadline), runtimeGeneration: state.generation };
-        } catch (error) {
-          if (!isExternalMcpDisconnectedError(error)) throw error;
-          return { result: await callRuntimeTool(runtime, binding.serverName, tool, toolArguments, callDeadline), runtimeGeneration: state.generation };
-        }
+        return {
+          result: await callRuntimeTool(
+            runtime, binding.serverName, tool, toolArguments, callDeadline, 'read_only',
+          ),
+          runtimeGeneration: state.generation,
+        };
       }).then(({ result, runtimeGeneration }) => {
         binding.semanticReady = true;
         binding.lastError = undefined;
@@ -1302,6 +1287,77 @@ export async function callSessionSerenaTool(args: Record<string, unknown>, timeo
   });
   binding.semanticReady = true;
   return { status: 'ready', workspaceSession: binding.token, root: binding.root, cached: false, result };
+}
+
+export async function callSessionSerenaReadBatch(
+  args: Record<string, unknown>, timeoutMs = MCP_CALL_TIMEOUT_DEFAULT_MS,
+) {
+  const allowed = new Set(['calls', 'session', 'concurrency']);
+  const unknown = Object.keys(args).filter((key) => !allowed.has(key));
+  if (unknown.length) throw new Error(`serena_read_batch received unsupported argument(s): ${unknown.join(', ')}.`);
+  if (!Array.isArray(args.calls) || args.calls.length < 1 || args.calls.length > SERENA_READ_BATCH_MAX_CALLS) {
+    throw new Error(`serena_read_batch.calls must contain 1-${SERENA_READ_BATCH_MAX_CALLS} calls.`);
+  }
+  const concurrency = args.concurrency === undefined ? 4 : Number(args.concurrency);
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > SERENA_READ_BATCH_MAX_CONCURRENCY) {
+    throw new Error(`serena_read_batch.concurrency must be an integer from 1 to ${SERENA_READ_BATCH_MAX_CONCURRENCY}.`);
+  }
+  const calls = args.calls.map((raw, index) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error(`serena_read_batch.calls[${index}] must be an object.`);
+    }
+    const item = raw as Record<string, unknown>;
+    const itemUnknown = Object.keys(item).filter((key) => key !== 'tool' && key !== 'arguments');
+    if (itemUnknown.length) {
+      throw new Error(`serena_read_batch.calls[${index}] has unsupported field(s): ${itemUnknown.join(', ')}.`);
+    }
+    if (typeof item.tool !== 'string' || !MCP_READ_ONLY_POLICY_NAME.test(item.tool)) {
+      throw new Error(`serena_read_batch.calls[${index}].tool is invalid.`);
+    }
+    return {
+      tool: item.tool,
+      arguments: normalizeMcpArgumentsObject(item.arguments, `serena_read_batch.calls[${index}].arguments`),
+    };
+  });
+
+  const binding = serenaBindingForCall(args.session);
+  const warmup = startSerenaWarmup(binding);
+  const warm = await settledWithin(warmup, Math.min(SERENA_COLD_START_WAIT_MS, timeoutMs));
+  if (!warm.done) {
+    return { ...serenaColdStart(binding, 'transport'), results: [], requestedCalls: calls.length };
+  }
+  await warmup;
+
+  const deadlineAt = Date.now() + Math.min(timeoutMs, MCP_CALL_TIMEOUT_MAX_MS);
+  const results = new Array<unknown>(calls.length);
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= calls.length) return;
+      const item = calls[index];
+      const remainingMs = remainingOperationMs(deadlineAt, `Serena read batch call ${index}`);
+      const outcome = await callSessionSerenaTool({
+        tool: item.tool, arguments: item.arguments, session: binding.token,
+      }, remainingMs, true);
+      results[index] = 'cached' in outcome && 'result' in outcome
+        ? {
+            index, tool: item.tool, status: outcome.status, cached: outcome.cached === true,
+            ...(outcome.result === undefined ? {} : { result: outcome.result }),
+          }
+        : { index, tool: item.tool, status: outcome.status };
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, calls.length) }, worker));
+  const allReady = results.every((value) =>
+    !!value && typeof value === 'object' && (value as Record<string, unknown>).status === 'ready');
+  return {
+    status: allReady ? 'ready' : 'cold_start',
+    workspaceSession: binding.token,
+    root: binding.root,
+    concurrency: Math.min(concurrency, calls.length),
+    results,
+  };
 }
 
 export function assertBoundedProxyValue(value: unknown, label: string): { bytes: number; nodes: number } {
@@ -1385,7 +1441,7 @@ export async function listExternalMcpTools(args: {
     let externalMcpError: string | undefined;
     try {
       externalServers = await withRuntimeLease(deadlineAt, (runtime) => {
-        remainingDeadline(deadlineAt, 'mcp_list_tools');
+        remainingOperationMs(deadlineAt, 'mcp_list_tools');
         return runtime.listServers();
       });
     } catch (error) {
@@ -1433,11 +1489,7 @@ export async function listExternalMcpTools(args: {
     async (runtime) => {
       const tools = await listRuntimeTools(runtime, args.server!, Boolean(args.tool), deadlineAt);
       const instructions = runtime.getInstructions
-        ? await waitForPromiseUntil(
-            runtime.getInstructions(args.server!),
-            deadlineAt,
-            `Read MCP server instructions for ${args.server}`,
-          )
+        ? await waitForOperationUntil(runtime.getInstructions(args.server!), deadlineAt, `Read MCP server instructions for ${args.server}`)
         : undefined;
       return { tools, instructions };
     },
@@ -1491,7 +1543,7 @@ export async function callExternalMcpTool(args: {
       return callBuiltinAcceleratorTool(args.tool, toolArguments, operationTimeoutMs);
     })();
     try {
-      return textResult(await waitForPromiseUntil(operation, responseDeadlineAt, 'Builtin MCP accelerator call'));
+      return textResult(await waitForOperationUntil(operation, responseDeadlineAt, 'Builtin MCP accelerator call'));
     } catch (error) {
       // cpp_build_execute can own a native child through start_process. If the
       // compatibility response boundary wins the race, terminate request-owned
@@ -1513,7 +1565,7 @@ export async function callExternalMcpTool(args: {
       return callBuiltinCoreTool(args.tool, toolArguments);
     })();
     try {
-      return await waitForPromiseUntil(operation, deadlineAt, `Builtin Desktop Commander tool ${args.tool}`);
+      return await waitForOperationUntil(operation, deadlineAt, `Builtin Desktop Commander tool ${args.tool}`);
     } catch (error) {
       // If this compatibility layer itself exhausts the response budget before
       // start_process can publish its PID, the request-owned child must not
@@ -1532,11 +1584,15 @@ export async function callExternalMcpTool(args: {
     listBuiltinContextTools(args.tool);
     if (args.tool === 'serena_workspace') {
       const operation = callSerenaWorkspaceTool(toolArguments, operationTimeoutMs);
-      return textResult(await waitForPromiseUntil(operation, responseDeadlineAt, 'Builtin Serena workspace call'));
+      return textResult(await waitForOperationUntil(operation, responseDeadlineAt, 'Builtin Serena workspace call'));
     }
     if (args.tool === 'serena_call') {
       const operation = callSessionSerenaTool(toolArguments, operationTimeoutMs);
-      return textResult(await waitForPromiseUntil(operation, responseDeadlineAt, 'Builtin session Serena call'));
+      return textResult(await waitForOperationUntil(operation, responseDeadlineAt, 'Builtin session Serena call'));
+    }
+    if (args.tool === 'serena_read_batch') {
+      const operation = callSessionSerenaReadBatch(toolArguments, operationTimeoutMs);
+      return textResult(await waitForOperationUntil(operation, responseDeadlineAt, 'Builtin session Serena read batch'));
     }
     const operation = (async () => {
       const { callBuiltinAcceleratorTool } = await builtinAccelerators();
@@ -1544,9 +1600,11 @@ export async function callExternalMcpTool(args: {
         callBuiltin: (tool, toolArgs, callTimeout) => callBuiltinAcceleratorTool(tool, toolArgs, callTimeout),
         callTrustedExternal: callTrustedReadOnlyExternalMcpTool,
         assertWorkspace: assertExternalContextWorkspace,
+        callSessionSemantic: callTrustedReadOnlySessionSerenaTool,
+        assertSessionWorkspace: assertSessionSerenaContextWorkspace,
       }, operationTimeoutMs);
     })();
-    return textResult(await waitForPromiseUntil(operation, responseDeadlineAt, 'Builtin code-context orchestration call'));
+    return textResult(await waitForOperationUntil(operation, responseDeadlineAt, 'Builtin code-context orchestration call'));
   }
 
   const result = await withRuntimeLease(
@@ -1752,7 +1810,7 @@ export async function readMultipleFilesCompatAware(
       let lease: { maxBytes: number; commit(bytes: number): void; release(): void } | undefined;
       try {
         lease = await budget.acquire(READ_MULTIPLE_PER_FILE_OUTPUT_BYTES);
-        const remaining = remainingDeadline(deadlineAt, 'read_multiple_files MCP compatibility batch');
+        const remaining = remainingOperationMs(deadlineAt, 'read_multiple_files MCP compatibility batch');
         let item: ServerResult;
         if (isMcpCompatUri(filePath)) {
           const target = parseExternalMcpCompatUri(filePath);
@@ -1763,9 +1821,7 @@ export async function readMultipleFilesCompatAware(
             timeout_ms: Math.min(target.timeout_ms ?? 10_000, remaining),
           });
         } else {
-          item = await waitForPromiseUntil(
-            readLocal(filePath, lease.maxBytes), deadlineAt, `Read local batch file ${filePath}`
-          );
+          item = await waitForOperationUntil(readLocal(filePath, lease.maxBytes), deadlineAt, `Read local batch file ${filePath}`);
         }
         const itemBytes = serverResultContentBytes(item);
         if (itemBytes > lease.maxBytes) {
@@ -1861,7 +1917,7 @@ export async function callExternalMcpCompatUri(raw: string, content: string) {
   );
   assertProcessTransportBudget(target.server, target.tool, toolArguments, totalTimeout, 'MCP compatibility timeout_ms');
   deadlineAt = Date.now() + totalTimeout;
-  const remaining = remainingDeadline(deadlineAt, 'MCP compatibility call');
+  const remaining = remainingOperationMs(deadlineAt, 'MCP compatibility call');
   if (remaining < 100) {
     const error = new Error('MCP compatibility call deadline exceeded before dispatch.') as NodeJS.ErrnoException;
     error.code = 'ETIMEDOUT';

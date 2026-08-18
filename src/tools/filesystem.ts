@@ -1,4 +1,6 @@
 import fs from "fs/promises";
+import { constants as fsConstants } from 'fs';
+import { randomUUID } from 'crypto';
 import path from "path";
 import os from 'os';
 import fetch from 'cross-fetch';
@@ -6,6 +8,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { capture } from '../utils/capture.js';
 import { withTimeout, runWithAbortableTimeout } from '../utils/withTimeout.js';
+import { OperationScope } from '../utils/operation-scope.js';
 import { configManager } from '../config-manager.js';
 import { getFileHandler, TextFileHandler } from '../utils/files/index.js';
 import type { ReadOptions, FileResult, PdfPageItem } from '../utils/files/base.js';
@@ -46,6 +49,10 @@ const FILE_OPERATION_TIMEOUTS = {
 // cancelled (fd/thread released), not just abandoned.
 export const READ_OPERATION_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
 export const READ_METADATA_TIMEOUT_MS = 10 * 1000; // 10 seconds
+// Base write_file is an emergency path as well as a convenience tool. Keep its
+// whole request below the client hard cap, including staging and commit.
+export const WRITE_OPERATION_TIMEOUT_MS = 3 * 60 * 1000;
+const WRITE_ATOMIC_COMMIT_RESERVE_MS = 1_500;
 
 function normalizeReadTimeout(timeoutMs: number): number {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
@@ -484,29 +491,132 @@ export async function readFileInternal(filePath: string, offset: number = 0, len
     return selectedLines.join('');
 }
 
-export async function writeFile(filePath: string, content: string, mode: 'rewrite' | 'append' = 'rewrite'): Promise<void> {
-    const validPath = await validatePath(filePath);
+export interface WriteFileOperationOptions {
+    /** Shared request deadline supplied by the server handler after lock acquisition. */
+    deadlineAt?: number;
+}
 
-    // Get file extension for telemetry
-    const fileExtension = getFileExtension(validPath);
+function stagedWritePath(targetPath: string): string {
+    const extension = path.extname(targetPath);
+    const stem = path.basename(targetPath, extension);
+    return path.join(
+        path.dirname(targetPath),
+        `.${stem}.${process.pid}.${randomUUID()}.write.tmp${extension}`,
+    );
+}
 
-    // Calculate content metrics
-    const contentBytes = Buffer.from(content).length;
-    const lineCount = TextFileHandler.countLines(content);
+async function writeViaAtomicStage(
+    targetPath: string,
+    mode: 'rewrite' | 'append',
+    scope: OperationScope,
+    writeStage: (stagedPath: string, signal: AbortSignal) => Promise<void>,
+): Promise<void> {
+    const stagedPath = stagedWritePath(targetPath);
+    let pendingTempOperation: Promise<void> | undefined;
+    let published = false;
 
-    // Capture file extension and operation details in telemetry without capturing the file path
-    capture('server_write_file', {
-        fileExtension: fileExtension,
-        mode: mode,
-        contentBytes: contentBytes,
-        lineCount: lineCount
-    });
+    const runTempOperation = async (factory: () => Promise<void>, label: string): Promise<void> => {
+        scope.throwIfAborted(label);
+        const operation = factory();
+        pendingTempOperation = operation;
+        await scope.run(() => operation, label);
+        if (pendingTempOperation === operation) pendingTempOperation = undefined;
+    };
 
-    // Get appropriate handler for this file type (async - includes binary detection)
-    const handler = await getFileHandler(validPath);
+    try {
+        let targetExists = false;
+        let targetMode: number | undefined;
+        try {
+            const stats = await scope.run(() => fs.stat(targetPath), `Stat write target ${targetPath}`);
+            if (!stats.isFile()) throw new Error(`write_file target is not a file: ${targetPath}`);
+            targetExists = true;
+            targetMode = stats.mode;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
+        }
 
-    // Use handler to write the file
-    await handler.write(validPath, content, mode);
+        if (mode === 'append' && targetExists) {
+            await runTempOperation(
+                () => fs.copyFile(targetPath, stagedPath, fsConstants.COPYFILE_EXCL),
+                `Stage existing file for append ${targetPath}`,
+            );
+        } else {
+            await runTempOperation(
+                () => fs.writeFile(stagedPath, Buffer.alloc(0), {
+                    flag: 'wx',
+                    ...(targetMode === undefined ? {} : { mode: targetMode }),
+                    signal: scope.signal,
+                    flush: true,
+                }),
+                `Create staged write file ${stagedPath}`,
+            );
+        }
+
+        await runTempOperation(
+            () => writeStage(stagedPath, scope.signal),
+            `Populate staged write file ${stagedPath}`,
+        );
+        scope.throwIfAborted(`Publish staged write ${targetPath}`);
+
+        if (targetMode !== undefined) {
+            await scope.run(() => fs.chmod(stagedPath, targetMode), `Preserve write target mode ${targetPath}`);
+        }
+        if (scope.remainingMs(`Publish staged write ${targetPath}`) < WRITE_ATOMIC_COMMIT_RESERVE_MS) {
+            const error = new Error(
+                `Write file ${targetPath} deadline exceeded (timed out) before atomic publish; original file was preserved.`,
+            ) as NodeJS.ErrnoException;
+            error.code = 'ETIMEDOUT';
+            throw error;
+        }
+
+        // Once publish starts, await its real outcome rather than racing the scope:
+        // returning a timeout while rename later succeeds would lie about mutation state.
+        await renameReplacingWithRetry(stagedPath, targetPath, {
+            deadlineAt: scope.deadlineAt,
+            beforeRetry: async () => scope.throwIfAborted(`Retry atomic write publish ${targetPath}`),
+        });
+        published = true;
+    } finally {
+        if (!published) {
+            const cleanup = () => fs.rm(stagedPath, { force: true }).catch(() => undefined);
+            if (pendingTempOperation) {
+                // A non-cooperative format encoder may outlive the caller deadline, but
+                // it owns only the private staged path. Clean it when that work settles.
+                void pendingTempOperation.catch(() => undefined).finally(cleanup);
+            } else {
+                await cleanup();
+            }
+        }
+    }
+}
+
+export async function writeFile(
+    filePath: string, content: string, mode: 'rewrite' | 'append' = 'rewrite',
+    options: WriteFileOperationOptions = {},
+): Promise<void> {
+    const deadlineAt = options.deadlineAt ?? Date.now() + WRITE_OPERATION_TIMEOUT_MS;
+    const scope = new OperationScope({ label: `Write file ${filePath}`, deadlineAt });
+    try {
+        const validPath = await scope.run(
+            () => validatePath(filePath, Math.min(PATH_VALIDATION_TIMEOUT_MS, scope.remainingMs('Validate write path'))),
+            `Validate write path ${filePath}`,
+        );
+
+        const fileExtension = getFileExtension(validPath);
+        const contentBytes = Buffer.byteLength(content, 'utf8');
+        const lineCount = TextFileHandler.countLines(content);
+        capture('server_write_file', { fileExtension, mode, contentBytes, lineCount });
+
+        // Handler discovery may inspect the current bytes for binary detection; keep it
+        // inside the same hard request deadline as staging and publication.
+        const handler = await scope.run(() => getFileHandler(validPath), `Select file handler for ${validPath}`);
+        await writeViaAtomicStage(
+            validPath, mode, scope,
+            (stagedPath, signal) => handler.write(stagedPath, content, mode, { signal }),
+        );
+    } finally {
+        scope.dispose();
+    }
 }
 
 export interface MultiFileResult {

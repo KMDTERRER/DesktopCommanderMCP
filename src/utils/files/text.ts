@@ -27,7 +27,8 @@ import {
     FileHandler,
     ReadOptions,
     FileResult,
-    FileInfo
+    FileInfo,
+    WriteOptions
 } from './base.js';
 
 // TODO: Centralize these constants with filesystem.ts to avoid silent drift
@@ -122,12 +123,15 @@ export class TextFileHandler implements FileHandler {
         );
     }
 
-    async write(path: string, content: string, mode: 'rewrite' | 'append' = 'rewrite'): Promise<void> {
-        if (mode === 'append') {
-            await fs.appendFile(path, content);
-        } else {
-            await fs.writeFile(path, content);
-        }
+    async write(
+        path: string, content: string, mode: 'rewrite' | 'append' = 'rewrite', options?: WriteOptions,
+    ): Promise<void> {
+        await fs.writeFile(path, content, {
+            encoding: 'utf8',
+            flag: mode === 'append' ? 'a' : 'w',
+            signal: options?.signal,
+            flush: true,
+        });
     }
 
     async getInfo(path: string): Promise<FileInfo> {

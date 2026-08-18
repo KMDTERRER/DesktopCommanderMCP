@@ -4,7 +4,10 @@ import path from 'path';
 import fsp from 'fs/promises';
 import http from 'http';
 import { runWithAbortableTimeout } from '../dist/utils/withTimeout.js';
-import { READ_OPERATION_TIMEOUT_MS, READ_METADATA_TIMEOUT_MS, readFile, getFileInfo } from '../dist/tools/filesystem.js';
+import {
+  READ_OPERATION_TIMEOUT_MS, READ_METADATA_TIMEOUT_MS, WRITE_OPERATION_TIMEOUT_MS,
+  readFile, writeFile, getFileInfo,
+} from '../dist/tools/filesystem.js';
 import { configManager } from '../dist/config-manager.js';
 
 /**
@@ -269,8 +272,107 @@ async function run() {
       await Promise.race([observed, new Promise((resolve) => originalSetTimeout(resolve, 500))]);
     }
   }
+
+  // 11) A stalled staged write must time out without ever modifying the target.
+  {
+    const original = await configManager.getConfig();
+    const originalAllowed = original.allowedDirectories;
+    const tmpDir = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), 'dc-write-atomic-timeout-')));
+    const target = path.join(tmpDir, 'fallback.txt');
+    await fsp.writeFile(target, 'ORIGINAL\n', 'utf8');
+    const originalWriteFile = fsp.writeFile;
+    const originalSetTimeout = globalThis.setTimeout;
+    let stagedWriteSignal;
+    try {
+      await configManager.setValue('allowedDirectories', [tmpDir]);
+      fsp.writeFile = async (file, data, options = {}) => {
+        if (String(file).includes('.write.tmp') && data === 'replacement-that-must-not-commit') {
+          stagedWriteSignal = options.signal;
+          return new Promise((_resolve, reject) => {
+            const abort = () => reject(stagedWriteSignal?.reason ?? new Error('aborted'));
+            if (stagedWriteSignal?.aborted) abort();
+            else stagedWriteSignal?.addEventListener('abort', abort, { once: true });
+          });
+        }
+        return originalWriteFile(file, data, options);
+      };
+      globalThis.setTimeout = (callback, ms, ...timerArgs) =>
+        originalSetTimeout(callback, ms > 170_000 && ms <= WRITE_OPERATION_TIMEOUT_MS ? 50 : ms, ...timerArgs);
+
+      let error;
+      try {
+        await writeFile(target, 'replacement-that-must-not-commit', 'rewrite');
+        assert.fail('expected staged write timeout');
+      } catch (caught) {
+        error = caught;
+      }
+      assert.equal(error?.code, 'ETIMEDOUT', `unexpected staged write error: ${error?.message}`);
+      assert.equal(stagedWriteSignal?.aborted, true, 'staged file write did not receive AbortSignal cancellation');
+      assert.equal(await fsp.readFile(target, 'utf8'), 'ORIGINAL\n', 'timed-out rewrite modified the target');
+      await new Promise((resolve) => originalSetTimeout(resolve, 50));
+      const leftovers = (await fsp.readdir(tmpDir)).filter((name) => name.includes('.write.tmp'));
+      assert.deepEqual(leftovers, [], `staged write leaked temporary files: ${leftovers.join(', ')}`);
+      ok('timed-out staged write preserves the original target and cancels staged I/O');
+    } finally {
+      fsp.writeFile = originalWriteFile;
+      globalThis.setTimeout = originalSetTimeout;
+      await configManager.setValue('allowedDirectories', originalAllowed);
+      await fsp.rm(tmpDir, { recursive: true, force: true });
+    }
+  }
+
+  // 12) Base write_file rewrite+append remains directly readable without semantic/external services.
+  {
+    const original = await configManager.getConfig();
+    const originalAllowed = original.allowedDirectories;
+    const tmpDir = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), 'dc-write-fallback-')));
+    const target = path.join(tmpDir, 'fallback.txt');
+    try {
+      await configManager.setValue('allowedDirectories', [tmpDir]);
+      await writeFile(target, 'first\n', 'rewrite');
+      await writeFile(target, 'second\n', 'append');
+      assert.equal(await fsp.readFile(target, 'utf8'), 'first\nsecond\n');
+      const result = await readFile(target, { offset: 0, length: 10, includeStatusMessage: false });
+      const text = typeof result.content === 'string' ? result.content : result.content.toString('utf8');
+      assert(text.includes('first') && text.includes('second'), `base read lost written content: ${text}`);
+      assert.deepEqual((await fsp.readdir(tmpDir)).filter((name) => name.includes('.write.tmp')), []);
+      ok('base write_file rewrite and append stay readable through the base read path');
+    } finally {
+      await configManager.setValue('allowedDirectories', originalAllowed);
+      await fsp.rm(tmpDir, { recursive: true, force: true });
+    }
+  }
+
+  // 13) Unsupported binary/document append modes must fail closed, never report false success.
+  {
+    const original = await configManager.getConfig();
+    const originalAllowed = original.allowedDirectories;
+    const tmpDir = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), 'dc-write-append-contract-')));
+    const imagePath = path.join(tmpDir, 'fallback.png');
+    const pdfPath = path.join(tmpDir, 'fallback.pdf');
+    await fsp.writeFile(imagePath, Buffer.from('IMAGE_ORIGINAL'));
+    await fsp.writeFile(pdfPath, Buffer.from('PDF_ORIGINAL'));
+    try {
+      await configManager.setValue('allowedDirectories', [tmpDir]);
+      await assert.rejects(
+        () => writeFile(imagePath, 'eA==', 'append'),
+        /Image append is not supported/,
+      );
+      await assert.rejects(
+        () => writeFile(pdfPath, '# must not append', 'append'),
+        /PDF append is not supported/,
+      );
+      assert.equal((await fsp.readFile(imagePath)).toString(), 'IMAGE_ORIGINAL');
+      assert.equal((await fsp.readFile(pdfPath)).toString(), 'PDF_ORIGINAL');
+      assert.deepEqual((await fsp.readdir(tmpDir)).filter((name) => name.includes('.write.tmp')), []);
+      ok('unsupported image/PDF append fails closed without modifying the target');
+    } finally {
+      await configManager.setValue('allowedDirectories', originalAllowed);
+      await fsp.rm(tmpDir, { recursive: true, force: true });
+    }
+  }
 }
 
 run()
-  .then(() => { console.log(`\nPASS (${passed}/10)`); process.exit(0); })
+  .then(() => { console.log(`\nPASS (${passed}/13)`); process.exit(0); })
   .catch((e) => { console.error(`\nFAIL: ${e.message}`); process.exit(1); });

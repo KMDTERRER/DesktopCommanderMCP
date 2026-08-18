@@ -1,5 +1,5 @@
 
-import { makeCancellationError } from './cancellation.js';
+import { OperationScope } from './operation-scope.js';
 
 /**
  * Executes a promise with a timeout. If the promise doesn't resolve or reject within
@@ -75,32 +75,15 @@ export function withTimeout<T>(
  * signal (e.g. Excel/PDF parsers) still get the timeout rejection but keep
  * running in the background until they finish on their own.
  */
-export function runWithAbortableTimeout<T>(
+export async function runWithAbortableTimeout<T>(
     operation: (signal: AbortSignal) => Promise<T>,
     timeoutMs: number,
     operationName: string
 ): Promise<T> {
-    const controller = new AbortController();
-    let timeoutId: NodeJS.Timeout;
-
-    const timeout = new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(() => {
-            const error = makeCancellationError(
-                'deadline_exceeded',
-                `${operationName} timed out after ${timeoutMs / 1000} seconds`,
-                'ETIMEDOUT',
-            );
-            controller.abort(error);
-            reject(error);
-        }, timeoutMs);
-    });
-
-    // Defer invocation into a promise turn so a synchronous throw from the
-    // operation is captured by the same finally path and cannot leak the timer.
-    const op = Promise.resolve().then(() => operation(controller.signal));
-    // Swallow the late abort rejection so it can't surface as an unhandled
-    // rejection after the timeout has already settled the race.
-    op.catch(() => {});
-
-    return Promise.race([op, timeout]).finally(() => clearTimeout(timeoutId));
+    const scope = new OperationScope({ label: operationName, timeoutMs });
+    try {
+        return await scope.run(operation, operationName);
+    } finally {
+        scope.dispose();
+    }
 }

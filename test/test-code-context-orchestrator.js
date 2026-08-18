@@ -27,11 +27,10 @@ function toolList() {
     inputSchema: { type: 'object', additionalProperties: true },
     annotations: { readOnlyHint: true }
   }];
-  return [{
-    name: 'find_symbol',
-    inputSchema: { type: 'object', additionalProperties: true },
+  return ['find_symbol', 'find_referencing_symbols', 'find_implementations'].map((name) => ({
+    name, inputSchema: { type: 'object', additionalProperties: true },
     annotations: { readOnlyHint: true }
-  }];
+  }));
 }
 `, 'utf8');await fs.appendFile(fakeServer, `
 async function handle(message) {
@@ -60,16 +59,37 @@ async function handle(message) {
     }
 `, 'utf8');await fs.appendFile(fakeServer, `
     const args = message.params?.arguments || {};
+    const tool = message.params?.name;
+    let semanticResult;
+    if (tool === 'find_referencing_symbols') {
+      semanticResult = {
+        'src/tools/code-context-orchestrator.ts': { Function: [{
+          name_path: 'callCodeContextOrchestrator',
+          body_location: { start_line: 242, end_line: 366 },
+          content_around_reference: '... 300: before\\n  > 301: callExternalMcpTool()\\n... 302: after'
+        }] },
+        'src/server.ts': { File: [{
+          name_path: 'server',
+          body_location: { start_line: 0, end_line: 1768 },
+          content_around_reference: '... 60: before\\n  > 61: callExternalMcpTool()\\n... 62: after'
+        }] }
+      };
+    } else if (tool === 'find_implementations') {
+      semanticResult = [{
+        name_path: 'callExternalMcpToolImpl', kind: 'Function', relative_path: 'src/tools/core-mcp.ts',
+        body_location: { start_line: 80, end_line: 120 }
+      }];
+    } else {
+      semanticResult = [{
+        name_path: args.name_path_pattern, kind: 'Function',
+        relative_path: args.relative_path || 'src/tools/external-mcp.ts',
+        body_location: { start_line: 1500, end_line: 1560 },
+        include_body: args.include_body, max_matches: args.max_matches
+      }];
+    }
     send(message.id, {
       content: [{ type: 'text', text: 'semantic-result' }],
-      structuredContent: {
-        result: JSON.stringify({
-          name: args.name_path_pattern,
-          relative_path: args.relative_path || '',
-          include_body: args.include_body,
-          max_matches: args.max_matches
-        })
-      }
+      structuredContent: { result: JSON.stringify(semanticResult) }
     });
     return;
   }
@@ -99,10 +119,17 @@ process.stdin.on('end', () => process.exit(0));
     },
     'fake-serena': {
       command: process.execPath,
-      args: [fakeServer, '--repo', REPO_ROOT],
+      args: [fakeServer, 'start-mcp-server', '--project', REPO_ROOT],
       env: { DC_CONTEXT_ROLE: 'semantic' },
       protocolVersion: 'legacy', lifecycle: 'keep-alive',
-      allowedTools: ['find_symbol'],
+      allowedTools: ['find_symbol', 'find_referencing_symbols', 'find_implementations'],
+    },
+    'serena-fake': {
+      command: process.execPath,
+      args: [fakeServer, 'start-mcp-server', '--project', REPO_ROOT],
+      env: { DC_CONTEXT_ROLE: 'semantic' },
+      protocolVersion: 'legacy', lifecycle: 'keep-alive',
+      allowedTools: ['find_symbol', 'find_referencing_symbols', 'find_implementations'],
     },
   },
 };
@@ -118,12 +145,12 @@ await fs.writeFile(path.join(dcConfigDir, 'config.json'), JSON.stringify({
 process.env.DESKTOP_COMMANDER_MCP_CONFIG = configPath;
 process.env.DESKTOP_COMMANDER_MCP_READ_ONLY_POLICY = JSON.stringify({
   'fake-crg': ['get_impact_radius_tool'],
-  'fake-serena': ['find_symbol'],
+  'fake-serena': ['find_symbol', 'find_referencing_symbols', 'find_implementations'],
 });
 
 const { configManager } = await import('../dist/config-manager.js');
 assert.equal(await configManager.getValue('externalMcpConfigPath'), staleConfigPath);
-const { listExternalMcpTools, readExternalMcpCompatUri, closeExternalMcpRuntime } =
+const { listExternalMcpTools, callExternalMcpTool, readExternalMcpCompatUri, closeExternalMcpRuntime } =
   await import('../dist/tools/external-mcp.js');
 const { callCodeContextOrchestrator } = await import('../dist/tools/code-context-orchestrator.js');
 try {
@@ -141,7 +168,18 @@ try {
     /bulk or multi-symbol context/,
   );
   assert.match(schema.routing_guidance, /keep include_info=false/);
+  assert.match(schema.routing_guidance, /serena_read_batch/);
+  assert.match(schema.routing_guidance, /semanticSession/);
+  assert.match(schema.routing_guidance, /start_search -> get_more_search_results -> read_file/);
+  assert.match(schema.tool.inputSchema.properties.semanticSession.description, /workspaceSession/);
   assert.match(schema.tool.inputSchema.properties.graphServer.description, /workspace_delta contract/);
+  const batchSchema = JSON.parse((await readExternalMcpCompatUri('mcp://desktop-context/serena_read_batch?timeout_ms=5000')).content[0].text);
+  assert.equal(batchSchema.tool.readOnly, true);
+  assert.equal(batchSchema.tool.mutating, false);
+  assert.equal(batchSchema.tool.inputSchema.properties.calls.maxItems, 16);
+  assert.equal(batchSchema.tool.inputSchema.properties.concurrency.default, 4);
+  assert.equal(schema.tool.inputSchema.properties.semanticExpand.default, 'references');
+  assert.match(schema.tool.inputSchema.properties.semanticExpand.description, /related files/);
 
   const directCalls = [];
   const direct = await callCodeContextOrchestrator({
@@ -215,6 +253,85 @@ try {
   assert.equal(largeDirect.orchestration.changedFiles, 101);
   assert.equal(largeDirect.orchestration.seedFiles, 0);
 
+  const sessionCalls = [];
+  const sessionContext = await callCodeContextOrchestrator({
+    root: REPO_ROOT,
+    query: 'session scoped semantic fanout',
+    semanticSession: 'ws_test_session',
+    symbolQueries: [{ name_path_pattern: 'SessionTarget', relative_path: 'src/tools/external-mcp.ts' }],
+    maxFiles: 4,
+  }, {
+    callBuiltin: async (tool, args) => {
+      assert.equal(tool, 'context_pack');
+      return {
+        repositoryRoot: REPO_ROOT, scopeRoot: REPO_ROOT, scopePrefix: '', queryTerms: [],
+        workspaceDelta: { changedFiles: [] }, candidateCount: 0, inspectedCandidateCount: 0, inspectedBytes: 0,
+        inspectionByteLimitReached: false, seedFilesAccepted: args.seedFiles || [], missingSeedFiles: [], files: [],
+        returnedChars: 0, responseTruncated: false, semanticFollowupTerms: [],
+      };
+    },
+    callTrustedExternal: async () => { throw new Error('fixed external semantic provider must not be used'); },
+    assertWorkspace: async () => { throw new Error('fixed workspace binding must not be used'); },
+    assertSessionWorkspace: async (session, root) => {
+      assert.equal(session, 'ws_test_session');
+      return { requestedRoot: root, boundRoot: root };
+    },
+    callSessionSemantic: async (session, tool, args) => {
+      sessionCalls.push({ session, tool, args });
+      assert.equal(session, 'ws_test_session');
+      if (tool === 'find_symbol') {
+        return { result: JSON.stringify([{
+          name_path: 'SessionTarget', relative_path: 'src/tools/external-mcp.ts',
+          body_location: { start_line: 10, end_line: 20 },
+        }]) };
+      }
+      assert.equal(tool, 'find_referencing_symbols');
+      return { result: JSON.stringify({
+        'src/tools/code-context-orchestrator.ts': { Function: [{
+          name_path: 'callCodeContextOrchestrator', body_location: { start_line: 470, end_line: 650 },
+        }] },
+        'src/server.ts': { Function: [{ name_path: 'registerTools', body_location: { start_line: 40, end_line: 80 } }] },
+      }) };
+    },
+  }, 5000);
+  assert.equal(sessionContext.semantic.provider, 'session');
+  assert.equal(sessionContext.semantic.workspaceSession, 'ws_test_session');
+  assert.deepEqual(sessionContext.semantic.expansion.files, [
+    'src/tools/external-mcp.ts', 'src/tools/code-context-orchestrator.ts', 'src/server.ts',
+  ]);
+  assert.equal(sessionContext.semantic.expansion.relations.length, 2);
+  assert.equal(sessionCalls.filter((call) => call.tool === 'find_symbol').length, 1);
+  assert.equal(sessionCalls.filter((call) => call.tool === 'find_referencing_symbols').length, 1);
+  assert(sessionContext.contextPack.seedFilesAccepted.includes('src/server.ts'));
+
+  const boundSession = JSON.parse((await callExternalMcpTool({
+    server: 'desktop-context', tool: 'serena_workspace', timeout_ms: 5000,
+    arguments: { operation: 'bind', root: REPO_ROOT, templateServer: 'serena-fake', warm: true },
+  })).content[0].text);
+  assert.equal(typeof boundSession.workspaceSession, 'string');
+  const sessionIntegrated = JSON.parse((await readExternalMcpCompatUri(
+    'mcp://desktop-context/code_context?timeout_ms=15000',
+    {
+      root: REPO_ROOT, query: 'session Serena integrated fanout',
+      semanticSession: boundSession.workspaceSession,
+      symbolQueries: [{
+        name_path_pattern: 'callExternalMcpTool', relative_path: 'src/tools/external-mcp.ts', max_matches: 2,
+      }],
+      maxFiles: 4, maxTotalChars: 20000,
+    },
+  )).content[0].text);
+  assert.equal(sessionIntegrated.semantic.provider, 'session');
+  assert.equal(sessionIntegrated.semantic.workspaceSession, boundSession.workspaceSession);
+  assert.deepEqual(sessionIntegrated.semantic.expansion.files, [
+    'src/tools/external-mcp.ts', 'src/tools/code-context-orchestrator.ts', 'src/server.ts',
+  ]);
+  assert(sessionIntegrated.contextPack.seedFilesAccepted.includes('src/server.ts'));
+  assert.equal(sessionIntegrated.orchestration.semanticExpansionCalls, 1);
+  await callExternalMcpTool({
+    server: 'desktop-context', tool: 'serena_workspace', timeout_ms: 5000,
+    arguments: { operation: 'release', session: boundSession.workspaceSession },
+  });
+
   const result = JSON.parse((await readExternalMcpCompatUri(
     'mcp://desktop-context/code_context?timeout_ms=15000',
     {
@@ -241,12 +358,41 @@ try {
   assert.equal(result.semantic.server, 'fake-serena');
   assert.equal(result.semantic.results.length, 1);
   const semantic = JSON.parse(result.semantic.results[0].result.result);
-  assert.equal(semantic.name, 'callExternalMcpTool');
-  assert.equal(semantic.include_body, false);
-  assert.equal(semantic.max_matches, 2);
+  assert.equal(semantic[0].name_path, 'callExternalMcpTool');
+  assert.equal(semantic[0].include_body, false);
+  assert.equal(semantic[0].max_matches, 2);
+  assert.deepEqual(result.semantic.expansion.files, [
+    'src/tools/external-mcp.ts',
+    'src/tools/code-context-orchestrator.ts',
+    'src/server.ts',
+  ]);
+  assert.equal(result.semantic.expansion.mode, 'references');
+  assert.equal(result.semantic.expansion.relations.length, 2);
+  assert(result.contextPack.seedFilesAccepted.includes('src/server.ts'));
   assert.equal(result.orchestration.graphCalls, 1);
   assert.equal(result.orchestration.contextPackCalls, 1);
   assert.equal(result.orchestration.semanticCalls, 1);
+  assert.equal(result.orchestration.semanticExpansionCalls, 1);
+  assert.equal(result.orchestration.semanticFiles, 3);
+
+  const allSemantic = JSON.parse((await readExternalMcpCompatUri(
+    'mcp://desktop-context/code_context?timeout_ms=15000',
+    {
+      root: REPO_ROOT,
+      query: 'semantic references and implementations',
+      semanticServer: 'fake-serena',
+      semanticExpand: 'all',
+      symbolQueries: [{
+        name_path_pattern: 'callExternalMcpTool',
+        relative_path: 'src/tools/external-mcp.ts',
+      }],
+      maxFiles: 4,
+      maxTotalChars: 20000,
+    },
+  )).content[0].text);
+  assert(allSemantic.semantic.expansion.files.includes('src/tools/core-mcp.ts'));
+  assert(allSemantic.semantic.expansion.relations.some((relation) => relation.kind === 'implementation'));
+  assert.equal(allSemantic.orchestration.semanticExpansionCalls, 2);
 
   process.env.DESKTOP_COMMANDER_MCP_READ_ONLY_POLICY = JSON.stringify({ 'fake-serena': ['find_symbol'] });
   await assert.rejects(
@@ -291,7 +437,7 @@ try {
       query: 'implicit symbol inference must stay disabled',
       semanticServer: 'fake-serena',
     }),
-    /semanticServer requires symbolQueries/,
+    /semantic provider requires symbolQueries/,
   );
 
   console.log('code context orchestrator: PASS');

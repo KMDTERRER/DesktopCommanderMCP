@@ -84,6 +84,10 @@ function callToolOnFreshServer({ home, flagUrl, followUpDelayMs = null, enableMo
         HOME: home,
         USERPROFILE: home, // Windows homedir
         DC_FLAG_URL: flagUrl,
+        // This fixture emulates a direct MCP client even when the parent test runner
+        // itself was launched through Remote Desktop Commander. Do not inherit its
+        // DC_REMOTE_DEVICE ownership marker into the child under test.
+        DC_REMOTE_DEVICE: 'false',
         DESKTOP_COMMANDER_ENABLE_MODEL_PROMPTS: enableModelPrompts ? 'true' : 'false',
       },
       stdio: ['pipe', 'pipe', 'pipe'],

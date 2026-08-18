@@ -16,7 +16,8 @@ import {
     FileHandler,
     ReadOptions,
     FileResult,
-    FileInfo
+    FileInfo,
+    WriteOptions
 } from './base.js';
 
 /**
@@ -69,14 +70,14 @@ export class ImageFileHandler implements FileHandler {
         };
     }
 
-    async write(path: string, content: Buffer | string): Promise<void> {
-        // If content is base64 string, convert to buffer
-        if (typeof content === 'string') {
-            const buffer = Buffer.from(content, 'base64');
-            await fs.writeFile(path, buffer);
-        } else {
-            await fs.writeFile(path, content);
+    async write(
+        path: string, content: Buffer | string, mode?: 'rewrite' | 'append', options?: WriteOptions,
+    ): Promise<void> {
+        if (mode === 'append') {
+            throw new Error('Image append is not supported; appending bytes would corrupt the image. Use mode=rewrite.');
         }
+        const buffer = typeof content === 'string' ? Buffer.from(content, 'base64') : content;
+        await fs.writeFile(path, buffer, { signal: options?.signal, flush: true });
     }
 
     async getInfo(path: string): Promise<FileInfo> {

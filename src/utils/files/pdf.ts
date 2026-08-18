@@ -4,7 +4,7 @@
  */
 
 import fs from 'fs/promises';
-import { FileHandler, FileResult, FileInfo, ReadOptions, EditResult } from './base.js';
+import { FileHandler, FileResult, FileInfo, ReadOptions, EditResult, WriteOptions } from './base.js';
 import { parsePdfToMarkdown, parseMarkdownToPdf, editPdf } from '../../tools/pdf/index.js';
 import { readFileBounded } from '../bounded-file-read.js';
 import {
@@ -96,17 +96,24 @@ export class PdfFileHandler implements FileHandler {
     /**
      * Write PDF - creates from markdown or operations
      */
-    async write(path: string, content: any, mode?: 'rewrite' | 'append'): Promise<void> {
-        // If content is string, treat as markdown to convert
+    async write(
+        path: string, content: any, mode?: 'rewrite' | 'append', options?: WriteOptions,
+    ): Promise<void> {
+        if (mode === 'append') {
+            throw new Error('PDF append is not supported by write_file; use the PDF operation tools or mode=rewrite.');
+        }
+        let resultBuffer: Buffer | Uint8Array;
         if (typeof content === 'string') {
-            await parseMarkdownToPdf(content, path);
+            // parseMarkdownToPdf returns bytes; its second argument is render options,
+            // never an output path. The previous call discarded the generated PDF.
+            resultBuffer = await parseMarkdownToPdf(content);
         } else if (Array.isArray(content)) {
-            // Array of operations - use editPdf
-            const resultBuffer = await editPdf(path, content);
-            await fs.writeFile(path, resultBuffer);
+            resultBuffer = await editPdf(path, content);
         } else {
             throw new Error('PDF write requires markdown string or array of operations');
         }
+        options?.signal?.throwIfAborted();
+        await fs.writeFile(path, resultBuffer, { signal: options?.signal, flush: true });
     }
 
     /**

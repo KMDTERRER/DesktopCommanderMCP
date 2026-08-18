@@ -21,7 +21,8 @@ import {
     FileResult,
     EditResult,
     FileInfo,
-    ExcelSheet
+    ExcelSheet,
+    WriteOptions
 } from './base.js';
 
 // Compressed XLSX input limit. Expanded ZIP data has a separate preflight budget.
@@ -86,7 +87,9 @@ ${JSON.stringify(data)}`;
         };
     }
 
-    async write(path: string, content: any, mode?: 'rewrite' | 'append'): Promise<void> {
+    async write(
+        path: string, content: any, mode?: 'rewrite' | 'append', options?: WriteOptions,
+    ): Promise<void> {
         // Check existing file size if it exists
         try {
             await this.checkFileSize(path);
@@ -111,7 +114,7 @@ ${JSON.stringify(data)}`;
         // Handle append mode by finding last row and writing after it
         if (mode === 'append') {
             try {
-                const workbook = await this.loadWorkbook(path);
+                const workbook = await this.loadWorkbook(path, options?.signal);
 
                 if (Array.isArray(parsedContent)) {
                     // Append to Sheet1
@@ -135,7 +138,10 @@ ${JSON.stringify(data)}`;
                     }
                 }
 
-                await workbook.xlsx.writeFile(path);
+                const output = Buffer.from(await workbook.xlsx.writeBuffer() as unknown as Uint8Array);
+                assertByteLengthWithin(output, MAX_EXCEL_OUTPUT_BYTES, 'Excel write output');
+                options?.signal?.throwIfAborted();
+                await fs.writeFile(path, output, { signal: options?.signal, flush: true });
                 return;
             } catch (error) {
                 // File doesn't exist - fall through to create new file
@@ -163,7 +169,10 @@ ${JSON.stringify(data)}`;
             throw new Error('Invalid content format. Expected 2D array or object with sheet names.');
         }
 
-        await workbook.xlsx.writeFile(path);
+        const output = Buffer.from(await workbook.xlsx.writeBuffer() as unknown as Uint8Array);
+        assertByteLengthWithin(output, MAX_EXCEL_OUTPUT_BYTES, 'Excel write output');
+        options?.signal?.throwIfAborted();
+        await fs.writeFile(path, output, { signal: options?.signal, flush: true });
     }
 
     async editRange(path: string, range: string, content: any, options?: Record<string, any>): Promise<EditResult> {

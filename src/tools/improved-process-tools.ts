@@ -13,6 +13,8 @@ import { fileURLToPath } from 'url';
 import { terminateProcessTree } from '../utils/process-tree.js';
 import { processProblemEvidence } from '../utils/process-problem-matcher.js';
 import { runWithAbortableTimeout } from '../utils/withTimeout.js';
+import { OperationScope } from '../utils/operation-scope.js';
+import { KeyedSerializedOperationOwners } from '../utils/serialized-operation-owner.js';
 import { registerToolCallCancellationCleanup } from '../utils/client-context.js';
 import {
   PROCESS_INITIAL_OUTPUT_MAX_CHARS, PROCESS_INTERACTION_DEFAULT_MS,
@@ -34,7 +36,7 @@ function processLocalIoTimeout(requestTimeoutMs: number): number {
   return Math.max(100, Math.min(PROCESS_LOCAL_IO_TIMEOUT_MS, requestTimeoutMs > 0 ? requestTimeoutMs : PROCESS_LOCAL_IO_TIMEOUT_MS));
 }
 
-const processInteractionTails = new Map<number, Promise<void>>();
+const processInteractionOwners = new KeyedSerializedOperationOwners<number>();
 const PIPE_PROMPT_SETTLE_MS = 150;
 
 function compactInitialProcessOutput(value: string): { text: string; truncated: boolean; chars: number } {
@@ -46,39 +48,22 @@ function compactInitialProcessOutput(value: string): { text: string; truncated: 
 }
 
 async function acquireProcessInteractionLease(pid: number, timeoutMs: number): Promise<() => void> {
-  const previous = processInteractionTails.get(pid) ?? Promise.resolve();
-  let releaseGate!: () => void;
-  const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
-  const tail = previous.catch(() => undefined).then(() => gate);
-  processInteractionTails.set(pid, tail);
-
-  let timer: NodeJS.Timeout | undefined;
+  const scope = new OperationScope({ label: `Process ${pid} interaction lease`, timeoutMs });
   try {
-    await Promise.race([
-      previous.catch(() => undefined),
-      new Promise<void>((_resolve, reject) => {
-        timer = setTimeout(() => {
-          const error = new Error(`Timed out waiting for exclusive interaction with process ${pid}.`) as NodeJS.ErrnoException;
-          error.code = 'ETIMEDOUT';
-          reject(error);
-        }, timeoutMs);
-      }),
-    ]);
+    const releaseOwner = await processInteractionOwners.acquire(
+      pid, scope, `Wait for exclusive interaction with process ${pid}`,
+    );
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      releaseOwner();
+      scope.dispose();
+    };
   } catch (error) {
-    releaseGate();
-    void tail.finally(() => { if (processInteractionTails.get(pid) === tail) processInteractionTails.delete(pid); });
+    scope.dispose();
     throw error;
-  } finally {
-    if (timer) clearTimeout(timer);
   }
-
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    releaseGate();
-    void tail.finally(() => { if (processInteractionTails.get(pid) === tail) processInteractionTails.delete(pid); });
-  };
 }
 
 /**

@@ -2,6 +2,7 @@ import {
     readFile,
     readMultipleFiles,
     writeFile,
+    WRITE_OPERATION_TIMEOUT_MS,
     createDirectory,
     listDirectory,
     moveFile,
@@ -312,8 +313,11 @@ export async function handleWriteFile(args: unknown): Promise<ServerResult> {
     try {
         const modeProvided = !!(args && typeof args === 'object' && 'mode' in args);
         const parsed = WriteFileArgsSchema.parse(args);
+        const deadlineAt = Date.now() + WRITE_OPERATION_TIMEOUT_MS;
         const validatedPath = await validatePathAuthority(parsed.path);
-        const releaseMutationLock = await acquireMutationResourceLocks([validatedPath], Date.now() + 45_000);
+        const releaseMutationLock = await acquireMutationResourceLocks(
+            [validatedPath], Math.min(deadlineAt, Date.now() + 45_000),
+        );
         try {
             // An omitted `mode` falls back to 'rewrite', which silently destroys
             // the target's existing content. Keep this check inside the same
@@ -352,7 +356,7 @@ export async function handleWriteFile(args: unknown): Promise<ServerResult> {
 💡 Performance tip: For optimal speed, consider chunking files into ≤30 line pieces in future operations.`;
             }
 
-            await writeFile(validatedPath, parsed.content, parsed.mode);
+            await writeFile(validatedPath, parsed.content, parsed.mode, { deadlineAt });
 
             const modeMessage = parsed.mode === 'append' ? 'appended to' : 'wrote to';
             return {

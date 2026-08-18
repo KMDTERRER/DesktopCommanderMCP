@@ -18,7 +18,7 @@
 
 import fs from 'fs/promises';
 import PizZip from 'pizzip';
-import { FileHandler, FileResult, FileInfo, ReadOptions, EditResult } from './base.js';
+import { FileHandler, FileResult, FileInfo, ReadOptions, EditResult, WriteOptions } from './base.js';
 import { readFileBounded } from '../bounded-file-read.js';
 import { preflightZipContainer } from '../bounded-zip.js';
 import {
@@ -577,7 +577,9 @@ export class DocxFileHandler implements FileHandler {
      * Content is plain text — each line becomes a paragraph.
      * Lines starting with # become headings (# = Heading1, ## = Heading2, etc.)
      */
-    async write(path: string, content: any, mode?: 'rewrite' | 'append'): Promise<void> {
+    async write(
+        path: string, content: any, mode?: 'rewrite' | 'append', options?: WriteOptions,
+    ): Promise<void> {
         if (mode === 'append') {
             throw new Error('DOCX append not supported. Use edit_block to modify existing DOCX files.');
         }
@@ -613,7 +615,8 @@ export class DocxFileHandler implements FileHandler {
 
         const zip = createMinimalDocxZip(docXml);
         const buf = zip.generate({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
-        await fs.writeFile(path, buf);
+        options?.signal?.throwIfAborted();
+        await fs.writeFile(path, buf, { signal: options?.signal, flush: true });
     }
 
     /**

@@ -78,10 +78,11 @@ async function runChild(scriptPath, env, timeoutMs = 20000) {
 async function runServerPassthroughProbe(root) {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'dc-mcp-passthrough-'));
   const cfgDir = path.join(home, '.claude-server-commander');
+  const baseFallbackFile = path.join(home, 'base-fallback.txt');
   await fs.mkdir(cfgDir, { recursive: true });
   await fs.writeFile(
     path.join(cfgDir, 'config.json'),
-    JSON.stringify({ telemetryEnabled: false, allowedDirectories: [root] }),
+    JSON.stringify({ telemetryEnabled: false, allowedDirectories: [root, home] }),
     'utf8',
   );
   await fs.writeFile(
@@ -97,6 +98,9 @@ async function runServerPassthroughProbe(root) {
       HOME: home,
       USERPROFILE: home,
       DC_FLAG_URL: 'http://127.0.0.1:9/',
+      // Built-in/base tools must remain operational even when the external MCP
+      // configuration is missing or unusable. This is the emergency fallback path.
+      DESKTOP_COMMANDER_MCP_CONFIG: path.join(home, 'missing-external-mcp.json'),
     },
     windowsHide: true,
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -116,6 +120,8 @@ async function runServerPassthroughProbe(root) {
       };
       const send = (message) => child.stdin.write(JSON.stringify(message) + '\n');
       let readResult;
+      let writeResult;
+      let baseWriteResult;
       child.stdout.on('data', (chunk) => {
         stdout += chunk.toString();
         for (;;) {
@@ -158,7 +164,25 @@ async function runServerPassthroughProbe(root) {
               },
             });
           } else if (message.id === 3) {
-            finish({ readResult, writeResult: message.result });
+            writeResult = message.result;
+            send({
+              jsonrpc: '2.0', id: 4, method: 'tools/call',
+              params: {
+                name: 'write_file',
+                arguments: { path: baseFallbackFile, content: 'BASE_FALLBACK_OK\n', mode: 'rewrite' },
+              },
+            });
+          } else if (message.id === 4) {
+            baseWriteResult = message.result;
+            send({
+              jsonrpc: '2.0', id: 5, method: 'tools/call',
+              params: {
+                name: 'read_file',
+                arguments: { path: baseFallbackFile, offset: 0, length: 10 },
+              },
+            });
+          } else if (message.id === 5) {
+            finish({ readResult, writeResult, baseWriteResult, baseReadResult: message.result });
           }
         }
       });
@@ -178,6 +202,10 @@ async function runServerPassthroughProbe(root) {
     assert(!text.includes('NEW USER ONBOARDING REQUIRED'));
     const parsed = JSON.parse(text);
     assert.equal(parsed.repositoryRoot.replace(/\\/g, '/').toLowerCase(), root.replace(/\\/g, '/').toLowerCase());
+    const baseWriteText = (result?.baseWriteResult?.content ?? []).map((item) => item?.text ?? '').join('\n');
+    assert.match(baseWriteText, /Successfully wrote to/);
+    const baseReadText = (result?.baseReadResult?.content ?? []).map((item) => item?.text ?? '').join('\n');
+    assert(baseReadText.includes('BASE_FALLBACK_OK'), `base read/write fallback failed while external MCP config was unavailable: ${baseReadText}`);
   } finally {
     try { child.stdin.end(); } catch {}
     await terminateProcessTree(child, 3000, true).catch(() => undefined);
@@ -503,7 +531,7 @@ process.stdin.on('end', () => process.exit(0));
     await fs.writeFile(childScript, `
 import assert from 'node:assert';
 import fs from 'node:fs/promises';
-import { listExternalMcpTools, callExternalMcpTool, readExternalMcpCompatUri, callSerenaWorkspaceTool, callSessionSerenaTool, closeExternalMcpRuntime } from ${JSON.stringify(externalMcpUrl)};
+import { listExternalMcpTools, callExternalMcpTool, readExternalMcpCompatUri, callSerenaWorkspaceTool, callSessionSerenaTool, callSessionSerenaReadBatch, closeExternalMcpRuntime } from ${JSON.stringify(externalMcpUrl)};
 const configPath = process.env.DESKTOP_COMMANDER_MCP_CONFIG;
 const fakeServer = process.env.DC_FAKE_SERVER;
 const configFor = (name) => ({ mcpServers: {
@@ -605,6 +633,27 @@ const genericRead = await callSessionSerenaTool({ tool: 'echo', arguments: { val
 const genericRepeat = await callSessionSerenaTool({ tool: 'echo', arguments: { value: 'global-read' }, session: workspaceSession }, 5000);
 assert.equal(genericRead.cached, false);
 assert.equal(genericRepeat.cached, false, 'workspace-dependent read without a file dependency was memoized unsafely');
+
+const readBatch = await callSessionSerenaReadBatch({
+  session: workspaceSession,
+  concurrency: 2,
+  calls: [
+    { tool: 'echo', arguments: { value: 'batch-a' } },
+    { tool: 'get_symbols_overview', arguments: { relative_path: 'cache-probe.ts', value: 'batch-b' } },
+  ],
+}, 5000);
+assert.equal(readBatch.status, 'ready');
+assert.equal(readBatch.results.length, 2);
+assert.equal(readBatch.results[0].tool, 'echo');
+assert.equal(readBatch.results[0].result.structuredContent.echoed.value, 'batch-a');
+assert.equal(readBatch.results[1].tool, 'get_symbols_overview');
+assert.equal(readBatch.results[1].result.structuredContent.echoed.value, 'batch-b');
+await assert.rejects(
+  () => callSessionSerenaReadBatch({
+    session: workspaceSession, calls: [{ tool: 'echo_two', arguments: { value: 'must-reject' } }],
+  }, 5000),
+  /read-only tool/,
+);
 
 const coldSession = 'session_cold_123';
 await callSerenaWorkspaceTool({ operation: 'bind', root: process.env.DC_SERENA_ROOT, session: coldSession, templateServer: 'serena-test' }, 5000);

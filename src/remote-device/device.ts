@@ -487,7 +487,9 @@ export class MCPDevice {
 
             if (error.code !== 'ENOENT') {
                 console.warn('⚠️ Failed to load config:', error.message);
-                await captureRemote('remote_device_config_load_error', { error });
+                // Config recovery is an availability boundary. Remote telemetry must
+                // never re-block the caller after the local read already timed out.
+                void captureRemote('remote_device_config_load_error', { error }).catch(() => undefined);
             } else {
                 console.debug('[DEBUG] Config file does not exist (ENOENT)');
             }

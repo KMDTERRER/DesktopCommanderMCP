@@ -140,7 +140,10 @@ export function buildLocalMcpChildEnvironment(configEnv?: Record<string, string>
     // for every tool call; that traffic competes with the result channel without
     // adding an independent operational signal. Keep the kill-switch scoped to
     // this child so parent captureRemote diagnostics remain available.
-    env.DESKTOP_COMMANDER_DISABLE_TELEMETRY = 'true';
+    const telemetryKillSwitch = env.DESKTOP_COMMANDER_DISABLE_TELEMETRY?.trim().toLowerCase();
+    if (!telemetryKillSwitch || !['1', 'true', 'yes', 'on'].includes(telemetryKillSwitch)) {
+        env.DESKTOP_COMMANDER_DISABLE_TELEMETRY = 'true';
+    }
     return env;
 }
 

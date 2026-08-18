@@ -1,4 +1,5 @@
 import path from 'path';
+import { remainingOperationMs } from '../utils/operation-scope.js';
 import { MAX_WORKSPACE_CURSOR_TRANSPORT_BYTES } from './workspace-accelerators.js';
 
 const MAX_OPERATION_TIMEOUT_MS = 45_000;
@@ -7,6 +8,11 @@ const MAX_SEED_FILES = 100;
 const MAX_SYMBOL_QUERIES = 8;
 const MAX_SYMBOL_MATCHES = 20;
 const MAX_SYMBOL_ANSWER_CHARS = 40_000;
+const MAX_SEMANTIC_EXPANSION_SEEDS = 8;
+const MAX_SEMANTIC_FILES = 40;
+const MAX_SEMANTIC_RELATIONS = 100;
+const MAX_SEMANTIC_EXPANSION_ANSWER_CHARS = 12_000;
+const MAX_SEMANTIC_SNIPPET_CHARS = 1200;
 const SEMANTIC_CONCURRENCY = 4;
 
 export const BUILTIN_CONTEXT_SERVER_ID = 'desktop-context';
@@ -23,6 +29,26 @@ type SymbolQuery = {
   max_answer_chars: number;
 };
 
+type SemanticExpandMode = 'none' | 'references' | 'all';
+type SemanticBodyLocation = { start_line: number; end_line: number };
+type SemanticSeed = {
+  queryIndex: number;
+  namePath: string;
+  relativePath: string;
+  bodyLocation?: SemanticBodyLocation;
+  answerChars: number;
+};
+type SemanticRelation = {
+  kind: 'reference' | 'implementation';
+  seedNamePath: string;
+  seedRelativePath: string;
+  relativePath: string;
+  namePath?: string;
+  symbolKind?: string;
+  bodyLocation?: SemanticBodyLocation;
+  snippet?: string;
+};
+
 export type ContextWorkspaceBinding = { requestedRoot: string; boundRoot: string };
 
 export type CodeContextDependencies = {
@@ -31,19 +57,13 @@ export type CodeContextDependencies = {
   assertWorkspace: (
     server: string, root: string, timeoutMs: number, relation: 'exact' | 'ancestor',
   ) => Promise<ContextWorkspaceBinding>;
+  callSessionSemantic?: (
+    session: string, tool: string, args: Record<string, unknown>, timeoutMs: number,
+  ) => Promise<unknown>;
+  assertSessionWorkspace?: (session: string, root: string, timeoutMs: number) => Promise<ContextWorkspaceBinding>;
 };
 function recordValue(value: unknown): JsonRecord | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as JsonRecord : undefined;
-}
-
-function remaining(deadlineAt: number, label: string): number {
-  const value = deadlineAt - Date.now();
-  if (value <= 0) {
-    const error = new Error(`${label} deadline exceeded.`) as NodeJS.ErrnoException;
-    error.code = 'ETIMEDOUT';
-    throw error;
-  }
-  return value;
 }
 
 function boundedInteger(value: unknown, fallback: number, minimum: number, maximum: number, label: string): number {
@@ -138,6 +158,122 @@ function normalizeSlash(value: string): string { return value.replace(/\\/g, '/'
 function pathWithin(parent: string, candidate: string): boolean {
   const relative = path.relative(parent, candidate);
   return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function semanticExpandMode(value: unknown): SemanticExpandMode {
+  if (value === undefined) return 'references';
+  if (value === 'none' || value === 'references' || value === 'all') return value;
+  throw new Error("code_context.semanticExpand must be one of: none, references, all.");
+}
+
+function semanticBodyLocation(value: unknown): SemanticBodyLocation | undefined {
+  const object = recordValue(value);
+  const start = object?.start_line;
+  const end = object?.end_line;
+  if (!Number.isInteger(start) || !Number.isInteger(end) || (start as number) < 0 || (end as number) < (start as number)) {
+    return undefined;
+  }
+  return { start_line: start as number, end_line: end as number };
+}
+
+function serenaPayload(value: unknown): unknown {
+  const unwrapped = unwrapResult(value);
+  const object = recordValue(unwrapped);
+  const encoded = object && typeof object.result === 'string'
+    ? object.result
+    : typeof unwrapped === 'string' ? unwrapped : undefined;
+  if (encoded === undefined) return unwrapped;
+  try { return JSON.parse(encoded); } catch { return encoded; }
+}
+
+function semanticSeedsFromResults(results: Array<{ query: SymbolQuery; result: unknown }>): { seeds: SemanticSeed[]; total: number } {
+  const all: SemanticSeed[] = [];
+  const seen = new Set<string>();
+  results.forEach((entry, queryIndex) => {
+    const payload = serenaPayload(entry.result);
+    const candidates = Array.isArray(payload) ? payload : [payload];
+    for (const candidate of candidates) {
+      const item = recordValue(candidate);
+      if (!item || typeof item.name_path !== 'string' || typeof item.relative_path !== 'string') continue;
+      const namePath = item.name_path.trim();
+      const relativePath = normalizeSlash(item.relative_path.trim());
+      if (!namePath || !relativePath) continue;
+      const key = `${relativePath}\u0000${namePath}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      all.push({
+        queryIndex, namePath, relativePath, answerChars: entry.query.max_answer_chars,
+        ...(semanticBodyLocation(item.body_location) ? { bodyLocation: semanticBodyLocation(item.body_location) } : {}),
+      });
+    }
+  });
+  return { seeds: all.slice(0, MAX_SEMANTIC_EXPANSION_SEEDS), total: all.length };
+}
+
+function semanticScopePath(value: string, binding: ContextWorkspaceBinding): string | null {
+  const normalized = normalizeSlash(value.trim());
+  if (!normalized) return null;
+  const fsPath = normalized.split('/').join(path.sep);
+  const absolute = path.isAbsolute(fsPath) ? path.resolve(fsPath) : path.resolve(binding.boundRoot, fsPath);
+  if (!pathWithin(binding.requestedRoot, absolute)) return null;
+  const relative = normalizeSlash(path.relative(binding.requestedRoot, absolute));
+  return relative && relative !== '..' ? relative : null;
+}
+
+function compactSnippet(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  return value.trim().slice(0, MAX_SEMANTIC_SNIPPET_CHARS);
+}
+
+function referenceRelations(value: unknown, seed: SemanticSeed, binding: ContextWorkspaceBinding): SemanticRelation[] {
+  const payload = recordValue(serenaPayload(value));
+  if (!payload) return [];
+  const relations: SemanticRelation[] = [];
+  for (const [rawFile, rawKinds] of Object.entries(payload)) {
+    const relativePath = semanticScopePath(rawFile, binding);
+    const kinds = recordValue(rawKinds);
+    if (!relativePath || !kinds) continue;
+    for (const [symbolKind, rawItems] of Object.entries(kinds)) {
+      if (!Array.isArray(rawItems)) continue;
+      for (const rawItem of rawItems) {
+        const item = recordValue(rawItem);
+        if (!item) continue;
+        relations.push({
+          kind: 'reference',
+          seedNamePath: seed.namePath,
+          seedRelativePath: seed.relativePath,
+          relativePath,
+          ...(typeof item.name_path === 'string' && item.name_path.trim() ? { namePath: item.name_path.trim() } : {}),
+          ...(symbolKind ? { symbolKind } : {}),
+          ...(semanticBodyLocation(item.body_location) ? { bodyLocation: semanticBodyLocation(item.body_location) } : {}),
+          ...(compactSnippet(item.content_around_reference) ? { snippet: compactSnippet(item.content_around_reference) } : {}),
+        });
+      }
+    }
+  }
+  return relations;
+}
+
+function implementationRelations(value: unknown, seed: SemanticSeed, binding: ContextWorkspaceBinding): SemanticRelation[] {
+  const payload = serenaPayload(value);
+  if (!Array.isArray(payload)) return [];
+  const relations: SemanticRelation[] = [];
+  for (const rawItem of payload) {
+    const item = recordValue(rawItem);
+    if (!item || typeof item.relative_path !== 'string') continue;
+    const relativePath = semanticScopePath(item.relative_path, binding);
+    if (!relativePath) continue;
+    relations.push({
+      kind: 'implementation',
+      seedNamePath: seed.namePath,
+      seedRelativePath: seed.relativePath,
+      relativePath,
+      ...(typeof item.name_path === 'string' && item.name_path.trim() ? { namePath: item.name_path.trim() } : {}),
+      ...(typeof item.kind === 'string' && item.kind.trim() ? { symbolKind: item.kind.trim() } : {}),
+      ...(semanticBodyLocation(item.body_location) ? { bodyLocation: semanticBodyLocation(item.body_location) } : {}),
+    });
+  }
+  return relations;
 }
 
 function requestedScopePrefix(binding: ContextWorkspaceBinding): string {
@@ -240,6 +376,105 @@ async function mapConcurrent<T, R>(values: T[], concurrency: number, fn: (value:
   await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, worker));
   return results;
 }
+
+async function expandSemanticResults(
+  results: Array<{ query: SymbolQuery; result: unknown }>,
+  mode: SemanticExpandMode,
+  maxFiles: number,
+  maxRelations: number,
+  binding: ContextWorkspaceBinding,
+  callSemantic: (tool: string, args: Record<string, unknown>, timeoutMs: number) => Promise<unknown>,
+  deadlineAt: number,
+) {
+  const seedState = semanticSeedsFromResults(results);
+  const files: string[] = [];
+  const fileSet = new Set<string>();
+  const scopedSeeds: SemanticSeed[] = [];
+  let truncated = seedState.total > seedState.seeds.length;
+
+  const acceptFile = (candidate: string): boolean => {
+    if (fileSet.has(candidate)) return true;
+    if (files.length >= maxFiles) {
+      truncated = true;
+      return false;
+    }
+    fileSet.add(candidate);
+    files.push(candidate);
+    return true;
+  };
+
+  for (const seed of seedState.seeds) {
+    const relativePath = semanticScopePath(seed.relativePath, binding);
+    if (!relativePath) {
+      truncated = true;
+      continue;
+    }
+    if (!acceptFile(relativePath)) continue;
+    scopedSeeds.push({ ...seed, relativePath });
+  }
+
+  const tasks: Array<{ kind: 'reference' | 'implementation'; seed: SemanticSeed }> = [];
+  if (mode !== 'none') {
+    for (const seed of scopedSeeds) {
+      tasks.push({ kind: 'reference', seed });
+      if (mode === 'all') tasks.push({ kind: 'implementation', seed });
+    }
+  }
+
+  const expanded = await mapConcurrent(tasks, SEMANTIC_CONCURRENCY, async (task) => {
+    const tool = task.kind === 'reference' ? 'find_referencing_symbols' : 'find_implementations';
+    const args = task.kind === 'reference'
+      ? {
+          name_path: task.seed.namePath,
+          relative_path: task.seed.relativePath,
+          max_answer_chars: Math.min(task.seed.answerChars, MAX_SEMANTIC_EXPANSION_ANSWER_CHARS),
+        }
+      : {
+          name_path: task.seed.namePath,
+          relative_path: task.seed.relativePath,
+          include_info: false,
+          max_answer_chars: Math.min(task.seed.answerChars, MAX_SEMANTIC_EXPANSION_ANSWER_CHARS),
+        };
+    return {
+      task,
+      result: await callSemantic(
+        tool, args, remainingOperationMs(deadlineAt, `code_context semantic ${task.kind} expansion`),
+      ),
+    };
+  });
+
+  const relations: SemanticRelation[] = [];
+  const relationSet = new Set<string>();
+  for (const item of expanded) {
+    const candidates = item.task.kind === 'reference'
+      ? referenceRelations(item.result, item.task.seed, binding)
+      : implementationRelations(item.result, item.task.seed, binding);
+    for (const relation of candidates) {
+      if (!acceptFile(relation.relativePath)) continue;
+      const key = [
+        relation.kind, relation.seedRelativePath, relation.seedNamePath, relation.relativePath,
+        relation.namePath ?? '', relation.bodyLocation?.start_line ?? '',
+      ].join('\u0000');
+      if (relationSet.has(key)) continue;
+      relationSet.add(key);
+      if (relations.length >= maxRelations) {
+        truncated = true;
+        continue;
+      }
+      relations.push(relation);
+    }
+  }
+
+  return {
+    mode,
+    seedCount: seedState.total,
+    expandedSeedCount: scopedSeeds.length,
+    calls: tasks.length,
+    files,
+    relations,
+    truncated,
+  };
+}
 export async function callCodeContextOrchestrator(
   args: Record<string, unknown>, deps: CodeContextDependencies, timeoutMs = 30_000,
 ) {
@@ -248,7 +483,8 @@ export async function callCodeContextOrchestrator(
   }
   const allowed = new Set([
     'root', 'query', 'workspaceCursor', 'changedFiles', 'graphServer', 'graphDepth',
-    'semanticServer', 'symbolQueries', 'maxFiles', 'contextLines', 'maxLinesPerFile', 'maxTotalChars',
+    'semanticServer', 'semanticSession', 'symbolQueries', 'semanticExpand', 'semanticMaxFiles', 'semanticMaxRelations',
+    'maxFiles', 'contextLines', 'maxLinesPerFile', 'maxTotalChars',
   ]);
   const unknown = Object.keys(args).filter((key) => !allowed.has(key)).sort();
   if (unknown.length > 0) throw new Error(`code_context received unsupported argument(s): ${unknown.join(', ')}.`);
@@ -260,9 +496,36 @@ export async function callCodeContextOrchestrator(
   const explicitChanged = changedFiles(args.changedFiles);
   const graphServer = args.graphServer === undefined ? null : boundedString(args.graphServer, 'code_context.graphServer', 128);
   const semanticServer = args.semanticServer === undefined ? null : boundedString(args.semanticServer, 'code_context.semanticServer', 128);
+  const semanticSession = args.semanticSession === undefined ? null : boundedString(args.semanticSession, 'code_context.semanticSession', 128);
   const symbols = symbolQueries(args.symbolQueries);
-  if (semanticServer && symbols.length === 0) throw new Error('code_context.semanticServer requires symbolQueries.');
-  if (!semanticServer && symbols.length > 0) throw new Error('code_context.symbolQueries requires semanticServer.');
+  const semanticExpand = semanticExpandMode(args.semanticExpand);
+  const semanticMaxFiles = boundedInteger(args.semanticMaxFiles, 12, 1, MAX_SEMANTIC_FILES, 'code_context.semanticMaxFiles');
+  const semanticMaxRelations = boundedInteger(
+    args.semanticMaxRelations, 32, 1, MAX_SEMANTIC_RELATIONS, 'code_context.semanticMaxRelations',
+  );
+  if (semanticServer && semanticSession) {
+    throw new Error('code_context.semanticServer and semanticSession are mutually exclusive.');
+  }
+  const hasSemanticProvider = Boolean(semanticServer || semanticSession);
+  if (hasSemanticProvider && symbols.length === 0) {
+    throw new Error('code_context semantic provider requires symbolQueries.');
+  }
+  if (!hasSemanticProvider && symbols.length > 0) {
+    throw new Error('code_context.symbolQueries requires semanticServer or semanticSession.');
+  }
+  if (!hasSemanticProvider && (args.semanticExpand !== undefined || args.semanticMaxFiles !== undefined || args.semanticMaxRelations !== undefined)) {
+    throw new Error('code_context semantic expansion options require semanticServer or semanticSession.');
+  }
+  if (semanticSession && (!deps.callSessionSemantic || !deps.assertSessionWorkspace)) {
+    throw new Error('code_context session-scoped semantic provider is not configured.');
+  }
+  const callSemantic = semanticServer
+    ? (tool: string, toolArgs: Record<string, unknown>, callTimeout: number) =>
+        deps.callTrustedExternal(semanticServer, tool, toolArgs, callTimeout)
+    : semanticSession
+      ? (tool: string, toolArgs: Record<string, unknown>, callTimeout: number) =>
+          deps.callSessionSemantic!(semanticSession, tool, toolArgs, callTimeout)
+      : null;
   const deadlineAt = Date.now() + timeoutMs;
   const graphDepth = boundedInteger(args.graphDepth, 2, 0, 4, 'code_context.graphDepth');
   const maxFiles = boundedInteger(args.maxFiles, 8, 1, 20, 'code_context.maxFiles');
@@ -277,15 +540,17 @@ export async function callCodeContextOrchestrator(
     ? deps.callBuiltin('workspace_delta', {
         root,
         ...(workspaceCursor ? { cursor: workspaceCursor } : {}),
-      }, remaining(deadlineAt, 'code_context workspace delta'))
+      }, remainingOperationMs(deadlineAt, 'code_context workspace delta'))
     : Promise.resolve(null);
   const [graphBinding, semanticBinding, rawAutoDelta] = await Promise.all([
     graphServer
-      ? deps.assertWorkspace(graphServer, root, remaining(deadlineAt, 'code_context graph workspace'), 'ancestor')
+      ? deps.assertWorkspace(graphServer, root, remainingOperationMs(deadlineAt, 'code_context graph workspace'), 'ancestor')
       : Promise.resolve(null),
     semanticServer
-      ? deps.assertWorkspace(semanticServer, root, remaining(deadlineAt, 'code_context semantic workspace'), 'exact')
-      : Promise.resolve(null),
+      ? deps.assertWorkspace(semanticServer, root, remainingOperationMs(deadlineAt, 'code_context semantic workspace'), 'exact')
+      : semanticSession
+        ? deps.assertSessionWorkspace!(semanticSession, root, remainingOperationMs(deadlineAt, 'code_context semantic session workspace'))
+        : Promise.resolve(null),
     autoDeltaPromise,
   ]);
   const autoDelta = rawAutoDelta === null ? null : workspaceDeltaContract(rawAutoDelta);
@@ -299,18 +564,16 @@ export async function callCodeContextOrchestrator(
   // cursor and requiring raw auto-delta paths to be promoted as explicit seeds.
   const contextWorkspaceCursor = workspaceCursor;
 
-  const semanticPromise = semanticServer
+  const semanticPromise = callSemantic
     ? mapConcurrent(symbols, SEMANTIC_CONCURRENCY, async (symbol) => ({
         query: symbol,
-        result: unwrapResult(await deps.callTrustedExternal(semanticServer, 'find_symbol', {
+        result: unwrapResult(await callSemantic('find_symbol', {
           ...symbol,
           include_body: false,
-        }, remaining(deadlineAt, 'code_context semantic query'))),
+        }, remainingOperationMs(deadlineAt, 'code_context semantic query'))),
       }))
     : Promise.resolve([]);
-  // Attach rejection handling immediately: graph/context retrieval may take longer
-  // than a fast semantic policy/runtime failure, and a late await must not create
-  // a transient unhandled rejection in the shared Remote process.
+  // Observe semantic rejection immediately while graph work is in progress.
   const semanticSettled = semanticPromise.then(
     (value) => ({ ok: true as const, value }),
     (error) => ({ ok: false as const, error }),
@@ -320,14 +583,28 @@ export async function callCodeContextOrchestrator(
         changed_files: graphChanged,
         max_depth: graphDepth,
         detail_level: 'compact',
-      }, remaining(deadlineAt, 'code_context graph impact'))
+      }, remainingOperationMs(deadlineAt, 'code_context graph impact'))
     : null;
   const graphImpacts = graphResult && graphBinding ? impactedFiles(graphResult, graphBinding) : { graph: [], scope: [] };
   const graphSeeds = graphImpacts.graph;
   const explicitRelevanceSeeds = explicitChanged.length > 0 ? graphChanged : [];
-  const seeds = [...new Set([...explicitRelevanceSeeds, ...graphSeeds])].slice(0, MAX_SEED_FILES);
+  const semanticOutcome = await semanticSettled;
+  if (!semanticOutcome.ok) throw semanticOutcome.error;
+  const semantic = semanticOutcome.value;
+  const semanticExpansion = callSemantic && semanticBinding
+    ? await expandSemanticResults(
+        semantic, semanticExpand, semanticMaxFiles, semanticMaxRelations,
+        semanticBinding, callSemantic, deadlineAt,
+      )
+    : {
+        mode: 'none' as SemanticExpandMode, seedCount: 0, expandedSeedCount: 0, calls: 0,
+        files: [] as string[], relations: [] as SemanticRelation[], truncated: false,
+      };
+  const seeds = [...new Set([
+    ...explicitRelevanceSeeds, ...graphSeeds, ...semanticExpansion.files,
+  ])].slice(0, MAX_SEED_FILES);
 
-  const contextPackPromise = deps.callBuiltin('context_pack', {
+  const rawContextPack = await deps.callBuiltin('context_pack', {
     root,
     query,
     ...(contextWorkspaceCursor ? { workspaceCursor: contextWorkspaceCursor } : {}),
@@ -336,12 +613,8 @@ export async function callCodeContextOrchestrator(
     contextLines,
     maxLinesPerFile,
     maxTotalChars,
-  }, remaining(deadlineAt, 'code_context context pack'));
-
-  const [rawContextPack, semanticOutcome] = await Promise.all([contextPackPromise, semanticSettled]);
+  }, remainingOperationMs(deadlineAt, 'code_context context pack'));
   const contextPack = compactContextPack(rawContextPack);
-  if (!semanticOutcome.ok) throw semanticOutcome.error;
-  const semantic = semanticOutcome.value;
   return {
     root,
     query,
@@ -351,12 +624,22 @@ export async function callCodeContextOrchestrator(
       ...compactGraph(graphResult, graphImpacts.scope),
     } : null,
     contextPack,
-    semantic: semanticServer ? { server: semanticServer, results: semantic } : null,
+    semantic: hasSemanticProvider ? {
+      provider: semanticServer ? 'server' : 'session',
+      ...(semanticServer ? { server: semanticServer } : { workspaceSession: semanticSession }),
+      workspaceRoot: semanticBinding?.boundRoot ?? null,
+      results: semantic, expansion: semanticExpansion,
+    } : null,
     orchestration: {
       graphCalls: graphResult ? 1 : 0,
       contextPackCalls: 1,
       semanticCalls: semantic.length,
       semanticConcurrency: semantic.length > 0 ? Math.min(SEMANTIC_CONCURRENCY, semantic.length) : 0,
+      semanticExpansionMode: semanticExpansion.mode,
+      semanticExpansionCalls: semanticExpansion.calls,
+      semanticSeedSymbols: semanticExpansion.seedCount,
+      semanticFiles: semanticExpansion.files.length,
+      semanticRelations: semanticExpansion.relations.length,
       workspaceDeltaCalls: autoDelta ? 1 : 0,
       changedFilesSource: autoDelta ? 'workspace_delta' : (explicitChanged.length > 0 ? 'explicit' : 'none'),
       changedFiles: graphChanged.length,
@@ -368,8 +651,8 @@ export async function callCodeContextOrchestrator(
 
 export const CODE_CONTEXT_TOOL = {
   name: 'code_context',
-  purpose: 'Compose trusted read-only graph impact, bounded source retrieval, and explicit exact-symbol lookups without owning their indexes.',
-  when_to_use: 'When one task needs CRG-seeded source context and optionally a small explicit set of Serena symbol lookups.',
+  purpose: 'Compose trusted graph impact, multi-file semantic fan-out, and bounded source retrieval without owning the underlying indexes.',
+  when_to_use: 'When one task needs CRG/source context plus exact Serena symbols expanded into related files in one model round.',
   when_not_to_use: 'For implicit natural-language symbol inference, mutations, graph/index construction, or arbitrary downstream tool execution.',
   readOnly: true,
   mutating: false,
@@ -388,7 +671,8 @@ export const CODE_CONTEXT_TOOL = {
       },
       graphServer: { type: 'string', description: 'Workspace-bound CRG server. Uses explicit changedFiles when supplied, otherwise the shared workspace_delta contract.' },
       graphDepth: { type: 'integer', minimum: 0, maximum: 4, default: 2 },
-      semanticServer: { type: 'string', description: 'Workspace-bound Serena server; requires symbolQueries.' },
+      semanticServer: { type: 'string', description: 'Fixed workspace-bound Serena server; requires symbolQueries and is mutually exclusive with semanticSession.' },
+      semanticSession: { type: 'string', description: 'Opaque workspaceSession returned by serena_workspace. Preferred for task/session-scoped Serena semantics; requires symbolQueries and is mutually exclusive with semanticServer.' },
       symbolQueries: {
         type: 'array', minItems: 1, maxItems: MAX_SYMBOL_QUERIES,
         items: {
@@ -407,6 +691,18 @@ export const CODE_CONTEXT_TOOL = {
           },
         },
       },
+      semanticExpand: {
+        type: 'string', enum: ['none', 'references', 'all'], default: 'references',
+        description: 'Expand exact Serena hits into related files. references follows callers/usages; all also includes implementations.',
+      },
+      semanticMaxFiles: {
+        type: 'integer', minimum: 1, maximum: MAX_SEMANTIC_FILES, default: 12,
+        description: 'Maximum unique semantic seed/reference/implementation files returned and promoted into context_pack.',
+      },
+      semanticMaxRelations: {
+        type: 'integer', minimum: 1, maximum: MAX_SEMANTIC_RELATIONS, default: 32,
+        description: 'Maximum compact reference/implementation relations returned across all semantic seeds.',
+      },
       maxFiles: { type: 'integer', minimum: 1, maximum: 20, default: 8 },
       contextLines: { type: 'integer', minimum: 0, maximum: 20, default: 3 },
       maxLinesPerFile: { type: 'integer', minimum: 1, maximum: 500, default: 120 },
@@ -416,10 +712,12 @@ export const CODE_CONTEXT_TOOL = {
   recommended_workflow: [
     'For graph impact, code_context consumes the shared workspace_delta contract automatically when changedFiles is omitted; pass changedFiles only when the task already has a smaller authoritative set.',
     'Use symbolQueries only for exact symbol names already known from the task/context; this tool does not infer symbol identity from prose.',
+    'When serena_workspace already bound this task to a project, pass its workspaceSession as semanticSession so code_context can perform exact symbol fan-out without rebinding a global Serena server or requiring separate serena_call rounds.',
+    'By default semanticExpand=references fans each exact hit into bounded cross-file usages and promotes those files into context_pack; use all only when implementations are materially relevant.',
     'Keep include_info=false for bulk or multi-symbol lookups; hover/type enrichment is substantially more expensive and should normally be requested only for one or two exact symbols that need it.',
-    'Consume contextPack as the bounded source owner and semantic results as exact read-only evidence.',
+    'Consume contextPack as the bounded source owner and semantic.expansion as compact exact relationship evidence.',
   ],
-  related_capabilities: ['context_pack', 'CRG get_impact_radius_tool', 'Serena find_symbol'],
+  related_capabilities: ['context_pack', 'CRG get_impact_radius_tool', 'Serena find_symbol/find_referencing_symbols/find_implementations'],
 };
 
 export const SERENA_WORKSPACE_TOOL = {
@@ -444,10 +742,46 @@ export const SERENA_WORKSPACE_TOOL = {
   },
   recommended_workflow: [
     'Bind the project root once per chat/session.',
-    'If the result includes workspaceSession, retain it and pass it to later serena_workspace/serena_call calls.',
+    'If the result includes workspaceSession, retain it and pass it to later serena_workspace/serena_read_batch/serena_call calls.',
     'A cold_start status is informational: keep the returned session and retry rather than creating another Serena process.',
   ],
-  related_capabilities: ['Serena MCP', 'persistent Serena symbol cache', 'serena_call'],
+  related_capabilities: ['Serena MCP', 'persistent Serena symbol cache', 'serena_read_batch', 'serena_call'],
+};
+
+export const SERENA_READ_BATCH_TOOL = {
+  name: 'serena_read_batch',
+  purpose: 'Execute several session-scoped Serena read-only semantic calls in one bounded model round.',
+  when_to_use: 'After serena_workspace bind when several independent symbol/reference/diagnostic reads are already known.',
+  when_not_to_use: 'For mutation/refactoring tools; those stay on single-call serena_call and are rejected from this batch.',
+  readOnly: true,
+  mutating: false,
+  preferredFrozenSurface: 'read_file',
+  inputSchema: {
+    type: 'object',
+    required: ['calls'],
+    additionalProperties: false,
+    properties: {
+      calls: {
+        type: 'array', minItems: 1, maxItems: 16,
+        items: {
+          type: 'object', required: ['tool'], additionalProperties: false,
+          properties: {
+            tool: { type: 'string', minLength: 1, maxLength: 128 },
+            arguments: { type: 'object', additionalProperties: true, default: {} },
+          },
+        },
+      },
+      session: { type: 'string', description: 'Opaque workspace-session token when required by serena_workspace.' },
+      concurrency: { type: 'integer', minimum: 1, maximum: 8, default: 4 },
+    },
+  },
+  recommended_workflow: [
+    'Bind once with serena_workspace.',
+    'Batch only already-known independent read queries; result order matches input order.',
+    'Every downstream tool is re-checked against its live readOnlyHint before execution.',
+    'Use code_context instead when one seed symbol should automatically fan out into related files.',
+  ],
+  related_capabilities: ['serena_workspace', 'serena_call', 'code_context', 'Serena read-only tools'],
 };
 
 export const SERENA_CALL_TOOL = {
@@ -477,7 +811,7 @@ export const SERENA_CALL_TOOL = {
 };
 
 export function listBuiltinContextTools(tool?: string) {
-  const tools = [CODE_CONTEXT_TOOL, SERENA_WORKSPACE_TOOL, SERENA_CALL_TOOL];
+  const tools = [CODE_CONTEXT_TOOL, SERENA_WORKSPACE_TOOL, SERENA_READ_BATCH_TOOL, SERENA_CALL_TOOL];
   if (tool === undefined) return tools.map((item) => ({ name: item.name, purpose: item.purpose, readOnly: item.readOnly, mutating: item.mutating }));
   const selected = tools.find((item) => item.name === tool);
   if (!selected) throw new Error(`Unknown ${BUILTIN_CONTEXT_SERVER_ID} tool: ${tool}`);

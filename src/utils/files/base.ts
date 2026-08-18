@@ -24,8 +24,9 @@ export interface FileHandler {
      * @param path Validated file path
      * @param content Content to write
      * @param mode Write mode: 'rewrite' (default) or 'append'
+     * @param options Internal cancellation/deadline context owned by write_file.
      */
-    write(path: string, content: any, mode?: 'rewrite' | 'append'): Promise<void>;
+    write(path: string, content: any, mode?: 'rewrite' | 'append', options?: WriteOptions): Promise<void>;
 
     /**
      * Edit a specific range (bulk rewrite)
@@ -64,8 +65,14 @@ export interface FileHandler {
 }
 
 // ============================================================================
-// Read Operations
+// Read / Write Operations
 // ============================================================================
+
+/** Internal options for a staged file write. Not exposed in the MCP schema. */
+export interface WriteOptions {
+    /** Abort staged I/O or suppress a late commit after the request deadline. */
+    signal?: AbortSignal;
+}
 
 /**
  * Options for reading files
