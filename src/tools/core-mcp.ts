@@ -107,6 +107,7 @@ const coreInvokers: Record<string, CoreInvoker> = {
   create_directory: (args) => handlers.handleCreateDirectory(args),
   list_directory: (args) => handlers.handleListDirectory(args),
   move_file: (args) => handlers.handleMoveFile(args),
+  trash_action: (args) => handlers.handleTrashAction(args),
   start_search: (args) => handlers.handleStartSearch(args),
   get_more_search_results: (args) => handlers.handleGetMoreSearchResults(args),
   stop_search: (args) => handlers.handleStopSearch(args),

@@ -8,6 +8,7 @@ import {
   PROCESS_INTERACTION_DEFAULT_MS, PROCESS_STALL_DEFAULT_MS, PROCESS_TRANSPORT_TIMEOUT_MAX_MS,
   PROCESS_WAIT_DEFAULT_MS, PROCESS_WAIT_MAX_MS,
 } from '../utils/process-wait-contract.js';
+import { MANAGED_TRASH_ENTRY_NAME } from '../utils/trash-contract.js';
 
 // Config tools schemas
 export const GetConfigArgsSchema = z.object({
@@ -159,6 +160,23 @@ export const MoveFileArgsSchema = z.object({
   destination: z.string(),
 });
 
+export const TrashActionArgsSchema = z.object({
+  action: z.enum(['put', 'list', 'read', 'restore']),
+  path: z.string().min(1).max(4096).optional(),
+  name: z.string().regex(MANAGED_TRASH_ENTRY_NAME).optional(),
+  workspace: z.string().min(1).max(4096).optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.action === 'put') {
+    if (!value.path) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'trash_action put requires path.' });
+    if (value.name) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'trash_action put does not accept name.' });
+    return;
+  }
+  if (value.path) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `trash_action ${value.action} does not accept path.` });
+  if ((value.action === 'read' || value.action === 'restore') && !value.name) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: `trash_action ${value.action} requires name.` });
+  }
+});
+
 export const GetFileInfoArgsSchema = z.object({
   path: z.string(),
 });
@@ -293,6 +311,7 @@ export const toolArgSchemas: Record<string, z.ZodTypeAny> = {
   create_directory: CreateDirectoryArgsSchema,
   list_directory: ListDirectoryArgsSchema,
   move_file: MoveFileArgsSchema,
+  trash_action: TrashActionArgsSchema,
   start_search: StartSearchArgsSchema,
   get_more_search_results: GetMoreSearchResultsArgsSchema,
   stop_search: StopSearchArgsSchema,

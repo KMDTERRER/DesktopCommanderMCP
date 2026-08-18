@@ -4,6 +4,7 @@ import fs from 'fs/promises';
 import { validatePath } from './tools/filesystem.js';
 import { capture } from './utils/capture.js';
 import { getRipgrepPath } from './utils/ripgrep-resolver.js';
+import { MANAGED_TRASH_DIRECTORY_NAME } from './utils/trash-contract.js';
 import { isExcelFile } from './utils/files/index.js';
 import PizZip from 'pizzip';
 import { readFileBounded } from './utils/bounded-file-read.js';
@@ -893,6 +894,10 @@ function normalizeSearchOptions(options: SearchSessionOptions): SearchSessionOpt
     if (options.includeHidden) {
       args.push('--hidden');
     }
+
+    // Managed trash is an internal recovery store. Even hidden searches must not
+    // expose manifests or payload bytes through generic filesystem discovery.
+    args.push('-g', `!**/${MANAGED_TRASH_DIRECTORY_NAME}/**`);
     
     if (options.maxResults && options.maxResults > 0) {
       args.push('-m', options.maxResults.toString());

@@ -39,10 +39,6 @@ const ProcessPollSchema = z.object({
 
 const StopSchema = z.object({ id: z.number() }).strict();
 
-export const RESERVED_NEUTRAL_TOOL_NAMES = Object.freeze({
-    fileRemove: 'file_remove',
-});
-
 type AliasResolution = { canonicalName: string; args: Record<string, unknown> };
 
 export function resolveNeutralToolAlias(name: string, rawArgs: unknown): AliasResolution | null {

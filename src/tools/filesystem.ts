@@ -16,6 +16,7 @@ import { isPdfFile } from "./mime-types.js";
 import { parsePdfToMarkdown, editPdf, PdfOperations, PdfMetadata, parseMarkdownToPdf } from './pdf/index.js';
 import { isBinaryFile } from 'isbinaryfile';
 import { getAllowedDirs, PATH_VALIDATION_TIMEOUT_MS, validatePathAuthority } from './path-security.js';
+import { pathContainsManagedTrashSegment } from '../utils/trash-contract.js';
 import { renameReplacingWithRetry } from '../utils/atomic-rename.js';
 import { readFileBounded } from '../utils/bounded-file-read.js';
 import {
@@ -740,6 +741,7 @@ export async function listDirectory(dirPath: string, depth: number = 2): Promise
                 if (globallyTruncated) break;
                 if (!isTopLevel && shownHere >= MAX_NESTED_ITEMS) { nestedTruncated = true; break; }
                 const fullPath = path.join(currentPath, entry.name);
+                if (pathContainsManagedTrashSegment(fullPath)) continue;
                 const displayPath = relativePath ? path.join(relativePath, entry.name) : entry.name;
                 if (!appendResult(`${entry.isDirectory() ? "[DIR]" : "[FILE]"} ${displayPath}`)) break;
                 shownHere += 1;

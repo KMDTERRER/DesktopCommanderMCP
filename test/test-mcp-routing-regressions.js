@@ -307,7 +307,7 @@ async function main() {
 
   const buildExecuteWaitMs = 1000;
   const buildExecuteTransportBudget = buildExecuteWaitMs + PROCESS_TRANSPORT_RESERVE_MS;
-  const buildExecuteArgs = { root, buildDir: root, operation: 'build', timeoutMs: buildExecuteWaitMs };
+  const buildExecuteArgs = { root, buildDir: root, operation: 'build', timeoutMs: buildExecuteWaitMs, executionMode: 'inline' };
   await expectReject(
     () => callExternalMcpCompatUri(
       `mcp://desktop-accelerators/cpp_build_execute?timeout_ms=${buildExecuteTransportBudget - 1}`,

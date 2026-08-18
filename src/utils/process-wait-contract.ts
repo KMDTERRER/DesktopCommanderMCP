@@ -1,5 +1,6 @@
 export const PROCESS_WAIT_DEFAULT_MS = 90_000;
 export const PROCESS_WAIT_MAX_MS = 7 * 60_000;
+export const CPP_BUILD_AUTO_OBSERVE_MAX_MS = 30_000;
 export const PROCESS_STALL_DEFAULT_MS = 0;
 export const PROCESS_INTERACTION_DEFAULT_MS = 8_000;
 export const PROCESS_TRANSPORT_RESERVE_MS = 10_000;
@@ -28,6 +29,11 @@ export function processToolWaitMs(tool: string, args: Record<string, unknown>): 
   const minimum = tool === 'cpp_build_execute' ? 1_000 : 0;
   if (!Number.isInteger(requested) || requested < minimum || requested > PROCESS_WAIT_MAX_MS) {
     throw new Error(`${tool}.${timeoutKey} must be an integer from ${minimum} to ${PROCESS_WAIT_MAX_MS}ms.`);
+  }
+  if (tool === 'cpp_build_execute') {
+    const mode = args.executionMode ?? 'auto';
+    if (mode === 'resumable') return 0;
+    if (mode !== 'inline') return Math.min(requested, CPP_BUILD_AUTO_OBSERVE_MAX_MS);
   }
   return requested;
 }

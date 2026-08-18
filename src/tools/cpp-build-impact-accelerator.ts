@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 
 import { callBuildMetadataAcceleratorTool, revalidateBuildMetadataSnapshot, type BuildMetadataSnapshot } from './build-metadata-accelerator.js';
+import { collectCmakePresetDependencies } from './cmake-preset-dependencies.js';
 import { runBoundedSubprocess } from '../utils/bounded-subprocess.js';
 import { runWithAbortableTimeout } from '../utils/withTimeout.js';
 import { requireConfiguredExecutable } from '../utils/configured-executable.js';
@@ -97,7 +98,7 @@ async function normalizeChangedFile(root: string, value: unknown, deadlineAt: nu
     throw new Error(`cpp_build_impact changed path is unsupported: ${value}`);
   }
   if (!cppBuildImpactPathSupported(relative)) {
-    throw new Error(`cpp_build_impact only accepts C/C++ source/header/module paths: ${value}`);
+    // Non-source paths are classified against authoritative build metadata below.
   }
   try {
     const canonical = await runWithAbortableTimeout(
@@ -109,6 +110,65 @@ async function normalizeChangedFile(root: string, value: unknown, deadlineAt: nu
   }
   return relative;
 }
+export type CppBuildChangedFileKind = 'source' | 'cmake_input' | 'preset' | 'toolchain' | 'unknown';
+
+type ChangedFileClassification = {
+  path: string;
+  kind: CppBuildChangedFileKind;
+  evidence: string;
+};
+
+function metadataCmakeInputIds(metadata: JsonRecord): Set<string> {
+  const cmake = recordValue(metadata.cmake);
+  const cmakeFiles = recordValue(cmake?.cmakeFiles);
+  const inputs = Array.isArray(cmakeFiles?.inputs) ? cmakeFiles!.inputs : [];
+  const result = new Set<string>();
+  for (const raw of inputs) {
+    const item = recordValue(raw);
+    if (typeof item?.absolutePath === 'string' && item.absolutePath) result.add(identity(item.absolutePath));
+  }
+  return result;
+}
+
+async function classifyChangedFiles(
+  changedFiles: string[], metadata: JsonRecord, repositoryRoot: string, buildDir: string, deadlineAt: number,
+): Promise<{ classifications: ChangedFileClassification[]; warnings: string[] }> {
+  const cmakeInputIds = metadataCmakeInputIds(metadata);
+  const cmakeCache = recordValue(metadata.cmakeCache);
+  const cacheValues = recordValue(cmakeCache?.values) ?? {};
+  const toolchainIds = new Set<string>();
+  if (typeof cacheValues.CMAKE_TOOLCHAIN_FILE === 'string' && cacheValues.CMAKE_TOOLCHAIN_FILE.trim()) {
+    for (const candidate of candidateIdentities(cacheValues.CMAKE_TOOLCHAIN_FILE, repositoryRoot, buildDir)) toolchainIds.add(candidate);
+  }
+  const presetIds = new Set<string>();
+  const warnings: string[] = [];
+  try {
+    const presets = await collectCmakePresetDependencies(repositoryRoot, Math.min(10_000, remaining(deadlineAt)));
+    for (const preset of presets) presetIds.add(identity(preset.path));
+  } catch (error) {
+    warnings.push(`Preset dependency classification incomplete: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const classifications = changedFiles.map((relative): ChangedFileClassification => {
+    const absolute = path.resolve(repositoryRoot, relative);
+    const id = identity(absolute);
+    const base = path.basename(relative).toLowerCase();
+    const extension = path.extname(relative).toLowerCase();
+    if (toolchainIds.has(id)) return { path: relative, kind: 'toolchain', evidence: 'CMAKE_TOOLCHAIN_FILE' };
+    if (presetIds.has(id)) return { path: relative, kind: 'preset', evidence: 'preset dependency closure' };
+    if (cmakeInputIds.has(id)) return { path: relative, kind: 'cmake_input', evidence: 'CMake File API cmakeFiles-v1' };
+    if (base === 'cmakepresets.json' || base === 'cmakeuserpresets.json') {
+      return { path: relative, kind: 'preset', evidence: 'preset root filename fallback' };
+    }
+    if (base === 'cmakelists.txt' || extension === '.cmake') {
+      return { path: relative, kind: 'cmake_input', evidence: 'CMake input filename fallback' };
+    }
+    if (cppBuildImpactPathSupported(relative)) return { path: relative, kind: 'source', evidence: 'C/C++ source/header/module extension' };
+    return { path: relative, kind: 'unknown', evidence: 'not represented by current build metadata' };
+  });
+  return { classifications, warnings };
+}
+
 function compileEntries(metadata: JsonRecord): CompileEntry[] {
   const compileDatabase = recordValue(metadata.compileDatabase);
   const entries = Array.isArray(compileDatabase?.matchedEntries) ? compileDatabase.matchedEntries : [];
@@ -353,6 +413,43 @@ function assertArguments(args: Record<string, unknown>): void {
     throw new Error('cpp_build_impact.includeTests must be boolean.');
   }
 }
+
+export async function callCppBuildChangeClassification(
+  args: Record<string, unknown>, timeoutMs = 10_000, metadataSnapshot?: BuildMetadataSnapshot,
+) {
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > MAX_OPERATION_TIMEOUT_MS) {
+    throw new Error(`cpp build change classification timeout must be an integer from 100 to ${MAX_OPERATION_TIMEOUT_MS}ms.`);
+  }
+  if (typeof args.root !== 'string' || !args.root.trim()) throw new Error('cpp build change classification root is required.');
+  if (!Array.isArray(args.changedFiles) || args.changedFiles.length < 1 || args.changedFiles.length > MAX_CHANGED_FILES) {
+    throw new Error(`cpp build change classification changedFiles must contain 1-${MAX_CHANGED_FILES} paths.`);
+  }
+  const configuration = args.configuration === undefined ? undefined : args.configuration;
+  if (configuration !== undefined && (typeof configuration !== 'string' || !configuration.trim() || /[\0\r\n]/.test(configuration))) {
+    throw new Error('cpp build change classification configuration must be a non-empty single-line string.');
+  }
+  const deadlineAt = Date.now() + timeoutMs;
+  const metadata = (metadataSnapshot ?? await callBuildMetadataAcceleratorTool({
+    root: args.root, buildDir: args.buildDir, configuration, includeArguments: false, maxEntries: 1, maxTargets: 1,
+  }, remaining(deadlineAt, MAX_OPERATION_TIMEOUT_MS))) as JsonRecord;
+  const repositoryRoot = path.resolve(String(metadata.repositoryRoot));
+  const buildDir = path.resolve(String(metadata.buildDir));
+  const changedFiles = await Promise.all((args.changedFiles as unknown[]).map(
+    (value, index) => normalizeChangedFile(repositoryRoot, value, deadlineAt, index),
+  ));
+  const classified = await classifyChangedFiles(changedFiles, metadata, repositoryRoot, buildDir, deadlineAt);
+  const classifications = classified.classifications;
+  const buildSystemChanged = classifications.filter((item) =>
+    item.kind === 'cmake_input' || item.kind === 'preset' || item.kind === 'toolchain');
+  const unsupportedChangedFiles = classifications.filter((item) => item.kind === 'unknown').map((item) => item.path);
+  return {
+    repositoryRoot: slash(repositoryRoot), buildDir: slash(buildDir), changedFiles, classifications,
+    requiresConfigure: buildSystemChanged.length > 0,
+    configureInvalidatedBy: buildSystemChanged.map((item) => item.path),
+    unsupportedChangedFiles, warnings: classified.warnings,
+  };
+}
+
 export async function callCppBuildImpactAcceleratorTool(
   args: Record<string, unknown>, timeoutMs = 30_000, metadataSnapshot?: BuildMetadataSnapshot,
 ) {
@@ -382,15 +479,24 @@ export async function callCppBuildImpactAcceleratorTool(
   const changedFiles = await Promise.all((args.changedFiles as unknown[]).map(
     (value, index) => normalizeChangedFile(repositoryRoot, value, deadlineAt, index),
   ));
-  const changedIdentities = new Set(changedFiles.map((file) => identity(path.resolve(repositoryRoot, file))));
+  const classified = await classifyChangedFiles(changedFiles, metadata, repositoryRoot, buildDir, deadlineAt);
+  const classifications = classified.classifications;
+  const sourceChangedFiles = classifications.filter((item) => item.kind === 'source').map((item) => item.path);
+  const buildSystemChanged = classifications.filter((item) =>
+    item.kind === 'cmake_input' || item.kind === 'preset' || item.kind === 'toolchain');
+  const unsupportedChangedFiles = classifications.filter((item) => item.kind === 'unknown').map((item) => item.path);
+  const requiresConfigure = buildSystemChanged.length > 0;
+  const changedIdentities = new Set(sourceChangedFiles.map((file) => identity(path.resolve(repositoryRoot, file))));
   const entries = compileEntries(metadata);
   const targets = targetsFromMetadata(metadata);
   const compileDatabase = recordValue(metadata.compileDatabase);
   const cmake = recordValue(metadata.cmake);
   const cmakeCache = recordValue(metadata.cmakeCache);
   const cacheValues = recordValue(cmakeCache?.values) ?? {};
-  const warnings: string[] = [];
+  const warnings: string[] = [...classified.warnings];
   const incompleteness: string[] = [];
+  if (requiresConfigure) incompleteness.push('build_system_input_changed');
+  if (unsupportedChangedFiles.length > 0) incompleteness.push('unsupported_changed_files');
 
   if (compileDatabase?.truncated === true) incompleteness.push('compile_database_truncated');
   if (cmake?.targetsTruncated === true) incompleteness.push('cmake_targets_truncated');
@@ -406,17 +512,17 @@ export async function callCppBuildImpactAcceleratorTool(
   }
   for (const target of targets) {
     const sourceIds = targetSourceIdentities(target, repositoryRoot);
-    for (const changedFile of changedFiles) {
+    for (const changedFile of sourceChangedFiles) {
       if (sourceIds.has(identity(path.resolve(repositoryRoot, changedFile)))) mappedChangedFiles.add(changedFile);
     }
   }
 
-  const hasNonTuChange = changedFiles.some((file) => !TU_EXTENSIONS.has(path.extname(file).toLowerCase()));
-  const ninja = await ninjaAffectedTranslationUnits(
-    cacheValues, repositoryRoot, buildDir, changedIdentities, entries, deadlineAt,
-  );
+  const hasNonTuChange = sourceChangedFiles.some((file) => !TU_EXTENSIONS.has(path.extname(file).toLowerCase()));
+  const ninja = sourceChangedFiles.length > 0
+    ? await ninjaAffectedTranslationUnits(cacheValues, repositoryRoot, buildDir, changedIdentities, entries, deadlineAt)
+    : { files: new Set<string>(), matchedChangedIds: new Set<string>(), available: true, staleBlocks: 0, blockCount: 0, warning: undefined as string | undefined };
   for (const file of ninja.files) affectedTranslationUnits.add(file);
-  for (const changedFile of changedFiles) {
+  for (const changedFile of sourceChangedFiles) {
     if (ninja.matchedChangedIds.has(identity(path.resolve(repositoryRoot, changedFile)))) mappedChangedFiles.add(changedFile);
   }
   if (ninja.warning) warnings.push(ninja.warning);
@@ -431,7 +537,7 @@ export async function callCppBuildImpactAcceleratorTool(
       initialTargetIds.add(target.id);
     }
   }
-  const unmappedChanged = changedFiles.filter((file) => !mappedChangedFiles.has(file) && !ninja.files.has(file));
+  const unmappedChanged = sourceChangedFiles.filter((file) => !mappedChangedFiles.has(file) && !ninja.files.has(file));
   if (unmappedChanged.length > 0) incompleteness.push('changed_files_not_mapped_to_build_graph');
 
   let affectedTargetIds = expandDependentTargets(targets, initialTargetIds);
@@ -502,6 +608,10 @@ export async function callCppBuildImpactAcceleratorTool(
     repositoryRoot: slash(repositoryRoot),
     buildDir: slash(buildDir),
     changedFiles,
+    classifications,
+    requiresConfigure,
+    configureInvalidatedBy: buildSystemChanged.map((item) => item.path),
+    unsupportedChangedFiles,
     affectedTranslationUnits: boundedNames([...affectedTranslationUnits], MAX_METADATA_ENTRIES),
     affectedTargets: targetSelection.values,
     affectedTargetCount: targetSelection.total,
@@ -522,6 +632,8 @@ export async function callCppBuildImpactAcceleratorTool(
       buildProgram: typeof cacheValues.CMAKE_MAKE_PROGRAM === 'string' ? slash(cacheValues.CMAKE_MAKE_PROGRAM) : null,
       compileDatabaseSha256: compileDatabase?.found === true && typeof compileDatabase.sha256 === 'string' ? compileDatabase.sha256 : null,
       codemodelSha256: typeof cmakeCodemodel?.sha256 === 'string' ? cmakeCodemodel.sha256 : null,
+      cmakeFilesSha256: typeof recordValue(cmake?.cmakeFiles)?.sha256 === 'string' ? recordValue(cmake?.cmakeFiles)!.sha256 : null,
+      buildSystemClassificationSource: 'CMake File API + preset closure + cache toolchain',
       ninjaDeps: { available: ninja.available, blockCount: ninja.blockCount, staleBlocks: ninja.staleBlocks },
       snapshotValidation,
     },

@@ -26,6 +26,9 @@ import { toolHistory } from '../dist/utils/toolHistory.js';
 import { featureFlagManager } from '../dist/utils/feature-flags.js';
 import { usageTracker } from '../dist/utils/usageTracker.js';
 import {
+  CPP_BUILD_AUTO_OBSERVE_MAX_MS, PROCESS_CLIENT_RESPONSE_RESERVE_MS, PROCESS_TRANSPORT_RESERVE_MS,
+} from '../dist/utils/process-wait-contract.js';
+import {
   currentClient,
   getToolCallContext,
   runInToolCallContext,
@@ -102,7 +105,7 @@ await test('remote MCP integration preserves the exact argument object', async (
 });
 
 await test('remote MCP client reserves return-path time for cpp_build_execute', async () => {
-  const downstream = { root: 'C:/repo', operation: 'build', timeoutMs: 120_000 };
+  const downstream = { root: 'C:/repo', operation: 'build', timeoutMs: 120_000, executionMode: 'inline' };
   const expected = 135_000;
   assert.equal(localMcpRequestTimeoutMs('write_file', {
     path: 'mcp://desktop-accelerators/cpp_build_execute?timeout_ms=130000',
@@ -111,6 +114,24 @@ await test('remote MCP client reserves return-path time for cpp_build_execute', 
   assert.equal(localMcpRequestTimeoutMs('mcp_call_tool', {
     server: 'desktop-accelerators', tool: 'cpp_build_execute', arguments: downstream, timeout_ms: 130_000,
   }), expected);
+});
+
+await test('resumable build transport budget is independent from build lifetime', async () => {
+  const resumable = { root: 'C:/repo', operation: 'build', timeoutMs: 420_000, executionMode: 'resumable' };
+  const resumableExpected = PROCESS_TRANSPORT_RESERVE_MS + PROCESS_CLIENT_RESPONSE_RESERVE_MS;
+  assert.equal(localMcpRequestTimeoutMs('write_file', {
+    path: 'mcp://desktop-accelerators/cpp_build_execute',
+    content: JSON.stringify(resumable), mode: 'rewrite',
+  }), resumableExpected);
+  assert.equal(localMcpRequestTimeoutMs('mcp_call_tool', {
+    server: 'desktop-accelerators', tool: 'cpp_build_execute', arguments: resumable,
+  }), resumableExpected);
+
+  const auto = { ...resumable, executionMode: 'auto' };
+  const autoExpected = CPP_BUILD_AUTO_OBSERVE_MAX_MS + PROCESS_TRANSPORT_RESERVE_MS + PROCESS_CLIENT_RESPONSE_RESERVE_MS;
+  assert.equal(localMcpRequestTimeoutMs('mcp_call_tool', {
+    server: 'desktop-accelerators', tool: 'cpp_build_execute', arguments: auto,
+  }), autoExpected);
 });
 
 await test('local MCP child inherits only allowlisted runtime environment controls', async () => {

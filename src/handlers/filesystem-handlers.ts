@@ -26,6 +26,7 @@ import {
     CreateDirectoryArgsSchema,
     ListDirectoryArgsSchema,
     MoveFileArgsSchema,
+    TrashActionArgsSchema,
     GetFileInfoArgsSchema,
     WritePdfArgsSchema
 } from '../tools/schemas.js';
@@ -33,7 +34,8 @@ import path from 'path';
 import os from 'os';
 import { resolvePreviewFileType } from '../ui/file-preview/shared/preview-file-types.js';
 import { validatePathAuthority } from '../tools/path-security.js';
-import { acquireMutationResourceLocks } from '../utils/mutation-resource-lock.js';
+import { acquireCoordinatedMutationOwnership } from '../utils/resource-lease-owner.js';
+import { trashManager } from '../tools/trash-manager.js';
 
 /**
  * Expand home directory (~) in a file path
@@ -315,8 +317,8 @@ export async function handleWriteFile(args: unknown): Promise<ServerResult> {
         const parsed = WriteFileArgsSchema.parse(args);
         const deadlineAt = Date.now() + WRITE_OPERATION_TIMEOUT_MS;
         const validatedPath = await validatePathAuthority(parsed.path);
-        const releaseMutationLock = await acquireMutationResourceLocks(
-            [validatedPath], Math.min(deadlineAt, Date.now() + 45_000),
+        const releaseMutationLock = await acquireCoordinatedMutationOwnership(
+            [validatedPath], Math.min(deadlineAt, Date.now() + 45_000), { label: 'write_file' },
         );
         try {
             // An omitted `mode` falls back to 'rewrite', which silently destroys
@@ -381,8 +383,8 @@ export async function handleCreateDirectory(args: unknown): Promise<ServerResult
     try {
         const parsed = CreateDirectoryArgsSchema.parse(args);
         const validatedPath = await validatePathAuthority(parsed.path);
-        const releaseMutationLock = await acquireMutationResourceLocks(
-            [validatedPath], Date.now() + 45_000, { topologyMode: 'exclusive' }
+        const releaseMutationLock = await acquireCoordinatedMutationOwnership(
+            [validatedPath], Date.now() + 45_000, { topologyMode: 'exclusive', label: 'create_directory' }
         );
         try {
             await createDirectory(validatedPath);
@@ -435,8 +437,8 @@ export async function handleMoveFile(args: unknown): Promise<ServerResult> {
         const parsed = MoveFileArgsSchema.parse(args);
         const validatedSource = await validatePathAuthority(parsed.source);
         const validatedDestination = await validatePathAuthority(parsed.destination);
-        const releaseMutationLock = await acquireMutationResourceLocks(
-            [validatedSource, validatedDestination], Date.now() + 45_000, { topologyMode: 'exclusive' }
+        const releaseMutationLock = await acquireCoordinatedMutationOwnership(
+            [validatedSource, validatedDestination], Date.now() + 45_000, { topologyMode: 'exclusive', label: 'move_file' }
         );
         try {
             await moveFile(validatedSource, validatedDestination);
@@ -446,6 +448,17 @@ export async function handleMoveFile(args: unknown): Promise<ServerResult> {
         } finally {
             await releaseMutationLock();
         }
+    } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        return createErrorResponse(errorMessage);
+    }
+}
+
+export async function handleTrashAction(args: unknown): Promise<ServerResult> {
+    try {
+        const parsed = TrashActionArgsSchema.parse(args);
+        const result = await trashManager.action(parsed);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         return createErrorResponse(errorMessage);
@@ -524,7 +537,7 @@ export async function handleWritePdf(args: unknown): Promise<ServerResult> {
                 }
             }
         }
-        const releaseMutationLock = await acquireMutationResourceLocks(resources, Date.now() + 45_000);
+        const releaseMutationLock = await acquireCoordinatedMutationOwnership(resources, Date.now() + 45_000, { label: 'write_pdf' });
         try {
             await writePdf(
                 validatedSource, parsed.content,

@@ -36,6 +36,7 @@ import {
     CreateDirectoryArgsSchema,
     ListDirectoryArgsSchema,
     MoveFileArgsSchema,
+    TrashActionArgsSchema,
     GetFileInfoArgsSchema,
     GetConfigArgsSchema,
     SetConfigValueArgsSchema,
@@ -68,6 +69,7 @@ import { trackToolCall } from './utils/trackTools.js';
 import { assertMcpCompatWriteFileOptions, isMcpCompatUri, unsupportedMcpReadFileOptions } from './utils/mcp-uri.js';
 import { usageTracker } from './utils/usageTracker.js';
 import { processDockerPrompt } from './utils/dockerPrompt.js';
+import { startTrashManager } from './tools/trash-manager.js';
 import { toolHistory } from './utils/toolHistory.js';
 import { listNeutralToolAliases, resolveNeutralToolAlias } from './tools/neutral-tool-aliases.js';
 import { handleWelcomePageOnboarding, skipWelcomePageOnboarding } from './utils/welcome-onboarding.js';
@@ -239,6 +241,9 @@ export async function handleServerInitialized(): Promise<void> {
     } catch (error) {
         logToStderr('error', `Error in post-initialization handler: ${error}`);
     }
+    // Trash expiry is process-owned and independent of any one tool request.
+    // Startup is deliberately non-blocking; stale roots fail closed inside the manager.
+    startTrashManager();
 }
 
 // Preserve the public connection-level client binding without exporting
@@ -594,6 +599,31 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 inputSchema: zodToJsonSchema(MoveFileArgsSchema),
                 annotations: {
                     title: "Move/Rename File",
+                    readOnlyHint: false,
+                    destructiveHint: true,
+                    openWorldHint: false,
+                },
+            },
+            {
+                name: "trash_action",
+                description: `
+                        Recoverable workspace trash. This is the safe replacement for deleting files or directories.
+
+                        Actions:
+                        - put: requires an absolute path. Moves that item by rename into a manager-owned trash area in its exact Git workspace.
+                        - list: lists restorable entries; optional name lists the immediate contents of one trashed directory.
+                        - read: requires name. Reads one trashed file (bounded); symlinks return only their link target.
+                        - restore: requires name. Renames the item back to its recorded original path and refuses overwrite.
+
+                        Entries expire after 20 minutes and are purged only by the autonomous TrashManager.
+                        There is no public purge/delete action. put/restore never fall back to copy+delete across filesystems.
+                        workspace is optional; when supplied it must be the absolute exact Git working-tree root and cannot widen access.
+                        Generic filesystem/search tools cannot access the manager-owned trash storage.
+
+                        ${CMD_PREFIX_DESCRIPTION}`,
+                inputSchema: zodToJsonSchema(TrashActionArgsSchema),
+                annotations: {
+                    title: "Recoverable Trash Action",
                     readOnlyHint: false,
                     destructiveHint: true,
                     openWorldHint: false,
@@ -1575,6 +1605,10 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
 
             case "move_file":
                 result = await handlers.handleMoveFile(args);
+                break;
+
+            case "trash_action":
+                result = await handlers.handleTrashAction(args);
                 break;
 
             case "start_search":

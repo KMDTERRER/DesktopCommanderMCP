@@ -7,6 +7,7 @@ import { validatePath } from './filesystem.js';
 import { runWithAbortableTimeout } from '../utils/withTimeout.js';
 import { runBoundedSubprocess, type BoundedSubprocessResult } from '../utils/bounded-subprocess.js';
 import { readFileBounded } from '../utils/bounded-file-read.js';
+import { isManagedTrashRelativePath } from '../utils/trash-contract.js';
 
 const AST_GREP_TIMEOUT_MS = 30_000;
 const AST_GREP_EXPECTED_VERSION = '0.45.0';
@@ -212,6 +213,7 @@ function parseMatches(stdout: string, projectFolder: string): CompactAstMatch[] 
     if (!relative || relative === '..' || relative.startsWith('../') || path.isAbsolute(relative)) {
       throw new Error(`ast-grep returned a match outside project_folder: ${raw.file}`);
     }
+    if (isManagedTrashRelativePath(relative)) continue;
     const start = raw.range?.start ?? {};
     const end = raw.range?.end ?? {};
     const fullText = typeof raw.text === 'string' ? raw.text : '';
@@ -470,6 +472,7 @@ function parseRewriteMatches(stdout: string, projectFolder: string, repoRoot: st
     if (!repositoryFile || repositoryFile === '..' || repositoryFile.startsWith('../') || path.isAbsolute(repositoryFile)) {
       throw new Error(`ast-grep returned a rewrite outside the Git repository: ${raw.file}`);
     }
+    if (isManagedTrashRelativePath(repositoryFile)) continue;
     if (repositoryFile === '.git' || repositoryFile.startsWith('.git/')) {
       throw new Error('AST_REWRITE_REPOSITORY_METADATA_FORBIDDEN: .git cannot be a rewrite target.');
     }

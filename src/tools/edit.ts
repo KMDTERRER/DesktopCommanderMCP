@@ -27,7 +27,7 @@ import { detectLineEnding, normalizeLineEndings } from '../utils/lineEndingHandl
 import { configManager } from '../config-manager.js';
 import { resolvePreviewFileType } from '../ui/file-preview/shared/preview-file-types.js';
 import { resolveAbsolutePath } from '../handlers/filesystem-handlers.js';
-import { acquireMutationResourceLocks } from '../utils/mutation-resource-lock.js';
+import { acquireCoordinatedMutationOwnership } from '../utils/resource-lease-owner.js';
 
 interface SearchReplace {
     search: string;
@@ -393,7 +393,9 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
 
     let releaseMutationLock: (() => Promise<void>) | undefined;
     try {
-        releaseMutationLock = await acquireMutationResourceLocks([validatedPath], Date.now() + 45_000);
+        releaseMutationLock = await acquireCoordinatedMutationOwnership(
+            [validatedPath], Date.now() + 45_000, { label: 'edit_block' },
+        );
     } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         return createErrorResponse(errorMessage);

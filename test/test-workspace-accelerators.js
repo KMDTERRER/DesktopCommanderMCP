@@ -33,6 +33,7 @@ import {
 } from '../dist/tools/core-mcp.js';
 import { StartProcessArgsSchema, ReadProcessOutputArgsSchema, InteractWithProcessArgsSchema, McpCallToolArgsSchema, toolArgSchemas } from '../dist/tools/schemas.js';
 import { PROCESS_TRANSPORT_RESERVE_MS, PROCESS_TRANSPORT_TIMEOUT_MAX_MS, PROCESS_WAIT_DEFAULT_MS, PROCESS_WAIT_MAX_MS } from '../dist/utils/process-wait-contract.js';
+import { acquireMutationResourceLease, acquireResourceLease } from '../dist/utils/resource-lease-owner.js';
 
 function git(root, ...args) {
   return execFileSync('git', ['-C', root, ...args], { encoding: 'utf8' }).trim();
@@ -41,6 +42,8 @@ function git(root, ...args) {
 function hashText(text) {
   return `sha256:${crypto.createHash('sha256').update(text, 'utf8').digest('hex')}`;
 }
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function expectReject(action, contains) {
   let message = '';
@@ -75,7 +78,7 @@ async function main() {
     assert.equal(BUILTIN_SERVER_ID, 'desktop-accelerators');
     assert.deepEqual(
       catalog.map((tool) => tool.name).sort(),
-      ['apply_patch', 'ast_rewrite', 'ast_rule_search', 'ast_search', 'build_metadata', 'context_pack', 'cpp_build_context', 'cpp_build_execute', 'cpp_build_impact', 'cpp_build_plan', 'cpp_toolchain_profile', 'edit_file', 'read_ranges', 'safe_fix', 'wait_process', 'workspace_delta', 'workspace_snapshot'],
+      ['apply_patch', 'ast_rewrite', 'ast_rule_search', 'ast_search', 'build_metadata', 'context_pack', 'cpp_build_context', 'cpp_build_execute', 'cpp_build_impact', 'cpp_build_plan', 'cpp_build_result', 'cpp_toolchain_profile', 'edit_file', 'read_ranges', 'safe_fix', 'wait_process', 'workspace_delta', 'workspace_snapshot'],
     );
     const patchMetadata = listBuiltinAcceleratorTools('apply_patch');
     assert.equal(patchMetadata.mutating, true);
@@ -84,6 +87,12 @@ async function main() {
     const snapshotMetadata = listBuiltinAcceleratorTools('workspace_snapshot');
     assert.equal(snapshotMetadata.readOnly, true);
     assert.equal(snapshotMetadata.preferredFrozenSurface, 'read_file');
+    const buildResultMetadata = listBuiltinAcceleratorTools('cpp_build_result');
+    assert.equal(buildResultMetadata.readOnly, true);
+    assert.equal(buildResultMetadata.mutating, false);
+    assert.equal(buildResultMetadata.preferredFrozenSurface, 'read_file');
+    const buildExecuteMetadata = listBuiltinAcceleratorTools('cpp_build_execute');
+    assert.deepEqual(buildExecuteMetadata.inputSchema.properties.executionMode.enum, ['auto', 'inline', 'resumable']);
 
     assert.equal(StartProcessArgsSchema.safeParse({ command: 'echo ok', timeout_ms: PROCESS_WAIT_MAX_MS }).success, true);
     assert.equal(StartProcessArgsSchema.safeParse({ command: 'echo ok', timeout_ms: PROCESS_WAIT_MAX_MS + 1 }).success, false);
@@ -673,6 +682,7 @@ async function main() {
       `CMAKE_CTEST_COMMAND:INTERNAL=${ctestExecutable}`,
       `CMAKE_MAKE_PROGRAM:FILEPATH=${cmakeExecutable}`,
       `CMAKE_CXX_COMPILER:FILEPATH=${path.join(syntheticToolchainBin, process.platform === 'win32' ? 'c++.exe' : 'c++')}`,
+      `CMAKE_TOOLCHAIN_FILE:FILEPATH=${path.join(buildMetaRoot, 'cmake', 'toolchain.cmake')}`,
       `CMAKE_PREFIX_PATH:PATH=${syntheticQtRoot}`,
       `Qt6_DIR:PATH=${syntheticQtDir}`,
       'CMAKE_GENERATOR:INTERNAL=Ninja',
@@ -682,7 +692,32 @@ async function main() {
     ].join('\n'), 'utf8');
     await fs.writeFile(path.join(replyDir, 'index-2026-08-15T000000.json'), JSON.stringify({
       cmake: { generator: { name: 'Ninja', multiConfig: false } },
-      objects: [{ kind: 'codemodel', version: { major: 2, minor: 8 }, jsonFile: 'codemodel-v2.json' }],
+      objects: [
+        { kind: 'codemodel', version: { major: 2, minor: 8 }, jsonFile: 'codemodel-v2.json' },
+        { kind: 'cmakeFiles', version: { major: 1, minor: 1 }, jsonFile: 'cmakeFiles-v1.json' },
+        { kind: 'toolchains', version: { major: 1, minor: 1 }, jsonFile: 'toolchains-v1.json' },
+      ],
+    }), 'utf8');
+    await fs.writeFile(path.join(replyDir, 'cmakeFiles-v1.json'), JSON.stringify({
+      kind: 'cmakeFiles', version: { major: 1, minor: 1 },
+      paths: { source: buildMetaRoot.replace(/\\/g, '/'), build: buildMetaDir.replace(/\\/g, '/') },
+      inputs: [
+        { path: 'CMakeLists.txt' },
+        { path: 'cmake/options.cmake' },
+        { path: path.join(buildMetaDir, 'CMakeFiles', 'generated.cmake').replace(/\\/g, '/'), isGenerated: true },
+      ],
+      globsDependent: [{ expression: 'src/*.cpp', recurse: false, files: ['src/main.cpp', 'src/alt.cpp'] }],
+    }), 'utf8');
+    await fs.writeFile(path.join(replyDir, 'toolchains-v1.json'), JSON.stringify({
+      kind: 'toolchains', version: { major: 1, minor: 1 },
+      toolchains: [{
+        language: 'CXX', sourceFileExtensions: ['cpp', 'cxx'],
+        compiler: {
+          path: path.join(syntheticToolchainBin, process.platform === 'win32' ? 'clang++.exe' : 'clang++').replace(/\\/g, '/'),
+          id: 'Clang', version: '22.0.0', target: 'x86_64-pc-windows-msvc',
+          implicit: { includeDirectories: [path.join(buildMetaRoot, 'include')], linkDirectories: [syntheticToolchainBin], linkFrameworkDirectories: [], linkLibraries: ['c++'] },
+        },
+      }],
     }), 'utf8');
     await fs.writeFile(path.join(replyDir, 'codemodel-v2.json'), JSON.stringify({
       kind: 'codemodel',
@@ -724,6 +759,18 @@ async function main() {
     assert(buildMeta.compileDatabase.matchedEntries[0].semanticFlags.includes.includes('../include'));
     assert(buildMeta.compileDatabase.matchedEntries[0].semanticFlags.defines.includes('VALUE=1'));
     assert.equal(buildMeta.cmake.generator.name, 'Ninja');
+    assert(buildMeta.cmake.availableObjectKinds.some((item) => item.kind === 'cmakeFiles' && item.major === 1));
+    assert(buildMeta.cmake.availableObjectKinds.some((item) => item.kind === 'toolchains' && item.major === 1));
+    assert.equal(buildMeta.cmake.cmakeFiles.found, true);
+    assert(buildMeta.cmake.cmakeFiles.inputs.some((item) => item.path === 'CMakeLists.txt' && path.resolve(item.absolutePath) === path.resolve(buildMetaRoot, 'CMakeLists.txt')));
+    assert(buildMeta.cmake.cmakeFiles.inputs.some((item) => item.isGenerated === true));
+    assert.equal(buildMeta.cmake.cmakeFiles.globsDependent[0].expression, 'src/*.cpp');
+    assert.deepEqual(buildMeta.cmake.cmakeFiles.globsDependent[0].paths, ['src/main.cpp', 'src/alt.cpp']);
+    assert.equal(buildMeta.cmake.toolchains.found, true);
+    assert.equal(buildMeta.cmake.toolchains.toolchains[0].language, 'CXX');
+    assert.equal(buildMeta.cmake.toolchains.toolchains[0].compiler.id, 'Clang');
+    assert.equal(buildMeta.cmake.toolchains.toolchains[0].compiler.version, '22.0.0');
+    assert.equal(buildMeta.cmake.toolchains.toolchains[0].compiler.target, 'x86_64-pc-windows-msvc');
     assert.equal(buildMeta.cmake.configurations[0].name, 'Debug');
     assert.equal(path.resolve(buildMeta.cmake.codemodel.paths.source), path.resolve(buildMetaRoot));
     assert.equal(path.resolve(buildMeta.cmake.codemodel.paths.build), path.resolve(buildMetaDir));
@@ -889,6 +936,39 @@ async function main() {
     assert.deepEqual(directImpact.affectedTargets, ['sample']);
     assert.equal(directImpact.recommendFullBuild, false);
     assert.equal(directImpact.selectionComplete, true);
+    assert.deepEqual(directImpact.classifications, [
+      { path: 'src/main.cpp', kind: 'source', evidence: 'C/C++ source/header/module extension' },
+    ]);
+    assert.equal(directImpact.requiresConfigure, false);
+
+    const cmakeImpact = await callBuiltinAcceleratorTool('cpp_build_impact', {
+      root: buildMetaRoot, buildDir: buildMetaDir, changedFiles: ['CMakeLists.txt'], includeTests: false,
+    });
+    assert.equal(cmakeImpact.classifications[0].kind, 'cmake_input');
+    assert.equal(cmakeImpact.requiresConfigure, true);
+    assert.deepEqual(cmakeImpact.configureInvalidatedBy, ['CMakeLists.txt']);
+    assert.equal(cmakeImpact.recommendFullBuild, true);
+    assert.equal(cmakeImpact.selectionComplete, false);
+
+    const presetImpact = await callBuiltinAcceleratorTool('cpp_build_impact', {
+      root: buildMetaRoot, buildDir: buildMetaDir, changedFiles: ['CMakePresets.json'], includeTests: false,
+    });
+    assert.equal(presetImpact.classifications[0].kind, 'preset');
+    assert.equal(presetImpact.requiresConfigure, true);
+
+    const toolchainImpact = await callBuiltinAcceleratorTool('cpp_build_impact', {
+      root: buildMetaRoot, buildDir: buildMetaDir, changedFiles: ['cmake/toolchain.cmake'], includeTests: false,
+    });
+    assert.equal(toolchainImpact.classifications[0].kind, 'toolchain');
+    assert.equal(toolchainImpact.requiresConfigure, true);
+
+    const unknownImpact = await callBuiltinAcceleratorTool('cpp_build_impact', {
+      root: buildMetaRoot, buildDir: buildMetaDir, changedFiles: ['dependency.lock'], includeTests: false,
+    });
+    assert.equal(unknownImpact.classifications[0].kind, 'unknown');
+    assert.deepEqual(unknownImpact.unsupportedChangedFiles, ['dependency.lock']);
+    assert.equal(unknownImpact.requiresConfigure, false);
+    assert.equal(unknownImpact.recommendFullBuild, true);
 
     const contextSchema = parseTextResult(await readExternalMcpCompatUri('mcp://desktop-accelerators/cpp_build_context'));
     assert.equal(contextSchema.tool.name, 'cpp_build_context');
@@ -944,13 +1024,122 @@ async function main() {
       }),
       terminateProcess: async () => true,
       acquireMutationLocks: async () => async () => undefined,
+      planBuildAccess: async (args) => {
+        const targets = Array.isArray(args.targets) ? args.targets : [];
+        const fingerprint = JSON.stringify([path.resolve(args.buildDir), targets, args.preset ?? null]);
+        return {
+          accessFingerprint: fingerprint, coverage: 'historical',
+          readPaths: [], readRoots: [], writePaths: [], writeRoots: [path.resolve(args.buildDir)], watchRoots: [],
+          incompleteness: [], warnings: [],
+          leaseRequest: { kind: 'build', writeRoots: [path.resolve(args.buildDir)], coverage: 'historical' },
+        };
+      },
+      acquireBuildAccessLease: async () => ({ release: async () => undefined }),
     };
+
+    let staleBuildStarted = false;
+    const staleNever = await callCppBuildExecuteAcceleratorTool({
+      root: buildMetaRoot, buildDir: buildMetaDir, operation: 'build',
+      changedFiles: ['CMakeLists.txt'], configureMode: 'never', timeoutMs: 5000,
+    }, 5000, {
+      ...fakeExecuteDeps,
+      startProcess: async () => { staleBuildStarted = true; return { structuredContent: { pid: fakePid++ } }; },
+    });
+    assert.equal(staleNever.succeeded, false);
+    assert.equal(staleBuildStarted, false);
+    assert(staleNever.diagnostics.some((item) => item.message.includes('CPP_RECONFIGURE_REQUIRED')), JSON.stringify(staleNever));
+
+    const staleIfMissing = await callCppBuildExecuteAcceleratorTool({
+      root: buildMetaRoot, buildDir: buildMetaDir, operation: 'build', changedFiles: ['CMakeLists.txt'],
+      configureMode: 'if_missing', configurePreset: 'base', timeoutMs: 5000,
+    }, 5000, fakeExecuteDeps);
+    assert.equal(staleIfMissing.succeeded, false);
+    assert(staleIfMissing.diagnostics.some((item) => item.message.includes('CPP_RECONFIGURE_REQUIRED')), JSON.stringify(staleIfMissing));
+
+    const reconfigureCalls = [];
+    const reconfigured = await callCppBuildExecuteAcceleratorTool({
+      root: buildMetaRoot, buildDir: buildMetaDir, operation: 'build', changedFiles: ['CMakeLists.txt'],
+      configureMode: 'if_needed', configurePreset: 'base', includeTests: false, timeoutMs: 5000,
+    }, 5000, {
+      ...fakeExecuteDeps,
+      startProcess: async (processArgs) => {
+        reconfigureCalls.push(processArgs);
+        return { structuredContent: { pid: fakePid++ }, content: [{ type: 'text', text: 'started' }] };
+      },
+    });
+    assert.equal(reconfigured.succeeded, true, JSON.stringify(reconfigured));
+    assert.equal(reconfigured.configure.executed, true);
+    assert.deepEqual(reconfigureCalls[0].args, ['--preset', 'base', '-B', path.resolve(buildMetaDir)]);
+    assert(reconfigureCalls.some((call) => Array.isArray(call.args) && call.args[0] === '--build'), JSON.stringify(reconfigureCalls));
+    const queryPath = path.join(buildMetaDir, '.cmake', 'api', 'v1', 'query', 'client-desktop-commander', 'query.json');
+    assert.equal((await fs.stat(queryPath)).isFile(), true);
+
+    let staleTestStarted = false;
+    const staleTest = await callCppBuildExecuteAcceleratorTool({
+      root: buildMetaRoot, buildDir: buildMetaDir, operation: 'test', changedFiles: ['CMakeLists.txt'], timeoutMs: 5000,
+    }, 5000, {
+      ...fakeExecuteDeps,
+      startProcess: async () => { staleTestStarted = true; return { structuredContent: { pid: fakePid++ } }; },
+    });
+    assert.equal(staleTest.succeeded, false);
+    assert.equal(staleTestStarted, false);
+    assert(staleTest.diagnostics.some((item) => item.message.includes('CPP_REBUILD_REQUIRED')), JSON.stringify(staleTest));
+
     const autoBuildDir = await callCppBuildExecuteAcceleratorTool({
       root: buildMetaRoot, operation: 'build', targets: ['sample'], configuration: 'Debug', timeoutMs: 5000,
     }, 5000, fakeExecuteDeps);
     assert.equal(autoBuildDir.succeeded, true, JSON.stringify(autoBuildDir));
     assert.equal(path.resolve(autoBuildDir.buildDir), path.resolve(buildMetaDir));
     assert.equal(autoBuildDir.buildDirSource, 'discovered');
+
+    // cpp_build_execute must publish source/build access before starting the build,
+    // while allowing mutations outside the planned read set to proceed concurrently.
+    let markBuildStarted;
+    let finishLeasedBuild;
+    const leasedBuildStarted = new Promise((resolve) => { markBuildStarted = resolve; });
+    const leasedBuildMayFinish = new Promise((resolve) => { finishLeasedBuild = resolve; });
+    const leasedSource = path.join(buildMetaRoot, 'src', 'main.cpp');
+    const leasedExecutePromise = callCppBuildExecuteAcceleratorTool({
+      root: buildMetaRoot, buildDir: buildMetaDir, operation: 'build', targets: ['sample'],
+      configuration: 'Debug', timeoutMs: 5000,
+    }, 5000, {
+      ...fakeExecuteDeps,
+      planBuildAccess: async (args) => {
+        const targets = Array.isArray(args.targets) ? args.targets : [];
+        return {
+          accessFingerprint: JSON.stringify([path.resolve(args.buildDir), targets, leasedSource]),
+          coverage: 'historical', readPaths: [leasedSource], readRoots: [],
+          writePaths: [], writeRoots: [path.resolve(args.buildDir)], watchRoots: [],
+          incompleteness: [], warnings: [],
+          leaseRequest: {
+            kind: 'build', readPaths: [leasedSource], writeRoots: [path.resolve(args.buildDir)], coverage: 'historical',
+          },
+        };
+      },
+      acquireBuildAccessLease: (request, deadlineAt) => acquireResourceLease(request, deadlineAt),
+      startProcess: async () => { markBuildStarted(); return { structuredContent: { pid: fakePid++ } }; },
+      waitProcess: async () => {
+        await leasedBuildMayFinish;
+        return { completed: true, timedOut: false, processSucceeded: true, exitCode: 0, runtimeMs: 5, tail: '' };
+      },
+    });
+    await leasedBuildStarted;
+    let sourceWriterSettled = false;
+    const sourceWriter = acquireMutationResourceLease([leasedSource], Date.now() + 4000, { label: 'execute-source-writer' })
+      .then((handle) => { sourceWriterSettled = true; return handle; });
+    await sleep(120);
+    assert.equal(sourceWriterSettled, false, 'source writer bypassed cpp_build_execute access lease');
+    const unrelatedBuildEdit = await acquireMutationResourceLease(
+      [path.join(buildMetaRoot, 'docs', 'parallel.txt')], Date.now() + 1000, { label: 'execute-unrelated-writer' },
+    );
+    await unrelatedBuildEdit.release();
+    finishLeasedBuild();
+    const leasedExecute = await leasedExecutePromise;
+    assert.equal(leasedExecute.succeeded, true, JSON.stringify(leasedExecute));
+    assert.equal(leasedExecute.buildAccess.coverage, 'historical');
+    const sourceWriterLease = await sourceWriter;
+    assert.equal(sourceWriterSettled, true);
+    await sourceWriterLease.release();
 
     const presetLockCalls = [];
     const presetFastPath = await callCppBuildExecuteAcceleratorTool({
@@ -1070,10 +1259,19 @@ async function main() {
     await fs.writeFile(path.join(configureAutoRoot, 'CMakePresets.json'), JSON.stringify({
       version: 3, configurePresets: [{ name: 'auto', binaryDir: '${sourceDir}/preset-build' }],
     }), 'utf8');
+    const configureCalls = [];
     const configureDeps = {
       ...fakeExecuteDeps,
       startProcess: async (processArgs) => {
         if (Array.isArray(processArgs.args) && processArgs.args[0] === '--preset') {
+          configureCalls.push([...processArgs.args]);
+          if (configureCalls.length === 2) {
+            assert.deepEqual(processArgs.args.slice(0, 3), ['--preset', 'auto', '-B']);
+            assert.equal(path.resolve(processArgs.args[3]), path.resolve(configureAutoBuild));
+            const queryPath = path.join(configureAutoBuild, '.cmake', 'api', 'v1', 'query', 'client-desktop-commander', 'query.json');
+            const query = JSON.parse(await fs.readFile(queryPath, 'utf8'));
+            assert.deepEqual(query.requests.map((item) => item.kind), ['codemodel', 'cmakeFiles', 'toolchains']);
+          }
           await fs.mkdir(configureAutoBuild, { recursive: true });
           await fs.writeFile(path.join(configureAutoBuild, 'CMakeCache.txt'), [
             `CMAKE_COMMAND:INTERNAL=${configureAutoCmake}`,
@@ -1096,6 +1294,8 @@ async function main() {
     assert.equal(path.resolve(configuredByPreset.buildDir), path.resolve(configureAutoBuild));
     assert.equal(configuredByPreset.buildDirSource, 'configure-preset');
     assert.equal(configuredByPreset.configure.executed, true);
+    assert.equal(configureCalls.length, 2, JSON.stringify(configureCalls));
+    assert.deepEqual(configureCalls[0], ['--preset', 'auto']);
     await fs.rm(configureAutoRoot, { recursive: true, force: true });
     await fs.rm(configureAutoToolDir, { recursive: true, force: true });
 

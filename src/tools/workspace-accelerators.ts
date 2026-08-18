@@ -12,20 +12,26 @@ import {
 import { BUILD_METADATA_ACCELERATOR_TOOL, callBuildMetadataAcceleratorTool } from './build-metadata-accelerator.js';
 import { CPP_BUILD_PLAN_ACCELERATOR_TOOL, callCppBuildPlanAcceleratorTool } from './cpp-build-plan-accelerator.js';
 import { CPP_BUILD_CONTEXT_ACCELERATOR_TOOL, callCppBuildContextAcceleratorTool } from './cpp-build-context-accelerator.js';
-import { CPP_BUILD_EXECUTE_ACCELERATOR_TOOL, callCppBuildExecuteAcceleratorTool } from './cpp-build-execute-accelerator.js';
+import { CPP_BUILD_EXECUTE_ACCELERATOR_TOOL } from './cpp-build-execute-accelerator.js';
+import { CPP_BUILD_RESULT_ACCELERATOR_TOOL, executeCppBuildEntry, readCppBuildResult } from './cpp-build-entry.js';
+
+
 import { CPP_BUILD_IMPACT_ACCELERATOR_TOOL, callCppBuildImpactAcceleratorTool } from './cpp-build-impact-accelerator.js';
-import { startProcess } from './improved-process-tools.js';
+
 import { CPP_TOOLCHAIN_PROFILE_ACCELERATOR_TOOL, callCppToolchainProfileAcceleratorTool } from './cpp-toolchain-profile-accelerator.js';
 import { SAFE_FIX_ACCELERATOR_TOOL, callSafeFixAcceleratorTool } from './safe-fix-accelerator.js';
 import { runWithAbortableTimeout } from '../utils/withTimeout.js';
 import { renameReplacingWithRetry } from '../utils/atomic-rename.js';
 import { findWindowsFileLockers } from '../utils/windows-file-locks.js';
 import { acquireMutationResourceLocks } from '../utils/mutation-resource-lock.js';
+import { acquireCoordinatedMutationOwnership } from '../utils/resource-lease-owner.js';
 import { readFileBounded } from '../utils/bounded-file-read.js';
+import { MANAGED_TRASH_DIRECTORY_NAME, isManagedTrashRelativePath } from '../utils/trash-contract.js';
 import { runBoundedSubprocess, type BoundedSubprocessResult } from '../utils/bounded-subprocess.js';
 import { processProblemEvidence } from '../utils/process-problem-matcher.js';
+import { waitForTerminalProcess } from '../utils/terminal-process-wait.js';
 import {
-  PROCESS_STALL_DEFAULT_MS, PROCESS_TRANSPORT_TIMEOUT_MAX_MS,
+  PROCESS_STALL_DEFAULT_MS, PROCESS_TRANSPORT_RESERVE_MS, PROCESS_TRANSPORT_TIMEOUT_MAX_MS,
   PROCESS_WAIT_DEFAULT_MS, PROCESS_WAIT_MAX_MS,
 } from '../utils/process-wait-contract.js';
 
@@ -305,7 +311,9 @@ async function applyPreparedAstRewriteFiles(
     }
     return { entry, source };
   });
-  const release = await acquireMutationResourceLocks(resolved.map((file) => file.absolute), deadlineAt);
+  const release = await acquireCoordinatedMutationOwnership(
+    resolved.map((file) => file.absolute), deadlineAt, { label: 'ast_rewrite' },
+  );
   const staged: StagedAstRewriteFile[] = [];
   const preservedBackups = new Set<string>();
   try {
@@ -489,6 +497,17 @@ function zeroDelimitedChangedNames(stdout: string): string[] {
   return names;
 }
 
+function withoutManagedTrashStatusLines(value: string): string {
+  const marker = MANAGED_TRASH_DIRECTORY_NAME.toLocaleLowerCase();
+  return value.split(/\r?\n/).filter((line) => {
+    if (!line) return false;
+    const body = normalizeSlash(line.length >= 3 ? line.slice(3).trim() : line)
+      .replace(/^"|"$/g, '').toLocaleLowerCase();
+    return body !== marker && !body.startsWith(`${marker}/`)
+      && !body.includes(` -> ${marker}/`) && !body.includes(` -> ${marker}`);
+  }).join('\n');
+}
+
 function boundedWorkspaceSnapshotText(value: string) {
   const originalChars = value.length;
   if (originalChars <= MAX_WORKSPACE_SNAPSHOT_TEXT_CHARS) {
@@ -549,12 +568,14 @@ async function workspaceSnapshot(args: Record<string, unknown>, deadlineAt: numb
     }
   }
 
-  const statusShort = requireGitSuccess(statusResult, 'git status --short').trimEnd();
+  const statusShort = withoutManagedTrashStatusLines(
+    requireGitSuccess(statusResult, 'git status --short').trimEnd(),
+  );
   const changedFiles = sortedUnique([
     ...zeroDelimitedChangedNames(requireGitSuccess(unstagedResult, 'git diff --name-status')),
     ...zeroDelimitedChangedNames(requireGitSuccess(stagedResult, 'git diff --cached --name-status')),
     ...zeroDelimitedNames(requireGitSuccess(untrackedResult, 'git ls-files --others')),
-  ]);
+  ].filter((relativePath) => !isManagedTrashRelativePath(relativePath)));
   const rawDiffStat = includeDiffStat
     ? requireGitSuccess(diffStatResult, 'git diff --stat HEAD').trimEnd()
     : undefined;
@@ -905,7 +926,8 @@ async function workspaceDeltaPreflight(root: string, deadlineAt: number) {
     ),
   ]);
   const head = requireGitSuccess(headResult, 'git rev-parse HEAD').trim();
-  const gitStates = parsePorcelainV1States(requireGitSuccess(porcelainResult, 'git status --porcelain=v1 -z'));
+  const rawGitStates = parsePorcelainV1States(requireGitSuccess(porcelainResult, 'git status --porcelain=v1 -z'));
+  const gitStates = new Map([...rawGitStates].filter(([relativePath]) => !isManagedTrashRelativePath(relativePath)));
   return { repoRoot, head, gitStates, changedFiles: sortedUnique([...gitStates.keys()]) };
 }
 
@@ -935,6 +957,12 @@ async function workspaceDelta(args: Record<string, unknown>, deadlineAt: number)
   let reason = freshInstance ? 'cursor_missing' : undefined;
   if (cursorText !== undefined) {
     previous = decodeWorkspaceCursor(cursorText);
+    previous = {
+      ...previous,
+      dirty: Object.fromEntries(
+        Object.entries(previous.dirty).filter(([relativePath]) => !isManagedTrashRelativePath(relativePath)),
+      ),
+    };
     if (previous.repo !== currentPayload.repo) {
       previous = undefined;
       freshInstance = true;
@@ -951,7 +979,8 @@ async function workspaceDelta(args: Record<string, unknown>, deadlineAt: number)
       remainingTimeout(deadlineAt),
     );
     if (diff.exitCode === 0) {
-      commitChangedFiles = zeroDelimitedChangedNames(diff.stdout);
+      commitChangedFiles = zeroDelimitedChangedNames(diff.stdout)
+        .filter((relativePath) => !isManagedTrashRelativePath(relativePath));
     } else {
       previous = undefined;
       freshInstance = true;
@@ -1136,7 +1165,9 @@ async function contextPack(args: Record<string, unknown>, deadlineAt: number) {
     scopePrefix && !inScope(requestedPath) ? `${scopePrefix}/${requestedPath}` : requestedPath
   ));
   const contextPathAllowed = (relativePath: string) =>
-    explicitContextPaths.has(relativePath) || !isTransientContextPath(relativePath) || contextPathExplicitlyRequested(relativePath, queryLower);
+    !isManagedTrashRelativePath(relativePath) && (
+      explicitContextPaths.has(relativePath) || !isTransientContextPath(relativePath) || contextPathExplicitlyRequested(relativePath, queryLower)
+    );
   const scopedChangedFiles = (delta.changedFiles as string[]).filter((relativePath) => inScope(relativePath) && contextPathAllowed(relativePath));
   const scopedWorkingTreeChangedFiles = (delta.workingTreeChangedFiles as string[])
     .filter((relativePath) => inScope(relativePath) && contextPathAllowed(relativePath));
@@ -1171,7 +1202,7 @@ async function contextPack(args: Record<string, unknown>, deadlineAt: number) {
     const scopedCandidate = scopePrefix && !inScope(requestedPath)
       ? `${scopePrefix}/${requestedPath}`
       : requestedPath;
-    if (!inScope(scopedCandidate) || !repoFileSet.has(scopedCandidate)) {
+    if (!inScope(scopedCandidate) || !repoFileSet.has(scopedCandidate) || !contextPathAllowed(scopedCandidate)) {
       missingSeedFiles.push(requestedPath);
       continue;
     }
@@ -1574,7 +1605,9 @@ async function editFile(args: Record<string, unknown>, deadlineAt: number) {
   const requestedPath = typeof args.path === 'string' ? args.path : '';
   if (!requestedPath) throw new Error('edit_file.path is required.');
   const validPath = await validatePath(requestedPath, remainingTimeout(deadlineAt, 10_000));
-  const releaseMutationLock = await acquireMutationResourceLocks([validPath], deadlineAt);
+  const releaseMutationLock = await acquireCoordinatedMutationOwnership(
+    [validPath], deadlineAt, { label: 'edit_file' },
+  );
   try {
 
   const edits = Array.isArray(args.edits) ? args.edits : [];
@@ -1765,7 +1798,9 @@ async function applyPatch(args: Record<string, unknown>, deadlineAt: number) {
 
   const { repoRoot } = await resolveRepository(root, deadlineAt);
   const files = await resolveExpectedPatchFiles(repoRoot, args.expectedFiles, deadlineAt);
-  const releaseMutationLocks = await acquireMutationResourceLocks(files.map((file) => file.absolute), deadlineAt);
+  const releaseMutationLocks = await acquireCoordinatedMutationOwnership(
+    files.map((file) => file.absolute), deadlineAt, { label: 'apply_patch' },
+  );
   try {
   const beforeHashes = await verifyExpectedHashes(files, args.expectedHashes, deadlineAt);
   const run = (gitArgs: string[], input?: string) =>
@@ -1855,110 +1890,7 @@ async function waitProcess(args: Record<string, unknown>) {
   const timeoutMs = args.timeout_ms === undefined ? PROCESS_WAIT_DEFAULT_MS : Number(args.timeout_ms);
   const stallTimeoutMs = args.stall_timeout_ms === undefined ? PROCESS_STALL_DEFAULT_MS : Number(args.stall_timeout_ms);
   const tailLines = args.tail_lines === undefined ? 100 : Number(args.tail_lines);
-  if (!Number.isInteger(pid)) throw new Error('wait_process.pid must be an integer.');
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > PROCESS_WAIT_MAX_MS) {
-    throw new Error(`wait_process.timeout_ms must be an integer from 0 to ${PROCESS_WAIT_MAX_MS}.`);
-  }
-  if (!Number.isInteger(stallTimeoutMs) || stallTimeoutMs < 0 || stallTimeoutMs > PROCESS_WAIT_MAX_MS) {
-    throw new Error(`wait_process.stall_timeout_ms must be an integer from 0 to ${PROCESS_WAIT_MAX_MS}.`);
-  }
-  if (!Number.isInteger(tailLines) || tailLines < 1 || tailLines > 1000) {
-    throw new Error('wait_process.tail_lines must be an integer from 1 to 1000.');
-  }
-
-  const started = Date.now();
-  while (true) {
-    let result = terminalManager.readOutputPaginated(pid, -tailLines, tailLines);
-    if (!result) throw new Error(`No terminal session found for PID ${pid}.`);
-    if (!result.isComplete && result.rootExited) {
-      await terminalManager.reconcileExitedSession(pid);
-      result = terminalManager.readOutputPaginated(pid, -tailLines, tailLines);
-      if (!result) throw new Error(`No terminal session found for PID ${pid} after process-tree reconciliation.`);
-    }
-    const lifecycle = {
-      rootExited: result.rootExited ?? false,
-      rootExitCode: result.rootExited ? result.rootExitCode ?? null : null,
-      treeState: result.treeState ?? null,
-      descendantPids: result.descendantPids ?? [],
-      treeProbeWarning: result.treeProbeWarning ?? null,
-      terminalError: result.terminalError ?? null,
-    };
-    if ((result.terminalError || (result.rootExited && result.treeState === 'probe_uncertain')) && !result.isComplete) {
-      const tail = result.lines.join('\n');
-      return {
-        pid,
-        completed: false,
-        timedOut: false,
-        stalled: false,
-        terminalFailed: true,
-        ownershipLost: result.rootExited && result.treeState === 'probe_uncertain',
-        processSucceeded: false,
-        exitCode: result.rootExited ? result.rootExitCode ?? null : null,
-        runtimeMs: Date.now() - started,
-        noOutputForMs: result.noOutputForMs ?? 0,
-        evictedLines: result.evictedLines ?? 0,
-        outputDecoding: result.outputDecoding ?? null,
-        tail,
-        ...lifecycle,
-        ...processProblemEvidence(tail),
-      };
-    }
-    if (result.isComplete) {
-      const tail = result.lines.join('\n');
-      return {
-        pid,
-        completed: true,
-        timedOut: false,
-        stalled: false,
-        processSucceeded: result.exitCode === 0 && !result.terminalError,
-        exitCode: result.exitCode ?? null,
-        runtimeMs: result.runtimeMs ?? Date.now() - started,
-        noOutputForMs: result.noOutputForMs ?? 0,
-        evictedLines: result.evictedLines ?? 0,
-        outputDecoding: result.outputDecoding ?? null,
-        tail,
-        ...lifecycle,
-        ...processProblemEvidence(tail),
-      };
-    }
-    if (stallTimeoutMs > 0 && (result.noOutputForMs ?? 0) >= stallTimeoutMs) {
-      const tail = result.lines.join('\n');
-      return {
-        pid,
-        completed: false,
-        timedOut: false,
-        stalled: true,
-        processSucceeded: false,
-        exitCode: null,
-        runtimeMs: Date.now() - started,
-        noOutputForMs: result.noOutputForMs ?? 0,
-        evictedLines: result.evictedLines ?? 0,
-        outputDecoding: result.outputDecoding ?? null,
-        tail,
-        ...lifecycle,
-        ...processProblemEvidence(tail),
-      };
-    }
-    if (Date.now() - started >= timeoutMs) {
-      const tail = result.lines.join('\n');
-      return {
-        pid,
-        completed: false,
-        timedOut: true,
-        stalled: false,
-        processSucceeded: false,
-        exitCode: null,
-        runtimeMs: Date.now() - started,
-        noOutputForMs: result.noOutputForMs ?? 0,
-        evictedLines: result.evictedLines ?? 0,
-        outputDecoding: result.outputDecoding ?? null,
-        tail,
-        ...lifecycle,
-        ...processProblemEvidence(tail),
-      };
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
+  return waitForTerminalProcess(terminalManager, { pid, timeoutMs, stallTimeoutMs, tailLines });
 }
 
 const tools: BuiltinAcceleratorTool[] = [
@@ -1966,6 +1898,7 @@ const tools: BuiltinAcceleratorTool[] = [
   BUILD_METADATA_ACCELERATOR_TOOL,
   CPP_BUILD_CONTEXT_ACCELERATOR_TOOL,
   CPP_BUILD_EXECUTE_ACCELERATOR_TOOL,
+  CPP_BUILD_RESULT_ACCELERATOR_TOOL,
   CPP_BUILD_PLAN_ACCELERATOR_TOOL,
   CPP_BUILD_IMPACT_ACCELERATOR_TOOL,
   CPP_TOOLCHAIN_PROFILE_ACCELERATOR_TOOL,
@@ -2217,11 +2150,14 @@ export async function callBuiltinAcceleratorTool(
   args: Record<string, unknown>,
   timeoutMs?: number,
 ) {
-  const isProcessExecutionTool = tool === 'wait_process' || tool === 'cpp_build_execute';
-  const requestedExecutionTimeout = typeof args.timeoutMs === 'number' ? args.timeoutMs : PROCESS_WAIT_DEFAULT_MS;
+  const isProcessExecutionTool = tool === 'wait_process' || tool === 'cpp_build_execute' || tool === 'cpp_build_result';
+  const requestedExecutionTimeout = tool === 'cpp_build_result'
+    ? (typeof args.waitMs === 'number' ? args.waitMs : 0)
+    : (typeof args.timeoutMs === 'number' ? args.timeoutMs : PROCESS_WAIT_DEFAULT_MS);
   const effectiveTimeoutMs = timeoutMs ?? (
-    tool === 'cpp_build_execute' ? Math.min(PROCESS_TRANSPORT_TIMEOUT_MAX_MS, requestedExecutionTimeout + 10_000)
-      : tool === 'wait_process' ? PROCESS_WAIT_DEFAULT_MS + 10_000
+    tool === 'cpp_build_execute' ? Math.min(PROCESS_TRANSPORT_TIMEOUT_MAX_MS, requestedExecutionTimeout + PROCESS_TRANSPORT_RESERVE_MS)
+      : tool === 'cpp_build_result' ? Math.min(PROCESS_TRANSPORT_TIMEOUT_MAX_MS, requestedExecutionTimeout + PROCESS_TRANSPORT_RESERVE_MS)
+        : tool === 'wait_process' ? PROCESS_WAIT_DEFAULT_MS + PROCESS_TRANSPORT_RESERVE_MS
         : tool === 'ast_rewrite' ? BUILTIN_OPERATION_TIMEOUT_MAX_MS
           : 30_000
   );
@@ -2241,18 +2177,9 @@ export async function callBuiltinAcceleratorTool(
     case 'cpp_build_context':
       return callCppBuildContextAcceleratorTool(args, remainingTimeout(deadlineAt, BUILTIN_OPERATION_TIMEOUT_MAX_MS));
     case 'cpp_build_execute':
-      return callCppBuildExecuteAcceleratorTool(
-        args,
-        remainingTimeout(deadlineAt, PROCESS_WAIT_MAX_MS),
-        {
-          startProcess: (processArgs) => startProcess(processArgs),
-          waitProcess: (waitArgs) => waitProcess(waitArgs),
-          readProcessOutputPage: (pid, offset, length) => terminalManager.readOutputPaginated(pid, offset, length),
-          terminateProcess: (pid, cause, detail) => terminalManager.forceTerminate(pid, cause, detail),
-          acquireMutationLocks: (resources, lockDeadlineAt, resourceMode = 'exclusive') =>
-            acquireMutationResourceLocks(resources, lockDeadlineAt, { topologyMode: 'none', resourceMode }),
-        },
-      );
+      return executeCppBuildEntry(args, deadlineAt);
+    case 'cpp_build_result':
+      return readCppBuildResult(args, deadlineAt);
     case 'cpp_build_plan':
       return callCppBuildPlanAcceleratorTool(args, remainingTimeout(deadlineAt, BUILTIN_OPERATION_TIMEOUT_MAX_MS));
     case 'cpp_build_impact':

@@ -78,6 +78,21 @@ function compactMetadataEvidence(metadata: BuildMetadataSnapshot) {
   const cmake = recordValue(metadata.cmake) ?? {};
   const codemodel = recordValue(cmake.codemodel) ?? {};
   const generator = recordValue(cmake.generator) ?? {};
+  const toolchains = recordValue(cmake.toolchains) ?? {};
+  const compactToolchains = Array.isArray(toolchains.toolchains)
+    ? toolchains.toolchains.map(recordValue).filter((item): item is JsonRecord => item !== undefined).slice(0, 16).map((item) => {
+        const compiler = recordValue(item.compiler) ?? {};
+        return {
+          language: typeof item.language === 'string' ? item.language : null,
+          compiler: {
+            id: typeof compiler.id === 'string' ? compiler.id : null,
+            version: typeof compiler.version === 'string' ? compiler.version : null,
+            target: typeof compiler.target === 'string' ? compiler.target : null,
+            path: typeof compiler.path === 'string' ? compiler.path : null,
+          },
+        };
+      })
+    : [];
   const cmakeCache = recordValue(metadata.cmakeCache) ?? {};
   return {
     repositoryRoot: metadata.repositoryRoot,
@@ -98,6 +113,8 @@ function compactMetadataEvidence(metadata: BuildMetadataSnapshot) {
       generator: typeof generator.name === 'string' ? generator.name : null,
       targetCount: Array.isArray(cmake.targets) ? cmake.targets.length : 0,
       targetsTruncated: cmake.targetsTruncated === true,
+      toolchainsFound: toolchains.found === true,
+      toolchains: compactToolchains,
     },
     cmakeCache: {
       found: cmakeCache.found === true,

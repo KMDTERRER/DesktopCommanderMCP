@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import { configManager } from '../config-manager.js';
 import { withTimeout } from '../utils/withTimeout.js';
+import { pathContainsManagedTrashSegment } from '../utils/trash-contract.js';
 
 export const PATH_VALIDATION_TIMEOUT_MS = 10_000;
 
@@ -126,9 +127,15 @@ export async function validatePathAuthority(
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new Error('Path validation timeout must be a positive finite number.');
   }
+  if (pathContainsManagedTrashSegment(requestedPath)) {
+    throw new Error('Managed trash storage is reserved for trash_action.');
+  }
   const effectiveTimeoutMs = Math.max(1, Math.min(PATH_VALIDATION_TIMEOUT_MS, Math.floor(timeoutMs)));
   const operation = async (): Promise<string> => {
     const canonicalPath = await resolveCanonicalPath(requestedPath);
+    if (pathContainsManagedTrashSegment(canonicalPath)) {
+      throw new Error('Managed trash storage is reserved for trash_action.');
+    }
     const allowedDirectories = await getAllowedDirs();
     if (!(await isPathAllowed(canonicalPath, allowedDirectories))) {
       throw new Error(
