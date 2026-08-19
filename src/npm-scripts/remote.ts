@@ -1,6 +1,7 @@
 import { MCPDevice } from '../remote-device/device.js';
 import os from 'os';
 import { installRemoteLifecycleDiagnostics, recordRemoteLifecycle } from '../remote-device/remote-lifecycle.js';
+import { resolveMinimalLiveTestMode } from '../remote-device/remote-live-test-guard.js';
 import {
     isRemoteBackgroundWorker,
     launchRemoteBackground,
@@ -17,8 +18,7 @@ export async function runRemote() {
 
     const lifecycleLog = installRemoteLifecycleDiagnostics();
     const persistSession = process.argv.includes('--persist-session');
-    const minimalLiveTest = process.argv.includes('--minimal-live-test')
-        || process.env.DC_REMOTE_MINIMAL_LIVE_TEST === 'true';
+    const minimalLiveTest = resolveMinimalLiveTestMode(process.argv, process.env);
     if (minimalLiveTest) {
         // Test mode isolates the live transport from analytics/background network
         // traffic so latency measurements cover only the remote call protocol.

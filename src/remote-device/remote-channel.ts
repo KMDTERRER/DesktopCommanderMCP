@@ -6,12 +6,20 @@ import { randomUUID } from 'crypto';
 import { SessionTokenOwner, type AuthSession } from './session-token-owner.js';
 import { CLAIM_METADATA_KEY, stripNullBytes } from './remote-result-contract.js';
 import type { RemoteInboundMode } from './remote-runtime-config.js';
+import { describeRemoteError } from './transient-remote-error.js';
+import { diagnoseRemoteEndpoint } from './remote-network-diagnostics.js';
 
 const DEVICE_SESSION_CAPABILITY_KEY = 'device_session_v1';
 
 interface DeviceSessionLease {
     generation: string;
     acquired_at: string;
+}
+
+export interface RemoteResultWakeAck {
+    attempted: boolean;
+    status: string;
+    durationMs: number;
 }
 
 interface DeviceData {
@@ -29,12 +37,13 @@ const CAPABLE_HEARTBEAT_INTERVAL = 5 * 60 * 1000;
 const LEGACY_HEARTBEAT_INTERVAL = 15 * 1000;
 // Cap on a recreate's rebuild step so a hung await can't disable the watchdog.
 // Must exceed createChannel()'s worst case (~31.5s of presence retries).
-const RECREATE_TIMEOUT_MS = 45000;
-// Max continuous time in 'joining' before forcing a recreate — a half-open
-// socket parks the channel there forever, and a genuine join settles in ~10s.
-const JOINING_WEDGE_TIMEOUT_MS = 30000;
-// createChannel() must settle even if realtime-js never emits a terminal status.
-const CHANNEL_SUBSCRIBE_SETTLE_TIMEOUT_MS = 44_000;
+const REALTIME_ACK_TIMEOUT_MS = 60_000;
+const RECREATE_TIMEOUT_MS = 210_000;
+// Max continuous time in 'joining' before forcing a recreate. Must stay above
+// the Realtime join ACK timeout so a slow-but-live join is never torn down early.
+const JOINING_WEDGE_TIMEOUT_MS = 75_000;
+// Includes Presence retries after SUBSCRIBED; 3 x 60s plus bounded retry gaps.
+const CHANNEL_SUBSCRIBE_SETTLE_TIMEOUT_MS = 195_000;
 // Failed recreates before withdrawing transport_broadcast_v1 — keeping it while
 // unable to join makes the device undispatchable. Not lower than 3: ordinary
 // half-open recovery legitimately costs 2.
@@ -53,6 +62,19 @@ const REMOTE_CALL_CLAIM_ATTEMPTS = 3;
 // chains such as statusWriteChain; abortSignal cancels the request itself.
 const REMOTE_CONTROL_QUERY_TIMEOUT_MS = 15000;
 const REMOTE_HEARTBEAT_WRITE_TIMEOUT_MS = 5000;
+// When private Broadcast is unavailable, Postgres Changes can lag by seconds.
+// Poll only while degraded: fast during an active recovery window, then idle-slow.
+const DEGRADED_CALL_POLL_FAST_MS = 250;
+const DEGRADED_CALL_POLL_IDLE_MS = 1000;
+const DEGRADED_CALL_POLL_BURST_MS = 30_000;
+const DEGRADED_CALL_POLL_TIMEOUT_MS = 5000;
+const DEGRADED_CALL_POLL_BATCH = 16;
+// A broadcast-selected row arriving this late through legacy delivery proves the
+// primary transport missed its low-latency contract, even if SDK state says joined.
+const BROADCAST_DELIVERY_MISS_MS = 750;
+const BROADCAST_MISS_RECOVERY_COOLDOWN_MS = 30_000;
+const RECENT_BROADCAST_CALL_TTL_MS = 60_000;
+const RECENT_BROADCAST_CALLS_MAX = 256;
 // realtime-js parks in 'disconnecting' for ~100ms after a disconnect and
 // connect() early-returns for that whole window (see waitForSocketSettled).
 // Bound generously — this only ever delays a recreate, which RECREATE_TIMEOUT_MS
@@ -109,6 +131,15 @@ export class RemoteChannel {
     private trackingPresenceGeneration: number | null = null;
     private minimalInboundMode: RemoteInboundMode | null = null;
     private minimalInboundSwitch: Promise<void> = Promise.resolve();
+    private degradedCallPollTimer: NodeJS.Timeout | null = null;
+    private degradedCallPollInFlight = false;
+    private degradedCallPollBurstUntil = 0;
+    private lastBroadcastMissRecoveryAt = 0;
+    /** Broadcast doorbells already observed; late postgres_changes copies are expected duplicates. */
+    private recentBroadcastCalls = new Map<string, number>();
+    /** A delivery miss suppresses broadcast capability for this exact channel generation.
+     * Presence can remain valid; only a new private-channel generation may clear suppression. */
+    private broadcastSuppressedGeneration: number | null = null;
 
     // Track last device status to prevent duplicate log messages
     private lastDeviceStatus: 'online' | 'offline' = 'offline';
@@ -135,7 +166,10 @@ export class RemoteChannel {
                 persistSession: false,
                 detectSessionInUrl: false,
             },
-        } : undefined);
+            realtime: { timeout: REALTIME_ACK_TIMEOUT_MS },
+        } : {
+            realtime: { timeout: REALTIME_ACK_TIMEOUT_MS },
+        });
     }
 
     private async syncRealtimeAuth(token: string | null, reason: string): Promise<void> {
@@ -175,7 +209,12 @@ export class RemoteChannel {
         );
 
         if (error) {
-            console.error('[DEBUG] Failed to set session:', error.message);
+            console.error('[DEBUG] Failed to set session:', describeRemoteError(error));
+            const supabaseOrigin = (() => {
+                try { return new URL((this.client as any).supabaseUrl).origin; } catch { return 'unknown'; }
+            })();
+            console.error('[DEBUG] Supabase endpoint:', supabaseOrigin);
+            await diagnoseRemoteEndpoint(supabaseOrigin);
             await captureRemote('remote_channel_set_session_error', { error });
             return { error };
         }
@@ -187,7 +226,7 @@ export class RemoteChannel {
             'auth.getUser'
         );
         if (userError) {
-            console.error('[DEBUG] Failed to get user:', userError.message);
+            console.error('[DEBUG] Failed to get user:', describeRemoteError(userError));
             await captureRemote('remote_channel_get_user_error', { error: userError });
             throw userError;
         }
@@ -474,7 +513,10 @@ export class RemoteChannel {
                 this.presenceTracked = true;
                 console.log(`Presence tracked (device ${this.deviceId} visible as online)`);
                 captureRemote('remote_channel_presence_tracked', { recoveredAfterAttempts: recovered }).catch(() => { });
-                await this.setTransportCapable(true);
+                const broadcastSuppressed = this.broadcastSuppressedGeneration === expectedGeneration;
+                if (!broadcastSuppressed) await this.setTransportCapable(true);
+                if (!broadcastSuppressed && this.transportCapableWritten === true) this.stopDegradedCallPolling();
+                else this.startDegradedCallPolling();
                 return;
             }
 
@@ -484,6 +526,7 @@ export class RemoteChannel {
 
         if (expectedGeneration !== this.channelGeneration) return;
         this.presenceTracked = false;
+        this.startDegradedCallPolling();
         console.error('Presence track failed after retries - reverting to the legacy transport tier');
         captureRemote('remote_channel_presence_track_error', { attempts }).catch(() => { });
         await this.setTransportCapable(false);
@@ -559,6 +602,175 @@ export class RemoteChannel {
         });
     }
 
+    private privateTransportReady(): boolean {
+        return this.channel?.state === 'joined'
+            && this.presenceTracked
+            && this.transportCapableWritten === true;
+    }
+
+    private hardPrivateTransportFailure(error: unknown): boolean {
+        const record = error && typeof error === 'object' ? error as Record<string, unknown> : {};
+        const code = typeof record.code === 'string' ? record.code : '';
+        const message = typeof record.message === 'string' ? record.message : String(error ?? '');
+        return code === 'IncreaseConnectionPool' || /\bIncreaseConnectionPool\b/.test(message);
+    }
+
+    private quiescePrivateChannel(): void {
+        const channel = this.channel;
+        if (!channel || !this.client) return;
+        this.channelGeneration += 1;
+        this.channel = null;
+        this.presenceTracked = false;
+        // Local teardown only: stop Phoenix's own rejoin timer without creating
+        // another server join while the hosted authorization pool is unhealthy.
+        try { (channel as any).teardown?.(); } catch { /* best effort */ }
+        try {
+            const phoenixChannel = (channel as any).channelAdapter?.getChannel?.();
+            phoenixChannel?.socket?.remove?.(phoenixChannel);
+        } catch { /* best effort */ }
+        try { (this.client as any).realtime?._remove?.(channel); } catch { /* best effort */ }
+    }
+
+    private handlePrivateTransportFailure(error?: unknown): void {
+        this.presenceTracked = false;
+        this.startDegradedCallPolling();
+        if (!this.hardPrivateTransportFailure(error)) return;
+        // Hard hosted authorization-pool failure: stop Phoenix's private-channel
+        // auto-rejoin, but leave the legacy channel and shared socket untouched.
+        this.quiescePrivateChannel();
+        if (this.transportCapableWritten !== true) return;
+        // This is a Realtime authorization-capacity failure, not an ordinary
+        // half-open reconnect blip. Stop advertising a transport that cannot join.
+        void this.setTransportCapable(false).catch((withdrawError: any) => {
+            console.debug('[DEBUG] Immediate broadcast capability withdrawal failed:', withdrawError?.message);
+        });
+    }
+
+    private rememberBroadcastCall(callId: string, receivedAtMs: number): void {
+        this.recentBroadcastCalls.delete(callId);
+        this.recentBroadcastCalls.set(callId, receivedAtMs);
+        const cutoff = receivedAtMs - RECENT_BROADCAST_CALL_TTL_MS;
+        for (const [id, seenAt] of this.recentBroadcastCalls) {
+            if (seenAt >= cutoff && this.recentBroadcastCalls.size <= RECENT_BROADCAST_CALLS_MAX) break;
+            this.recentBroadcastCalls.delete(id);
+        }
+    }
+
+    private hasRecentBroadcastCall(callId: string, nowMs: number): boolean {
+        const seenAt = this.recentBroadcastCalls.get(callId);
+        if (seenAt === undefined) return false;
+        if (nowMs - seenAt <= RECENT_BROADCAST_CALL_TTL_MS) return true;
+        this.recentBroadcastCalls.delete(callId);
+        return false;
+    }
+
+    private handleBroadcastDeliveryMiss(row: any, receivedAtMs: number): void {
+        if (row?.metadata?.transport !== 'broadcast_v1') return;
+        if (typeof row?.id === 'string' && this.hasRecentBroadcastCall(row.id, receivedAtMs)) return;
+        const createdAtMs = Date.parse(String(row?.created_at ?? ''));
+        if (!Number.isFinite(createdAtMs)) return;
+        const lagMs = Math.max(0, receivedAtMs - createdAtMs);
+        if (lagMs < BROADCAST_DELIVERY_MISS_MS) return;
+
+        // The server chose Broadcast, but legacy Postgres Changes won only after
+        // a large delay. This invalidates Broadcast delivery for this channel
+        // generation, not its already-established Presence registration.
+        this.broadcastSuppressedGeneration = this.channelGeneration;
+        this.startDegradedCallPolling();
+        if (this.transportCapableWritten === true) {
+            void this.setTransportCapable(false).catch((error: any) => {
+                console.debug('[DEBUG] Broadcast-miss capability withdrawal failed:', error?.message);
+            });
+        }
+
+        const now = Date.now();
+        if (now - this.lastBroadcastMissRecoveryAt < BROADCAST_MISS_RECOVERY_COOLDOWN_MS) return;
+        this.lastBroadcastMissRecoveryAt = now;
+        captureRemote('remote_channel_broadcast_delivery_miss', {
+            call_id: row?.id, lagMs, state: this.channel?.state ?? null,
+        }).catch(() => {});
+        // Degraded mode is authoritative until the next manual process restart.
+        // Do not create another private join from an observed delivery miss.
+    }
+
+    private degradedCallPollDelayMs(): number {
+        return Date.now() < this.degradedCallPollBurstUntil
+            ? DEGRADED_CALL_POLL_FAST_MS
+            : DEGRADED_CALL_POLL_IDLE_MS;
+    }
+
+    private scheduleDegradedCallPoll(delayMs: number): void {
+        if (this.shuttingDown || this.privateTransportReady() || this.degradedCallPollTimer || this.degradedCallPollInFlight) return;
+        this.degradedCallPollTimer = setTimeout(() => {
+            this.degradedCallPollTimer = null;
+            void this.runDegradedCallPollLoop();
+        }, delayMs);
+        this.degradedCallPollTimer.unref?.();
+    }
+
+    private startDegradedCallPolling(): void {
+        if (this.shuttingDown || this.privateTransportReady() || this.degradedCallPollTimer || this.degradedCallPollInFlight) return;
+        this.degradedCallPollBurstUntil = Date.now() + DEGRADED_CALL_POLL_BURST_MS;
+        this.scheduleDegradedCallPoll(0);
+    }
+
+    private stopDegradedCallPolling(): void {
+        if (this.degradedCallPollTimer) clearTimeout(this.degradedCallPollTimer);
+        this.degradedCallPollTimer = null;
+        this.degradedCallPollBurstUntil = 0;
+    }
+
+    private async pollPendingCallsOnce(): Promise<number> {
+        if (!this.client || !this.deviceId || this.shuttingDown) return 0;
+        const startedAt = Date.now();
+        const { data, error } = await this.runDbQuery<any>(
+            'Poll degraded pending calls', DEGRADED_CALL_POLL_TIMEOUT_MS,
+            (signal) => this.client!
+                .from('mcp_remote_calls')
+                .select('*')
+                .eq('device_id', this.deviceId!)
+                .eq('status', 'pending')
+                .order('created_at', { ascending: true })
+                .limit(DEGRADED_CALL_POLL_BATCH)
+                .abortSignal(signal),
+        );
+        if (error) throw error;
+        const rows = Array.isArray(data) ? data : [];
+        const receivedAtMs = Date.now();
+        const rowFetchMs = Math.max(0, receivedAtMs - startedAt);
+        for (const row of rows) {
+            if (!row || row.device_id !== this.deviceId || row.status !== 'pending') continue;
+            this.dispatchToolCall({
+                new: row,
+                _remoteTiming: { inbound: 'degraded_poll', receivedAtMs, rowFetchMs },
+            });
+        }
+        return rows.length;
+    }
+
+    private async runDegradedCallPollLoop(): Promise<void> {
+        if (this.degradedCallPollInFlight || this.shuttingDown || this.privateTransportReady()) return;
+        this.degradedCallPollInFlight = true;
+        let nextDelay = this.degradedCallPollDelayMs();
+        try {
+            const count = await this.pollPendingCallsOnce();
+            if (count > 0) {
+                this.degradedCallPollBurstUntil = Date.now() + DEGRADED_CALL_POLL_BURST_MS;
+                nextDelay = DEGRADED_CALL_POLL_FAST_MS;
+            }
+        } catch (error: any) {
+            nextDelay = DEGRADED_CALL_POLL_IDLE_MS;
+            if (process.env.DEBUG_MODE === 'true') {
+                console.debug('[DEBUG] Degraded pending-call poll failed:', error?.message);
+            }
+        } finally {
+            this.degradedCallPollInFlight = false;
+            if (!this.shuttingDown && !this.privateTransportReady()) {
+                this.scheduleDegradedCallPoll(nextDelay);
+            }
+        }
+    }
+
     /** Strict minimal transport used only for live A/B latency testing. */
     private createMinimalLiveChannel(): Promise<void> {
         return new Promise((resolve, reject) => {
@@ -622,13 +834,41 @@ export class RemoteChannel {
         console.log('⚙ INBOUND switched to postgres_changes');
     }
 
+    private realtimeChannelRegistered(channel: RealtimeChannel): boolean {
+        if (!this.client) return false;
+        try { return this.client.getChannels().includes(channel); } catch { return false; }
+    }
+
+    private async removeRealtimeChannel(channel: RealtimeChannel, label: string): Promise<void> {
+        if (!this.client) return;
+        let status: unknown = 'not_attempted';
+        try { status = await this.client.removeChannel(channel); }
+        catch (error: any) { status = error?.message || 'threw'; }
+        if (!this.realtimeChannelRegistered(channel)) return;
+
+        // realtime-js only tears down after an acknowledged leave. If leave returns
+        // error, the wrapper and Phoenix channel can remain in their registries;
+        // channel(sameTopic) then reuses that errored object and subscribe() is a no-op.
+        console.debug(`[DEBUG] Evicting stale Realtime channel ${label} after remove status: ${String(status)}`);
+        try { (channel as any).teardown?.(); } catch { /* best effort */ }
+        try {
+            const phoenixChannel = (channel as any).channelAdapter?.getChannel?.();
+            phoenixChannel?.socket?.remove?.(phoenixChannel);
+        } catch { /* best effort */ }
+        try { (this.client as any).realtime?._remove?.(channel); } catch { /* best effort */ }
+
+        if (this.realtimeChannelRegistered(channel)) {
+            throw new Error(`Realtime channel registry retained stale ${label} after remove status ${String(status)}`);
+        }
+    }
+
     private async removePrivateChannelForMinimalTest(): Promise<void> {
         const channel = this.channel;
         if (!channel || !this.client) return;
         this.channelGeneration += 1;
         if (this.channel === channel) this.channel = null;
         this.presenceTracked = false;
-        try { await this.client.removeChannel(channel); } catch { /* best effort */ }
+        await this.removeRealtimeChannel(channel, 'private-minimal');
     }
 
     /**
@@ -636,7 +876,7 @@ export class RemoteChannel {
      * failures are logged, never thrown. Removed at the flip (009).
      */
     private createLegacyChannel(): void {
-        if (!this.client || !this.user?.id) return;
+        if (!this.client || !this.user?.id || !this.deviceId) return;
         try {
             this.legacyChannel = this.client
                 .channel('device_tool_call_queue')
@@ -646,11 +886,16 @@ export class RemoteChannel {
                         event: 'INSERT',
                         schema: 'public',
                         table: 'mcp_remote_calls',
-                        filter: `user_id=eq.${this.user.id}`
+                        filter: `device_id=eq.${this.deviceId}`
                     },
                     (payload: any) => {
+                        const receivedAtMs = Date.now();
                         console.debug('[DEBUG] Realtime event received, payload:', payload?.new?.id);
-                        this.dispatchToolCall(payload);
+                        this.handleBroadcastDeliveryMiss(payload?.new, receivedAtMs);
+                        this.dispatchToolCall({
+                            ...payload,
+                            _remoteTiming: { inbound: 'postgres_changes', receivedAtMs, rowFetchMs: 0 },
+                        });
                     }
                 )
                 .subscribe((status: string) => {
@@ -665,9 +910,7 @@ export class RemoteChannel {
     private async removeLegacyChannel(): Promise<void> {
         const channel = this.legacyChannel;
         if (!channel || !this.client) return;
-        try {
-            await this.client.removeChannel(channel);
-        } catch { /* best effort */ }
+        await this.removeRealtimeChannel(channel, 'legacy');
         // A stale teardown must never clear a newer replacement channel.
         if (this.legacyChannel === channel) this.legacyChannel = null;
     }
@@ -697,6 +940,7 @@ export class RemoteChannel {
             const channelName = `user:${this.user.id}`;
             console.debug(`[DEBUG] Creating channel: ${channelName}`);
             const generation = ++this.channelGeneration;
+            this.broadcastSuppressedGeneration = null;
             const channel = this.client.channel(channelName, {
                 // ack: true — without it send() resolves 'ok' once the frame hits
                 // the socket, making notifyResult's status check dead code.
@@ -723,8 +967,12 @@ export class RemoteChannel {
             settleTimer = setTimeout(() => {
                 // Invalidate late callbacks, but keep the channel object reachable so
                 // the next recreate can remove it from the Realtime registry.
-                if (isCurrentChannel()) this.channelGeneration += 1;
-                finish(new Error(`Tool call channel did not settle within ${CHANNEL_SUBSCRIBE_SETTLE_TIMEOUT_MS}ms`));
+                const timeoutError = new Error(`Tool call channel did not settle within ${CHANNEL_SUBSCRIBE_SETTLE_TIMEOUT_MS}ms`);
+                if (isCurrentChannel()) {
+                    this.channelGeneration += 1;
+                    this.handlePrivateTransportFailure(timeoutError);
+                }
+                finish(timeoutError);
             }, CHANNEL_SUBSCRIBE_SETTLE_TIMEOUT_MS);
             settleTimer.unref?.();
 
@@ -753,23 +1001,27 @@ export class RemoteChannel {
                     } else if (status === 'CHANNEL_ERROR') {
                         // CHANNEL_ERROR is the only status carrying a real error message.
                         console.error(`❌ Channel error: ${err?.message || 'unknown'} — ${this.connState()}`);
-                        this.presenceTracked = false;
+                        this.handlePrivateTransportFailure(err);
                         this.syncReachabilityStatus();
                         // Fires on ordinary network faults too — filter on the
                         // error text to isolate an 008 misconfiguration.
                         captureRemote('remote_channel_subscription_error', { error: err?.message || 'Channel error' }).catch(() => { });
                         finish(err || new Error('Failed to initialize tool call channel subscription'));
                     } else if (status === 'TIMED_OUT') {
+                        const timeoutError = new Error('Tool call channel subscription timed out');
                         console.error(`⏱️ Channel subscription timed out, Reconnecting... — ${this.connState()}`);
+                        this.handlePrivateTransportFailure(timeoutError);
                         this.syncReachabilityStatus();
                         captureRemote('remote_channel_subscription_timeout', { attempt: this.reconnectAttempt }).catch(() => { });
-                        finish(new Error('Tool call channel subscription timed out'));
+                        finish(timeoutError);
                     } else if (status === 'CLOSED') {
                         // Settle the promise so an in-flight recreateChannel() can't await
                         // forever (which would wedge the re-entrancy guard / watchdog).
+                        const closedError = new Error('Tool call channel closed during subscribe');
                         console.warn(`⚠️ Channel closed — ${this.connState()}`);
+                        this.handlePrivateTransportFailure(closedError);
                         this.syncReachabilityStatus();
-                        finish(new Error('Tool call channel closed during subscribe'));
+                        finish(closedError);
                     }
                 });
         });
@@ -779,30 +1031,35 @@ export class RemoteChannel {
      * Wake the server after a terminal row is committed. Reuse the already joined
      * Realtime channel: this is a signal only, never an owner of result durability.
      */
-    signalResultAvailable(callId: string): void {
+    async signalResultAvailable(callId: string): Promise<RemoteResultWakeAck> {
         const channel = this.channel;
         if (!channel || channel.state !== 'joined') {
             if (process.env.DEBUG_MODE === 'true') {
                 console.debug('[DEBUG] Result wake skipped — realtime channel not joined:', callId);
             }
-            return;
+            return { attempted: false, status: 'skipped', durationMs: 0 };
         }
         const wakeStartedAt = Date.now();
-        void channel.send(
-            { type: 'broadcast', event: 'result', payload: { call_id: callId } },
-            { timeout: 1_000 },
-        ).then((status: string) => {
-            console.log(`↗ RESULT WAKE ${callId.slice(0, 8)} ${status} ${Date.now() - wakeStartedAt}ms`);
+        try {
+            const status = await channel.send(
+                { type: 'broadcast', event: 'result', payload: { call_id: callId } },
+                { timeout: 1_000 },
+            );
+            const durationMs = Date.now() - wakeStartedAt;
+            console.log(`↗ RESULT WAKE ${callId.slice(0, 8)} ${status} ${durationMs}ms`);
             if (status !== 'ok' && process.env.DEBUG_MODE === 'true') {
                 console.debug(`[DEBUG] Result wake not acknowledged (${status}):`, callId);
             }
-        }).catch((error: any) => {
-            console.log(`↗ RESULT WAKE ${callId.slice(0, 8)} error ${Date.now() - wakeStartedAt}ms`);
+            return { attempted: true, status, durationMs };
+        } catch (error: any) {
+            const durationMs = Date.now() - wakeStartedAt;
+            console.log(`↗ RESULT WAKE ${callId.slice(0, 8)} error ${durationMs}ms`);
             console.debug('[DEBUG] Result wake failed; recovery remains authoritative:', error?.message);
             void captureRemote('remote_channel_result_wake_failed', {
                 call_id: callId, error: error?.message || String(error),
             });
-        });
+            return { attempted: true, status: 'error', durationMs };
+        }
     }
 
     /** Hand a call to device.ts, observing the rejection — the handler is async
@@ -826,6 +1083,7 @@ export class RemoteChannel {
      * payload, so device.ts stays transport-agnostic.
      */
     private async onDoorbell(payload: any): Promise<void> {
+        const receivedAtMs = Date.now();
         const callId = payload?.call_id;
         if (!callId) return;
         if (payload?.device_id && payload.device_id !== this.deviceId) {
@@ -836,6 +1094,9 @@ export class RemoteChannel {
         // Not a telemetry event on purpose: ~126k/day in prod. Transport usage
         // is already segmentable server-side via metadata.transport.
         console.debug('[DEBUG] Doorbell received for call:', callId);
+        // Record the signal before the REST row fetch. A later postgres_changes copy
+        // is normal transition duplication and must never trigger transport repair.
+        this.rememberBroadcastCall(callId, receivedAtMs);
 
         if (!this.client) return;
 
@@ -887,8 +1148,16 @@ export class RemoteChannel {
             return;
         }
 
-        // Same payload shape as postgres_changes ({ new: row }).
-        this.dispatchToolCall({ new: row });
+        // Same payload shape as postgres_changes ({ new: row }), plus local-only
+        // transport timing that is never persisted into remote row metadata.
+        this.dispatchToolCall({
+            new: row,
+            _remoteTiming: {
+                inbound: 'broadcast_doorbell',
+                receivedAtMs,
+                rowFetchMs: Math.max(0, Date.now() - receivedAtMs),
+            },
+        });
     }
 
     /**
@@ -924,6 +1193,11 @@ export class RemoteChannel {
         // 'joined' = healthy. Clear the joining-overstay timer.
         if (state === 'joined') {
             this.joiningSince = null;
+            if (this.privateTransportReady()) {
+                this.stopDegradedCallPolling();
+                return;
+            }
+            this.startDegradedCallPolling();
             // Self-heal a failed presence publish: the channel is up, so nothing
             // else will ever retry (SUBSCRIBED won't fire again), and without
             // presence the server reports this healthy device as offline.
@@ -934,9 +1208,14 @@ export class RemoteChannel {
             ) {
                 console.debug('[DEBUG] Channel joined but presence not tracked - retrying track()');
                 this.trackPresenceWithRetry(0, 1, this.channelGeneration).catch(() => { /* logged inside */ });
-            } else if (this.presenceTracked && this.transportCapableWritten !== true) {
-                // Presence succeeded but its capability PATCH may have failed.
-                // Retry the small control-plane write without re-tracking presence.
+            } else if (
+                this.presenceTracked &&
+                this.transportCapableWritten !== true &&
+                this.broadcastSuppressedGeneration !== this.channelGeneration
+            ) {
+                // Presence succeeded but its capability PATCH may have failed. Retry
+                // only when this generation was not intentionally degraded after a
+                // delivery miss; Presence alone is not evidence Broadcast recovered.
                 this.setTransportCapable(true).catch(() => { /* logged inside */ });
             }
             return;
@@ -948,6 +1227,7 @@ export class RemoteChannel {
         // JOINING_WEDGE_TIMEOUT_MS force a recreate, the only path that
         // disconnect()s the dead socket.
         if (state === 'joining') {
+            this.startDegradedCallPolling();
             const now = Date.now();
             if (this.joiningSince === null) this.joiningSince = now;
             const stuckMs = now - this.joiningSince;
@@ -959,10 +1239,19 @@ export class RemoteChannel {
             return;
         }
 
-        // Unhealthy: closed, errored, leaving — recreate
+        this.startDegradedCallPolling();
         this.joiningSince = null;
-        captureRemote('remote_channel_state_health', { state, attempt: this.reconnectAttempt });
-        console.debug(`[DEBUG] ⚠️ Channel in unhealthy state '${state}' - recreating... — ${this.connState()}`);
+
+        // realtime-js already owns errored-channel recovery via its rejoin timer.
+        // Do not layer our destructive recovery over the same transient signal.
+        if (state === 'errored' || state === 'leaving') {
+            captureRemote('remote_channel_state_health', { state, attempt: this.reconnectAttempt, owner: 'realtime-js' });
+            return;
+        }
+
+        // CLOSED has no automatic channel-rejoin owner; replace only that case.
+        captureRemote('remote_channel_state_health', { state, attempt: this.reconnectAttempt, owner: 'device' });
+        console.debug(`[DEBUG] ⚠️ Channel state '${state}' requires replacement — ${this.connState()}`);
         this.recreateChannel();
     }
 
@@ -1012,7 +1301,7 @@ export class RemoteChannel {
     /**
      * Recreate the channel by destroying old one and creating fresh instance.
      */
-    private async recreateChannel(): Promise<void> {
+    private async recreateChannel(force = false): Promise<void> {
         if (!this.client || !this.user?.id || !this.onToolCall) {
             console.warn('Cannot recreate channel - missing parameters');
             console.debug('[DEBUG] recreateChannel() aborted - missing prerequisites');
@@ -1030,6 +1319,7 @@ export class RemoteChannel {
         const isCurrentOperation = () =>
             this.recreateOperationGeneration === operationGeneration && !this.shuttingDown;
         this.reconnectAttempt++;
+        this.startDegradedCallPolling();
 
         // Create fresh channel
         console.log(`🔄 Recreating channel... (attempt ${this.reconnectAttempt}) — ${this.connState()}`);
@@ -1046,7 +1336,7 @@ export class RemoteChannel {
             // it a window to win: the old channel can come back 'joined' while we
             // slept. Destroying a healthy channel would cause a pointless outage
             // cycle — bail out instead (observed live on staging, 2026-07-23).
-            if (this.channel?.state === 'joined') {
+            if (!force && this.channel?.state === 'joined') {
                 console.log(`✅ Channel self-healed during backoff — skipping recreate — ${this.connState()}`);
                 return; // finally-block below clears the re-entrancy guard
             }
@@ -1055,51 +1345,33 @@ export class RemoteChannel {
             // ever emits CLOSED) must not pin isRecreatingChannel=true and silently disable
             // the 10s watchdog. On timeout we reject -> catch -> finally clears the guard.
             await this.withTimeout(async () => {
-                // Await it so the channel registry empties before we rebuild —
-                // otherwise realtime-js never tears the socket down and a
-                // half-open one gets reused.
+                // This recovery owns only the private channel. Never tear down the
+                // legacy safety net or the shared Realtime socket here.
                 if (!isCurrentOperation()) return;
                 const channelToRemove = this.channel;
                 if (channelToRemove) {
-                    console.debug('[DEBUG] Destroying old channel');
-                    await this.client!.removeChannel(channelToRemove);
-                    if (!isCurrentOperation()) return;
+                    this.channelGeneration += 1;
                     if (this.channel === channelToRemove) this.channel = null;
+                    this.presenceTracked = false;
+                    await this.removeRealtimeChannel(channelToRemove, 'private');
+                    if (!isCurrentOperation()) return;
                 }
-                // Rebuild the legacy channel too: it shares the socket, so a
-                // socket-level wedge takes it down with the private channel.
-                if (!isCurrentOperation()) return;
-                await this.removeLegacyChannel();
-                if (!isCurrentOperation()) return;
 
-                // FIX (core): force a brand-new WebSocket. After idle / wifi-loss the socket can
-                // be HALF-OPEN (readyState OPEN but dead); reusing it made every join TIME_OUT
-                // forever. disconnect() drops it so the next subscribe() dials a fresh one.
-                // Current realtime-js disconnect() is synchronous/void: invoke it
-                // directly so there is no artificial Promise owner that can outlive
-                // this recreate generation.
-                try { (this.client as any).realtime?.disconnect?.(); } catch { /* best effort */ }
+                // RealtimeClient.channel(topic) reuses an existing wrapper. If a
+                // previous leave failed, evict every stale same-topic wrapper from
+                // both RealtimeClient and Phoenix registries before creating one
+                // replacement.
+                const privateTopic = `realtime:user:${this.user!.id}`;
+                let staleChannels: RealtimeChannel[] = [];
+                try {
+                    staleChannels = this.client!.getChannels().filter((candidate) => candidate.topic === privateTopic);
+                } catch { /* older client shape: nothing else to clean */ }
+                for (const stale of staleChannels) {
+                    await this.removeRealtimeChannel(stale, 'private-stale');
+                    if (!isCurrentOperation()) return;
+                }
 
-                // ...but disconnect() is not synchronous from connect()'s point
-                // of view: it parks _connectionState in 'disconnecting' and
-                // _teardownConnection() nulls the conn.onclose that would clear
-                // it, so only an internal ~100ms fallback timer does. connect()
-                // early-returns for that whole window, so rebuilding here makes
-                // subscribe()'s socket.connect() a silent no-op and BOTH
-                // channels sit in 'joining' until the 10s join timeout — the
-                // wasted-first-recreate that left the device dark on the legacy
-                // channel too. Wait for the state to settle before rebuilding.
-                await this.waitForSocketSettled();
-                if (!isCurrentOperation()) return;
-
-                console.debug('[DEBUG] Calling createChannel() for recreation');
-                // Rebuild the legacy safety net FIRST and unconditionally: if
-                // createChannel() throws or exceeds RECREATE_TIMEOUT_MS, anything
-                // after it is skipped, which used to leave the fallback dead for
-                // the entire duration of a private-channel outage — every
-                // subsequent health tick repeating the same teardown.
-                if (!isCurrentOperation()) return;
-                this.createLegacyChannel();
+                console.debug('[DEBUG] Calling createChannel() for private replacement');
                 await this.createChannel();
                 if (!isCurrentOperation()) return;
             }, RECREATE_TIMEOUT_MS, 'recreateChannel');
@@ -1547,6 +1819,7 @@ export class RemoteChannel {
         // SIGINT during recreateChannel()'s backoff, where the later join's
         // SUBSCRIBED would queue 'online' after the durable write.
         this.shuttingDown = true;
+        this.stopDegradedCallPolling();
         // Budget against device.ts's 5s force-exit, worst case:
         //   250 drain + 3x300 leave + 500 session + 3000 spawnSync = 4650ms.
         // In practice only the untrack bound binds — removeChannel/unsubscribe

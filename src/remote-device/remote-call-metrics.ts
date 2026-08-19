@@ -2,7 +2,16 @@ import fs from 'fs/promises';
 import path from 'path';
 import { isMcpCompatUri } from '../utils/mcp-uri.js';
 
-export type RemoteMetricStage = 'recv' | 'tool_done' | 'terminal_done';
+const MAX_METRICS_LOG_BYTES = 16 * 1024 * 1024;
+
+export type RemoteMetricStage =
+    | 'recv'
+    | 'claim_done'
+    | 'tool_done'
+    | 'local_persist_done'
+    | 'remote_commit_done'
+    | 'wake_done'
+    | 'terminal_done';
 
 export interface RemoteMetricEvent {
     stage: RemoteMetricStage;
@@ -15,10 +24,23 @@ export interface RemoteMetricEvent {
     terminalWrite: string;
     receivedAtMs: number;
     createdAt?: unknown;
+    handlerReceivedAtMs?: number;
+    rowFetchMs?: number;
+    dispatchMs?: number;
     laneWaitMs?: number;
+    claimMs?: number;
+    preToolMs?: number;
     toolMs?: number;
+    localPersistMs?: number;
+    deliverySlotWaitMs?: number;
+    remoteCommitMs?: number;
+    wakeMs?: number;
+    wakeStatus?: string;
+    postToolToRemoteCommitMs?: number;
+    postToolToWakeMs?: number;
     terminalMs?: number;
     totalMs?: number;
+    phaseOutcome?: string;
 }
 
 function utf8Bytes(value: unknown): number | null {
@@ -72,6 +94,7 @@ export class RemoteCallMetrics {
     constructor(public readonly filePath: string) {}
 
     record(event: RemoteMetricEvent): void {
+        const eventAt = new Date().toISOString();
         // Never put diagnostics on the result path. Heavy sizing/stat work and
         // append I/O are deferred and serialized behind the completed call stage.
         this.writeChain = this.writeChain
@@ -82,7 +105,8 @@ export class RemoteCallMetrics {
                 const effectivePath = nested?.path ?? args.path ?? args.file_path ?? null;
                 const createdMs = Date.parse(String(event.createdAt ?? ''));
                 const row = {
-                    at: new Date().toISOString(),
+                    at: eventAt,
+                    writtenAt: new Date().toISOString(),
                     stage: event.stage,
                     callId: event.callId,
                     tool: event.tool,
@@ -91,10 +115,24 @@ export class RemoteCallMetrics {
                     inbound: event.inbound,
                     terminalWrite: event.terminalWrite,
                     inboundLagMs: Number.isFinite(createdMs) ? Math.max(0, event.receivedAtMs - createdMs) : null,
+                    handlerDispatchMs: event.handlerReceivedAtMs === undefined
+                        ? null : Math.max(0, event.handlerReceivedAtMs - event.receivedAtMs),
+                    rowFetchMs: event.rowFetchMs ?? null,
+                    dispatchMs: event.dispatchMs ?? null,
                     laneWaitMs: event.laneWaitMs ?? null,
+                    claimMs: event.claimMs ?? null,
+                    preToolMs: event.preToolMs ?? null,
                     toolMs: event.toolMs ?? null,
+                    localPersistMs: event.localPersistMs ?? null,
+                    deliverySlotWaitMs: event.deliverySlotWaitMs ?? null,
+                    remoteCommitMs: event.remoteCommitMs ?? null,
+                    wakeMs: event.wakeMs ?? null,
+                    wakeStatus: event.wakeStatus ?? null,
+                    postToolToRemoteCommitMs: event.postToolToRemoteCommitMs ?? null,
+                    postToolToWakeMs: event.postToolToWakeMs ?? null,
                     terminalMs: event.terminalMs ?? null,
                     totalMs: event.totalMs ?? null,
+                    phaseOutcome: event.phaseOutcome ?? null,
                     argsJsonBytes: jsonBytes(args),
                     outerContentBytes: utf8Bytes(args.content),
                     nestedContentBytes: utf8Bytes(nested?.content),
@@ -104,10 +142,14 @@ export class RemoteCallMetrics {
                     resultJsonBytes: jsonBytes(event.result),
                     resultTextBytes: resultTextBytes(event.result),
                     filePath: effectivePath,
-                    fileBytes: event.stage === 'recv' ? null : await fileSize(effectivePath),
+                    fileBytes: event.stage === 'tool_done' ? await fileSize(effectivePath) : null,
                 };
                 await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-                await fs.appendFile(this.filePath, JSON.stringify(row) + '\n', 'utf8');
+                const encoded = JSON.stringify(row) + '\n';
+                let reset = false;
+                try { reset = (await fs.stat(this.filePath)).size >= MAX_METRICS_LOG_BYTES; } catch { /* first write */ }
+                if (reset) await fs.writeFile(this.filePath, encoded, 'utf8');
+                else await fs.appendFile(this.filePath, encoded, 'utf8');
             })
             .catch(() => { /* diagnostics never own execution */ });
     }

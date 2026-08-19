@@ -57,6 +57,11 @@ function assertToolSuccess(result, message) {
   assert.ok(!result.isError, `${message}: should not be marked as an error`);
 }
 
+function assertToolDiagnosticFailure(result, message) {
+  assert.strictEqual(result.content?.[0]?.type, 'text', `${message}: expected text response`);
+  assert.strictEqual(result.isError, true, `${message}: non-mutation must be machine-visible as an error`);
+}
+
 async function callTool(client, name, args) {
   return client.callTool({ name, arguments: args }, undefined, { timeout: 120000 });
 }
@@ -602,7 +607,7 @@ async function runPythonFuzzyFallbackWorkflow(client, attemptCount) {
       new_string: editedTarget,
       expected_replacements: 1,
     });
-    assertToolSuccess(editResult, `fuzzy edit_block workflow ${workflowId} attempt ${attempt}`);
+    assertToolDiagnosticFailure(editResult, `fuzzy edit_block workflow ${workflowId} attempt ${attempt}`);
     assert.ok(
       getText(editResult).includes('Exact match not found, but found a similar text'),
       `fuzzy edit_block workflow ${workflowId} attempt ${attempt}: should use fuzzy fallback. Response: ${getText(editResult).slice(0, 1000)}`
@@ -684,7 +689,7 @@ async function runFuzzyEventLoopResponsivenessWorkflow(client) {
   }
 
   const editResult = await editPromise;
-  assertToolSuccess(editResult, 'fuzzy event-loop regression edit_block');
+  assertToolDiagnosticFailure(editResult, 'fuzzy event-loop regression edit_block');
 
   const durationMs = performance.now() - startedAt;
   const maxPingLatencyMs = pingLatencies.length > 0 ? Math.max(...pingLatencies) : Infinity;

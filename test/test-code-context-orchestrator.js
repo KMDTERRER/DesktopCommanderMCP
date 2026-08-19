@@ -48,11 +48,21 @@ async function handle(message) {
   if (message.method === 'tools/call') {
     if (role === 'graph') {
       await new Promise((resolve) => setTimeout(resolve, 150));
+      if (process.env.DC_CONTEXT_GRAPH_MALFORMED === '1') {
+        send(message.id, {
+          content: [{ type: 'text', text: 'malformed-graph-result' }],
+          structuredContent: { status: 'ok', summary: 'missing impacted_files', truncated: false },
+        });
+        return;
+      }
+      const impacts = process.env.DC_CONTEXT_IMPACT_COUNT
+        ? Array.from({ length: Number(process.env.DC_CONTEXT_IMPACT_COUNT) }, (_, index) => 'src/generated-impact-' + index + '.ts')
+        : [process.env.DC_CONTEXT_IMPACT];
       send(message.id, {
         content: [{ type: 'text', text: 'graph-result' }],
         structuredContent: {
           status: 'ok', summary: 'fake graph impact', truncated: false,
-          impacted_files: [process.env.DC_CONTEXT_IMPACT], total_impacted: 1
+          impacted_files: impacts, total_impacted: impacts.length
         }
       });
       return;
@@ -62,23 +72,57 @@ async function handle(message) {
     const tool = message.params?.name;
     let semanticResult;
     if (tool === 'find_referencing_symbols') {
-      semanticResult = {
-        'src/tools/code-context-orchestrator.ts': { Function: [{
-          name_path: 'callCodeContextOrchestrator',
-          body_location: { start_line: 242, end_line: 366 },
-          content_around_reference: '... 300: before\\n  > 301: callExternalMcpTool()\\n... 302: after'
-        }] },
-        'src/server.ts': { File: [{
-          name_path: 'server',
-          body_location: { start_line: 0, end_line: 1768 },
-          content_around_reference: '... 60: before\\n  > 61: callExternalMcpTool()\\n... 62: after'
-        }] }
-      };
+      if (args.name_path === 'ShortReferenceTarget') {
+        semanticResult = 'The answer is too long (24000 characters). You can adjust your query or raise the max_answer_chars parameter.'
+          + String.fromCharCode(10) + 'References without surrounding lines:' + String.fromCharCode(10)
+          + JSON.stringify({
+            'src/tools/code-context-orchestrator.ts': { Function: [{ name_path: 'callCodeContextOrchestrator', reference_line: 300 }] },
+            'src/server.ts': { File: [{ name_path: 'server', reference_line: 61 }] }
+          });
+      } else if (args.name_path === 'CountOnlyReferenceTarget') {
+        semanticResult = 'The answer is too long (48000 characters). You can adjust your query or raise the max_answer_chars parameter.'
+          + String.fromCharCode(10) + 'Reference counts per file:' + String.fromCharCode(10)
+          + JSON.stringify({ 'src/server.ts': 3, 'src/tools/core-mcp.ts': 2 });
+      } else {
+        semanticResult = {
+          'src/tools/code-context-orchestrator.ts': { Function: [{
+            name_path: 'callCodeContextOrchestrator',
+            body_location: { start_line: 242, end_line: 366 },
+            content_around_reference: '... 300: before\\n  > 301: callExternalMcpTool()\\n... 302: after'
+          }] },
+          'src/server.ts': { File: [{
+            name_path: 'server',
+            body_location: { start_line: 0, end_line: 1768 },
+            content_around_reference: '... 60: before\\n  > 61: callExternalMcpTool()\\n... 62: after'
+          }] }
+        };
+      }
     } else if (tool === 'find_implementations') {
-      semanticResult = [{
-        name_path: 'callExternalMcpToolImpl', kind: 'Function', relative_path: 'src/tools/core-mcp.ts',
-        body_location: { start_line: 80, end_line: 120 }
-      }];
+      semanticResult = args.name_path === 'LongImplementationTarget'
+        ? 'The answer is too long (18000 characters). You can adjust your query or raise the max_answer_chars parameter.'
+        : [{
+            name_path: 'callExternalMcpToolImpl', kind: 'Function', relative_path: 'src/tools/core-mcp.ts',
+            body_location: { start_line: 80, end_line: 120 }
+          }];
+    } else if (args.name_path_pattern === 'MalformedTarget') {
+      semanticResult = 'not-json-find-symbol-contract';
+    } else if (args.name_path_pattern === 'ShortenedTarget') {
+      semanticResult = 'Matched 12>max_matches=2 symbols. Shortened result:\\n' + JSON.stringify({
+        'src/tools/external-mcp.ts': ['ShortenedTarget'],
+        'src/tools/code-context-orchestrator.ts': ['ShortenedTarget/helper']
+      });
+    } else if (args.name_path_pattern === 'RankingTarget') {
+      semanticResult = Array.from({ length: 10 }, (_, index) => ({
+        name_path: index === 9 ? 'test blocking offline RankingTarget generation fenced' : 'RankingTarget/generic-' + index,
+        kind: 'Function',
+        relative_path: index === 9 ? 'test/test-code-context-orchestrator.js' : 'src/tools/external-mcp.ts',
+        body_location: { start_line: 100 + index, end_line: 100 + index }
+      }));
+    } else if (args.name_path_pattern === 'BroadFirst') {
+      semanticResult = Array.from({ length: 10 }, (_, index) => ({
+        name_path: 'BroadFirst/generic-' + index, kind: 'Function',
+        relative_path: 'src/tools/external-mcp.ts'
+      }));
     } else {
       semanticResult = [{
         name_path: args.name_path_pattern, kind: 'Function',
@@ -89,7 +133,7 @@ async function handle(message) {
     }
     send(message.id, {
       content: [{ type: 'text', text: 'semantic-result' }],
-      structuredContent: { result: JSON.stringify(semanticResult) }
+      structuredContent: { result: typeof semanticResult === 'string' ? semanticResult : JSON.stringify(semanticResult) }
     });
     return;
   }
@@ -117,6 +161,27 @@ process.stdin.on('end', () => process.exit(0));
       protocolVersion: 'legacy', lifecycle: 'keep-alive',
       allowedTools: ['get_impact_radius_tool'],
     },
+    'fake-crg-malformed': {
+      command: process.execPath,
+      args: [fakeServer, '--repo', REPO_ROOT],
+      env: { DC_CONTEXT_ROLE: 'graph', DC_CONTEXT_GRAPH_MALFORMED: '1' },
+      protocolVersion: 'legacy', lifecycle: 'keep-alive',
+      allowedTools: ['get_impact_radius_tool'],
+    },
+    'fake-crg-many': {
+      command: process.execPath,
+      args: [fakeServer, '--repo', REPO_ROOT],
+      env: { DC_CONTEXT_ROLE: 'graph', DC_CONTEXT_IMPACT_COUNT: '120' },
+      protocolVersion: 'legacy', lifecycle: 'keep-alive',
+      allowedTools: ['get_impact_radius_tool'],
+    },
+    'fake-crg-parent': {
+      command: process.execPath,
+      args: [fakeServer, '--repo', path.dirname(REPO_ROOT)],
+      env: { DC_CONTEXT_ROLE: 'graph', DC_CONTEXT_IMPACT: path.join(REPO_ROOT, 'src', 'tools', 'code-context-orchestrator.ts') },
+      protocolVersion: 'legacy', lifecycle: 'keep-alive',
+      allowedTools: ['get_impact_radius_tool'],
+    },
     'fake-serena': {
       command: process.execPath,
       args: [fakeServer, 'start-mcp-server', '--project', REPO_ROOT],
@@ -139,12 +204,15 @@ const dcConfigDir = path.join(isolated, '.claude-server-commander');
 await fs.mkdir(dcConfigDir, { recursive: true });
 await fs.writeFile(path.join(dcConfigDir, 'config.json'), JSON.stringify({
   externalMcpConfigPath: staleConfigPath,
-  allowedDirectories: [REPO_ROOT],
+  allowedDirectories: [path.dirname(REPO_ROOT)],
   telemetryEnabled: false,
 }, null, 2), 'utf8');
 process.env.DESKTOP_COMMANDER_MCP_CONFIG = configPath;
 process.env.DESKTOP_COMMANDER_MCP_READ_ONLY_POLICY = JSON.stringify({
   'fake-crg': ['get_impact_radius_tool'],
+  'fake-crg-parent': ['get_impact_radius_tool'],
+  'fake-crg-many': ['get_impact_radius_tool'],
+  'fake-crg-malformed': ['get_impact_radius_tool'],
   'fake-serena': ['find_symbol', 'find_referencing_symbols', 'find_implementations'],
 });
 
@@ -252,6 +320,22 @@ try {
   );
   assert.equal(largeDirect.orchestration.changedFiles, 101);
   assert.equal(largeDirect.orchestration.seedFiles, 0);
+
+  await assert.rejects(
+    () => callCodeContextOrchestrator(
+      { root: REPO_ROOT, query: 'malformed context pack must fail closed' },
+      {
+        callBuiltin: async (tool) => {
+          assert.equal(tool, 'context_pack');
+          return { content: [{ type: 'text', text: 'not-a-context-pack-contract' }] };
+        },
+        callTrustedExternal: async () => { throw new Error('external call must not run'); },
+        assertWorkspace: async () => { throw new Error('workspace binding must not run'); },
+      },
+      5000,
+    ),
+    /context_pack returned an invalid context contract/,
+  );
 
   const sessionCalls = [];
   const sessionContext = await callCodeContextOrchestrator({
@@ -374,6 +458,149 @@ try {
   assert.equal(result.orchestration.semanticCalls, 1);
   assert.equal(result.orchestration.semanticExpansionCalls, 1);
   assert.equal(result.orchestration.semanticFiles, 3);
+
+  const ancestorGraph = JSON.parse((await readExternalMcpCompatUri(
+    'mcp://desktop-context/code_context?timeout_ms=15000',
+    {
+      root: REPO_ROOT,
+      query: 'ancestor graph binding must promote scope-relative evidence',
+      changedFiles: ['src/tools/external-mcp.ts'],
+      graphServer: 'fake-crg-parent',
+      maxFiles: 4,
+      maxTotalChars: 20000,
+    },
+  )).content[0].text);
+  assert.equal(ancestorGraph.orchestration.graphWorkspaceRelation, 'ancestor');
+  assert.deepEqual(ancestorGraph.graph.impactedFiles, ['src/tools/code-context-orchestrator.ts']);
+  assert(ancestorGraph.contextPack.seedFilesAccepted.includes('src/tools/external-mcp.ts'),
+    `ancestor explicit changed file was not promoted: ${JSON.stringify(ancestorGraph.contextPack)}`);
+  assert(ancestorGraph.contextPack.seedFilesAccepted.includes('src/tools/code-context-orchestrator.ts'),
+    `ancestor graph impact was not promoted: ${JSON.stringify(ancestorGraph.contextPack)}`);
+
+  const manyGraph = JSON.parse((await readExternalMcpCompatUri(
+    'mcp://desktop-context/code_context?timeout_ms=15000',
+    {
+      root: REPO_ROOT, query: 'internal seed caps must be reported',
+      changedFiles: ['src/tools/external-mcp.ts'], graphServer: 'fake-crg-many',
+      maxFiles: 1, maxTotalChars: 12000,
+    },
+  )).content[0].text);
+  assert.equal(manyGraph.graph.totalImpacted, 120);
+  assert.equal(manyGraph.graph.impactedFiles.length, 100);
+  assert.equal(manyGraph.graph.truncated, true, 'local graph impact cap must be visible');
+  assert.equal(manyGraph.orchestration.seedCandidates, 101);
+  assert.equal(manyGraph.orchestration.seedFiles, 100);
+  assert.equal(manyGraph.orchestration.seedFilesTruncated, true);
+
+  await assert.rejects(
+    () => readExternalMcpCompatUri('mcp://desktop-context/code_context?timeout_ms=15000', {
+      root: REPO_ROOT, query: 'malformed graph response must fail closed',
+      changedFiles: ['src/tools/external-mcp.ts'], graphServer: 'fake-crg-malformed',
+      maxFiles: 1, maxTotalChars: 12000,
+    }),
+    /graph impact returned an invalid graph contract/,
+  );
+
+  await assert.rejects(
+    () => readExternalMcpCompatUri('mcp://desktop-context/code_context?timeout_ms=15000', {
+      root: REPO_ROOT, query: 'malformed semantic response must fail closed',
+      semanticServer: 'fake-serena',
+      symbolQueries: [{ name_path_pattern: 'MalformedTarget', max_matches: 2 }],
+      maxFiles: 2, maxTotalChars: 12000,
+    }),
+    /find_symbol returned an invalid symbol contract/,
+  );
+
+  const shortened = JSON.parse((await readExternalMcpCompatUri(
+    'mcp://desktop-context/code_context?timeout_ms=15000',
+    {
+      root: REPO_ROOT, query: 'shortened target retrieval', semanticServer: 'fake-serena',
+      symbolQueries: [{ name_path_pattern: 'ShortenedTarget', substring_matching: true, max_matches: 2 }],
+      maxFiles: 6, maxTotalChars: 20000,
+    },
+  )).content[0].text);
+  assert.equal(shortened.semantic.expansion.sourceTruncated, true);
+  assert.equal(shortened.semantic.expansion.truncated, true);
+  assert.equal(shortened.semantic.expansion.seedCount, 2);
+  assert.equal(shortened.semantic.expansion.expandedSeedCount, 2);
+  assert.equal(shortened.orchestration.semanticExpansionCalls, 2);
+  assert.deepEqual(shortened.semantic.expansion.truncatedQueries, [
+    { queryIndex: 0, maxMatches: 2, reportedMatches: 12 },
+  ]);
+  assert(shortened.contextPack.seedFilesAccepted.includes('src/tools/code-context-orchestrator.ts'));
+
+  const ranked = JSON.parse((await readExternalMcpCompatUri(
+    'mcp://desktop-context/code_context?timeout_ms=15000',
+    {
+      root: REPO_ROOT, query: 'blocking offline generation fenced ranking target', semanticServer: 'fake-serena',
+      symbolQueries: [{ name_path_pattern: 'RankingTarget', substring_matching: true, max_matches: 20 }],
+      maxFiles: 6, maxTotalChars: 20000,
+    },
+  )).content[0].text);
+  assert.equal(ranked.semantic.expansion.seedCount, 10);
+  assert.equal(ranked.semantic.expansion.expandedSeedCount, 8);
+  assert.equal(ranked.semantic.expansion.truncated, true);
+  assert(ranked.semantic.expansion.selectedSeeds.some((seed) =>
+    seed.namePath === 'test blocking offline RankingTarget generation fenced'
+      && seed.relativePath === 'test/test-code-context-orchestrator.js'));
+
+  const fair = JSON.parse((await readExternalMcpCompatUri(
+    'mcp://desktop-context/code_context?timeout_ms=15000',
+    {
+      root: REPO_ROOT, query: 'critical second query', semanticServer: 'fake-serena',
+      symbolQueries: [
+        { name_path_pattern: 'BroadFirst', substring_matching: true, max_matches: 20 },
+        { name_path_pattern: 'CriticalSecondQuery', max_matches: 2 },
+      ],
+      maxFiles: 6, maxTotalChars: 20000,
+    },
+  )).content[0].text);
+  assert(fair.semantic.expansion.selectedSeeds.some((seed) =>
+    seed.queryIndex === 1 && seed.namePath === 'CriticalSecondQuery'));
+
+  const shortReferences = JSON.parse((await readExternalMcpCompatUri(
+    'mcp://desktop-context/code_context?timeout_ms=15000',
+    {
+      root: REPO_ROOT, query: 'truncated reference evidence', semanticServer: 'fake-serena',
+      symbolQueries: [{ name_path_pattern: 'ShortReferenceTarget', max_matches: 2 }],
+      maxFiles: 6, maxTotalChars: 20000,
+    },
+  )).content[0].text);
+  assert.equal(shortReferences.semantic.expansion.downstreamTruncated, true);
+  assert.equal(shortReferences.semantic.expansion.truncated, true);
+  assert.equal(shortReferences.semantic.expansion.relations.length, 2);
+  assert(shortReferences.semantic.expansion.truncatedExpansionCalls.some((call) =>
+    call.kind === 'reference' && call.seedNamePath === 'ShortReferenceTarget'));
+  assert(shortReferences.contextPack.seedFilesAccepted.includes('src/server.ts'));
+
+  const countedReferences = JSON.parse((await readExternalMcpCompatUri(
+    'mcp://desktop-context/code_context?timeout_ms=15000',
+    {
+      root: REPO_ROOT, query: 'count only reference evidence', semanticServer: 'fake-serena',
+      symbolQueries: [{ name_path_pattern: 'CountOnlyReferenceTarget', max_matches: 2 }],
+      maxFiles: 6, maxTotalChars: 20000,
+    },
+  )).content[0].text);
+  assert.equal(countedReferences.semantic.expansion.downstreamTruncated, true);
+  assert.equal(countedReferences.semantic.expansion.relations.length, 0);
+  assert(countedReferences.semantic.expansion.files.includes('src/server.ts'));
+  assert(countedReferences.semantic.expansion.files.includes('src/tools/core-mcp.ts'));
+  assert(countedReferences.contextPack.seedFilesAccepted.includes('src/tools/core-mcp.ts'));
+
+  const longImplementation = JSON.parse((await readExternalMcpCompatUri(
+    'mcp://desktop-context/code_context?timeout_ms=15000',
+    {
+      root: REPO_ROOT, query: 'implementation truncation must be visible', semanticServer: 'fake-serena',
+      semanticExpand: 'all',
+      symbolQueries: [{ name_path_pattern: 'LongImplementationTarget', max_matches: 2 }],
+      maxFiles: 6, maxTotalChars: 20000,
+    },
+  )).content[0].text);
+  assert.equal(longImplementation.semantic.expansion.downstreamTruncated, true);
+  assert.equal(longImplementation.semantic.expansion.truncated, true);
+  assert(longImplementation.semantic.expansion.truncatedExpansionCalls.some((call) =>
+    call.kind === 'implementation' && call.seedNamePath === 'LongImplementationTarget'));
+  assert.equal(longImplementation.semantic.expansion.relations.some((relation) => relation.kind === 'implementation'), false);
 
   const allSemantic = JSON.parse((await readExternalMcpCompatUri(
     'mcp://desktop-context/code_context?timeout_ms=15000',

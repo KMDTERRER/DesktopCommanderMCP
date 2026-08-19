@@ -8,6 +8,7 @@ import { acquireMutationResourceLocks, type MutationLockOptions } from './mutati
 const LEASE_ROOT = path.join(os.tmpdir(), 'desktop-commander-resource-leases-v1');
 const REGISTRY_GATE = path.join(LEASE_ROOT, '.registry-gate');
 const LEASE_POLL_MS = 25;
+const RELEASE_GATE_TIMEOUT_MS = 500;
 const UNKNOWN_OWNER_GRACE_MS = 5_000;
 const MAX_MANIFEST_BYTES = 2 * 1024 * 1024;
 const MAX_LEASE_PATHS = 20_000;
@@ -267,17 +268,29 @@ async function publishManifest(manifest: NormalizedLease, manifestPath: string):
 }
 
 async function releaseManifest(manifestPath: string, token: string, deadlineAt: number): Promise<void> {
-  const releaseGate = await acquireRegistryGate(deadlineAt);
+  let releaseGate: (() => Promise<void>) | undefined;
   try {
     try {
+      releaseGate = await acquireRegistryGate(deadlineAt);
+    } catch {
+      // Release is cleanup after the mutation/build outcome is already known.
+      // Never turn a committed operation into an ambiguous error because the
+      // registry gate is transiently unavailable. Ownership is re-verified below.
+    }
+    try {
       const loaded = await readManifestBounded(manifestPath);
-      if (loaded.lease?.pid === process.pid && loaded.lease.token === token) await fs.unlink(manifestPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
+      if (loaded.lease?.pid === process.pid && loaded.lease.token === token) {
+        await fs.unlink(manifestPath).catch((error) => {
+          if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
+        });
+      }
+    } catch {
+      // activeTokens is cleared in finally. A surviving local manifest is then
+      // classified as inactive-local and safely reaped by the next registry scan.
     }
   } finally {
-    await releaseGate();
     activeTokens.delete(token);
+    await releaseGate?.().catch(() => undefined);
   }
 }
 
@@ -312,7 +325,7 @@ export async function acquireResourceLease(
         release: async () => {
           if (released) return;
           released = true;
-          await releaseManifest(manifestPath, token, Date.now() + 5_000);
+          await releaseManifest(manifestPath, token, Date.now() + RELEASE_GATE_TIMEOUT_MS);
         },
       };
     }

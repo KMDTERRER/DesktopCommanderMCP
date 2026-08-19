@@ -9,6 +9,7 @@ import {
   acquireMutationResourceLease,
   acquireResourceLease,
 } from '../dist/utils/resource-lease-owner.js';
+import { acquireMutationResourceLocks } from '../dist/utils/mutation-resource-lock.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -128,6 +129,21 @@ async function main() {
     assert.equal(leaseDirEntries.filter((name) => /^rl_[a-f0-9]{32}\.json$/.test(name)).length, 1,
       'one build lease must publish one manifest, not one lock file per input');
     await compact.release();
+
+    const cleanupLease = await acquireMutationResourceLease([sourceB], Date.now() + 1000, { label: 'cleanup-gate' });
+    const cleanupManifest = cleanupLease.manifestPath;
+    const registryGate = path.join(os.tmpdir(), 'desktop-commander-resource-leases-v1', '.registry-gate');
+    const releaseRegistryGate = await acquireMutationResourceLocks(
+      [registryGate], Date.now() + 1000, { topologyMode: 'none' },
+    );
+    try {
+      const releaseStarted = Date.now();
+      await cleanupLease.release();
+      assert(Date.now() - releaseStarted < 1500, 'lease cleanup blocked the completed mutation outcome');
+      await assert.rejects(() => fs.stat(cleanupManifest), (error) => error?.code === 'ENOENT');
+    } finally {
+      await releaseRegistryGate();
+    }
 
     const child = spawnLeaseChild(sourceA);
     await child.acquired;

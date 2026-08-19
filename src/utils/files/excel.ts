@@ -7,6 +7,7 @@ import ExcelJS from 'exceljs';
 import fs from 'fs/promises';
 import { readFileBounded } from '../bounded-file-read.js';
 import { preflightZipContainer } from '../bounded-zip.js';
+import { atomicReplaceFileBytes } from '../atomic-file-write.js';
 import {
     MAX_EXCEL_ARCHIVE_ENTRIES,
     MAX_EXCEL_INPUT_BYTES,
@@ -195,7 +196,7 @@ ${JSON.stringify(data)}`;
         // Parse range: "Sheet1!A1:C10" or "Sheet1"
         const [sheetName, cellRange] = this.parseRange(range);
 
-        const workbook = await this.loadWorkbook(path);
+        const workbook = await this.loadWorkbook(path, options?.signal);
 
         // Get or create sheet
         let worksheet = workbook.getWorksheet(sheetName);
@@ -249,7 +250,13 @@ ${JSON.stringify(data)}`;
             }
         }
 
-        await workbook.xlsx.writeFile(path);
+        const output = Buffer.from(await workbook.xlsx.writeBuffer() as unknown as Uint8Array);
+        assertByteLengthWithin(output, MAX_EXCEL_OUTPUT_BYTES, 'Excel edit output');
+        options?.signal?.throwIfAborted();
+        await atomicReplaceFileBytes(path, output, {
+            signal: options?.signal,
+            deadlineAt: options?.deadlineAt,
+        });
 
         return { success: true, editsApplied: 1 };
     }

@@ -21,6 +21,7 @@ import PizZip from 'pizzip';
 import { FileHandler, FileResult, FileInfo, ReadOptions, EditResult, WriteOptions } from './base.js';
 import { readFileBounded } from '../bounded-file-read.js';
 import { preflightZipContainer } from '../bounded-zip.js';
+import { atomicReplaceFileBytes } from '../atomic-file-write.js';
 import {
     MAX_DOCX_ARCHIVE_ENTRIES,
     MAX_DOCX_INPUT_BYTES,
@@ -656,8 +657,9 @@ export class DocxFileHandler implements FileHandler {
             }
 
             // Load and pretty-print
+            const signal = options?.signal ?? new AbortController().signal;
             const buf = await readFileBounded(
-                path, MAX_DOCX_INPUT_BYTES, new AbortController().signal, 'DOCX input'
+                path, MAX_DOCX_INPUT_BYTES, signal, 'DOCX input'
             );
             const { zip } = loadDocxZip(buf);
             const docFile = zip.file('word/document.xml');
@@ -726,7 +728,12 @@ export class DocxFileHandler implements FileHandler {
                 compression: 'DEFLATE',
                 compressionOptions: { level: 6 },
             });
-            await fs.writeFile(path, outBuf);
+            assertByteLengthWithin(outBuf, MAX_DOCX_OUTPUT_BYTES, 'DOCX edit output');
+            signal.throwIfAborted();
+            await atomicReplaceFileBytes(path, outBuf, {
+                signal,
+                deadlineAt: options?.deadlineAt,
+            });
 
             return { success: true, editsApplied: matchCount };
         } catch (error) {

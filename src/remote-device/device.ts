@@ -4,7 +4,7 @@ import { RemoteChannel } from './remote-channel.js';
 import { SessionTokenOwner, type AuthSession } from './session-token-owner.js';
 import { RemoteResultTransport } from './remote-result-transport.js';
 import { RemoteRuntimeConfigStore, type RemoteRuntimeConfig } from './remote-runtime-config.js';
-import { RemoteCallMetrics } from './remote-call-metrics.js';
+import { RemoteCallMetrics, type RemoteMetricEvent, type RemoteMetricStage } from './remote-call-metrics.js';
 import { createRemoteOutcomeIdentity, type RemoteResultDeliveryMode } from './remote-result-contract.js';
 import { DeviceAuthenticator } from './device-authenticator.js';
 import { DesktopCommanderIntegration } from './desktop-commander-integration.js';
@@ -15,7 +15,7 @@ import path from 'path';
 import { captureRemote } from '../utils/capture.js';
 import { runWithAbortableTimeout } from '../utils/withTimeout.js';
 import { renameReplacingWithRetry } from '../utils/atomic-rename.js';
-import { isTransientHttpStatus, isTransientRemoteError } from './transient-remote-error.js';
+import { describeRemoteError, isTransientHttpStatus, isTransientRemoteError } from './transient-remote-error.js';
 import { RemoteResultOutbox, type RemoteResultOutboxEntry, type RemoteResultStatus } from './result-outbox.js';
 
 const REMOTE_BOOTSTRAP_FETCH_TIMEOUT_MS = 15_000;
@@ -54,6 +54,17 @@ type ResultDeliveryWaiter = {
     resolve: () => void;
     reject: (error: Error) => void;
     timer: NodeJS.Timeout;
+};
+
+type RemoteLatencyContext = {
+    tool: string;
+    profile: string;
+    inbound: string;
+    terminalWrite: string;
+    receivedAtMs: number;
+    createdAt?: unknown;
+    toolDoneAtMs?: number;
+    localPersistStartedAtMs?: number;
 };
 
 function remoteToolLogSummary(value: unknown): Record<string, unknown> {
@@ -182,6 +193,7 @@ export class MCPDevice {
     private runtimeConfig: RemoteRuntimeConfigStore | null;
     private runtimeHeartbeatTimer: NodeJS.Timeout | null = null;
     private callMetrics: RemoteCallMetrics;
+    private remoteLatencyContexts = new Map<string, RemoteLatencyContext>();
     private minimalCallActive = 0;
     private minimalCallWaiters: Array<() => void> = [];
     private desktop: DesktopCommanderIntegration;
@@ -441,7 +453,7 @@ export class MCPDevice {
             else this.remoteChannel.startHeartbeat(this.deviceId!);
 
         } catch (error: any) {
-            console.error(' - ❌ Device startup failed:', error.message);
+            console.error(' - ❌ Device startup failed:', describeRemoteError(error));
             if (error.stack && process.env.DEBUG_MODE === 'true') {
                 console.error('Stack trace:', error.stack);
             }
@@ -626,6 +638,22 @@ export class MCPDevice {
 
     // Methods moved to RemoteChannel
 
+    private recordRemoteLatency(
+        callId: string,
+        stage: RemoteMetricStage,
+        fields: Omit<Partial<RemoteMetricEvent>,
+            'stage' | 'callId' | 'tool' | 'profile' | 'inbound' | 'terminalWrite' | 'receivedAtMs' | 'createdAt'> = {},
+    ): void {
+        const context = this.remoteLatencyContexts.get(callId);
+        if (!context) return;
+        this.callMetrics.record({
+            stage, callId, tool: context.tool,
+            profile: context.profile, inbound: context.inbound, terminalWrite: context.terminalWrite,
+            receivedAtMs: context.receivedAtMs, createdAt: context.createdAt,
+            ...fields,
+        });
+    }
+
     private scheduleResultOutboxFlush(): Promise<void> {
         if (this.resultOutboxFlushPromise) return this.resultOutboxFlushPromise;
         let current!: Promise<void>;
@@ -680,6 +708,42 @@ export class MCPDevice {
         };
     }
 
+    private observeResultWake(callId: string): void {
+        if (!this.shouldSignalResult()) {
+            this.remoteLatencyContexts.delete(callId);
+            return;
+        }
+        const wakeStartedAt = Date.now();
+        void Promise.resolve(this.remoteChannel.signalResultAvailable(callId)).then(
+            (ack) => {
+                const context = this.remoteLatencyContexts.get(callId);
+                const completedAt = Date.now();
+                this.recordRemoteLatency(callId, 'wake_done', {
+                    wakeMs: ack?.durationMs ?? Math.max(0, completedAt - wakeStartedAt),
+                    wakeStatus: ack?.status ?? 'unknown',
+                    postToolToWakeMs: context?.toolDoneAtMs === undefined
+                        ? undefined : Math.max(0, completedAt - context.toolDoneAtMs),
+                    totalMs: Math.max(0, completedAt - (context?.receivedAtMs ?? completedAt)),
+                    phaseOutcome: ack?.attempted === false ? 'skipped' : ack?.status ?? 'unknown',
+                });
+                this.remoteLatencyContexts.delete(callId);
+            },
+            (error: any) => {
+                const context = this.remoteLatencyContexts.get(callId);
+                const completedAt = Date.now();
+                this.recordRemoteLatency(callId, 'wake_done', {
+                    wakeMs: Math.max(0, completedAt - wakeStartedAt),
+                    wakeStatus: 'error',
+                    postToolToWakeMs: context?.toolDoneAtMs === undefined
+                        ? undefined : Math.max(0, completedAt - context.toolDoneAtMs),
+                    totalMs: Math.max(0, completedAt - (context?.receivedAtMs ?? completedAt)),
+                    phaseOutcome: error?.message || 'error',
+                });
+                this.remoteLatencyContexts.delete(callId);
+            },
+        );
+    }
+
     private deliverResultOutboxEntry(
         entry: RemoteResultOutboxEntry, priority: ResultDeliveryPriority = 'live',
     ): Promise<void> {
@@ -688,7 +752,9 @@ export class MCPDevice {
 
         let delivery!: Promise<void>;
         delivery = (async () => {
+            const deliveryQueuedAt = Date.now();
             const release = await this.acquireResultDeliverySlot(priority);
+            const deliverySlotWaitMs = Math.max(0, Date.now() - deliveryQueuedAt);
             try {
                 // The outbox owns only persistence of the exact terminal outcome.
                 // Once the database confirms it, retire the local retry entry BEFORE
@@ -700,13 +766,23 @@ export class MCPDevice {
                         outcomeRevision: entry.outcomeRevision, outcomeHash: entry.outcomeHash, claimMetadata: entry.claimMetadata,
                     }
                 );
-                console.log(`↗ RESULT COMMIT ${entry.callId.slice(0, 8)} ${Date.now() - terminalCommitStartedAt}ms`);
+                const terminalCommitDoneAt = Date.now();
+                const remoteCommitMs = Math.max(0, terminalCommitDoneAt - terminalCommitStartedAt);
+                const context = this.remoteLatencyContexts.get(entry.callId);
+                this.recordRemoteLatency(entry.callId, 'remote_commit_done', {
+                    deliverySlotWaitMs, remoteCommitMs,
+                    postToolToRemoteCommitMs: context?.toolDoneAtMs === undefined
+                        ? undefined : Math.max(0, terminalCommitDoneAt - context.toolDoneAtMs),
+                    totalMs: Math.max(0, terminalCommitDoneAt - (context?.receivedAtMs ?? terminalCommitDoneAt)),
+                    phaseOutcome: priority,
+                });
+                console.log(`↗ RESULT COMMIT ${entry.callId.slice(0, 8)} ${remoteCommitMs}ms`);
                 this.remoteChannel.releaseCallClaim(entry.callId);
 
                 // Terminal persistence is the handoff boundary. Wake the server
                 // immediately, then retire the local replay copy independently;
                 // neither wake acknowledgement nor filesystem cleanup owns this slot.
-                if (this.shouldSignalResult()) this.remoteChannel.signalResultAvailable(entry.callId);
+                this.observeResultWake(entry.callId);
                 void this.resultOutbox.remove(entry.callId).catch((cleanupError: any) => {
                     if (process.env.DEBUG_MODE === 'true') {
                         console.debug(`[DEBUG] Deferred result outbox cleanup for ${entry.callId}:`, cleanupError?.message);
@@ -732,14 +808,26 @@ export class MCPDevice {
         if (existing) return existing;
         let delivery!: Promise<void>;
         delivery = (async () => {
+            const deliveryQueuedAt = Date.now();
             const release = await this.acquireResultDeliverySlot(priority);
+            const deliverySlotWaitMs = Math.max(0, Date.now() - deliveryQueuedAt);
             try {
                 try {
+                    const remoteCommitStartedAt = Date.now();
                     await this.resultTransport.updateCallResult(
                         entry.callId, entry.status, entry.result, entry.errorMessage, entry.claimToken, priority, {
                             outcomeRevision: entry.outcomeRevision, outcomeHash: entry.outcomeHash, claimMetadata: entry.claimMetadata,
                         }
                     );
+                    const remoteCommitDoneAt = Date.now();
+                    const context = this.remoteLatencyContexts.get(entry.callId);
+                    this.recordRemoteLatency(entry.callId, 'remote_commit_done', {
+                        deliverySlotWaitMs, remoteCommitMs: Math.max(0, remoteCommitDoneAt - remoteCommitStartedAt),
+                        postToolToRemoteCommitMs: context?.toolDoneAtMs === undefined
+                            ? undefined : Math.max(0, remoteCommitDoneAt - context.toolDoneAtMs),
+                        totalMs: Math.max(0, remoteCommitDoneAt - (context?.receivedAtMs ?? remoteCommitDoneAt)),
+                        phaseOutcome: `volatile_${priority}`,
+                    });
                     this.remoteChannel.releaseCallClaim(entry.callId);
                 } catch (error: any) {
                     if (error?.code === 'EREMOTECALLGONE') {
@@ -751,7 +839,7 @@ export class MCPDevice {
                 // Remote terminal persistence is authoritative. Notification is
                 // best-effort acceleration and must not retain the delivery slot.
                 this.volatileOutcomes.delete(entry.callId);
-                if (this.shouldSignalResult()) this.remoteChannel.signalResultAvailable(entry.callId);
+                this.observeResultWake(entry.callId);
             } finally {
                 release();
             }
@@ -847,17 +935,42 @@ export class MCPDevice {
         this.volatileOutcomes.set(callId, entry);
         try {
             await this.resultOutbox.put(entry);
+            const localPersistDoneAt = Date.now();
+            const latencyContext = this.remoteLatencyContexts.get(callId);
+            this.recordRemoteLatency(callId, 'local_persist_done', {
+                localPersistMs: latencyContext?.localPersistStartedAtMs === undefined
+                    ? undefined : Math.max(0, localPersistDoneAt - latencyContext.localPersistStartedAtMs),
+                totalMs: Math.max(0, localPersistDoneAt - (latencyContext?.receivedAtMs ?? localPersistDoneAt)),
+                phaseOutcome: 'outbox',
+            });
             this.volatileOutcomes.delete(callId);
         } catch (spoolError: any) {
+            const spoolFailedAt = Date.now();
+            const latencyContext = this.remoteLatencyContexts.get(callId);
+            this.recordRemoteLatency(callId, 'local_persist_done', {
+                localPersistMs: latencyContext?.localPersistStartedAtMs === undefined
+                    ? undefined : Math.max(0, spoolFailedAt - latencyContext.localPersistStartedAtMs),
+                totalMs: Math.max(0, spoolFailedAt - (latencyContext?.receivedAtMs ?? spoolFailedAt)),
+                phaseOutcome: 'spool_error',
+            });
             console.error(`[DEBUG] Could not persist local result outbox entry ${callId}:`, spoolError?.message);
+            const remoteCommitStartedAt = Date.now();
             await this.resultTransport.updateCallResult(
                 callId, status, identity.result, identity.errorMessage, claimToken, 'live', {
                     outcomeRevision: identity.outcomeRevision, outcomeHash: identity.outcomeHash, claimMetadata,
                 }
             );
+            const remoteCommitDoneAt = Date.now();
+            this.recordRemoteLatency(callId, 'remote_commit_done', {
+                deliverySlotWaitMs: 0, remoteCommitMs: Math.max(0, remoteCommitDoneAt - remoteCommitStartedAt),
+                postToolToRemoteCommitMs: latencyContext?.toolDoneAtMs === undefined
+                    ? undefined : Math.max(0, remoteCommitDoneAt - latencyContext.toolDoneAtMs),
+                totalMs: Math.max(0, remoteCommitDoneAt - (latencyContext?.receivedAtMs ?? remoteCommitDoneAt)),
+                phaseOutcome: 'remote_fallback',
+            });
             this.remoteChannel.releaseCallClaim(callId);
             this.volatileOutcomes.delete(callId);
-            if (this.shouldSignalResult()) this.remoteChannel.signalResultAvailable(callId);
+            this.observeResultWake(callId);
             return;
         }
 
@@ -1036,9 +1149,16 @@ export class MCPDevice {
             }
             return;
         }
+        const handlerReceivedAtMs = Date.now();
         const toolCall = payload.new;
         // Expect toolCall to include a device_id field used to route calls to this device instance.
-        const { id: call_id, tool_name, tool_args, device_id, metadata = {} } = toolCall;
+        const { id: call_id, tool_name, tool_args, device_id, metadata = {}, created_at } = toolCall;
+        const rawTiming = payload?._remoteTiming && typeof payload._remoteTiming === 'object'
+            ? payload._remoteTiming as Record<string, unknown> : {};
+        const receivedAtMs = Number.isFinite(rawTiming.receivedAtMs)
+            ? Number(rawTiming.receivedAtMs) : handlerReceivedAtMs;
+        const inbound = typeof rawTiming.inbound === 'string' ? rawTiming.inbound : 'unknown';
+        const rowFetchMs = Number.isFinite(rawTiming.rowFetchMs) ? Number(rawTiming.rowFetchMs) : undefined;
 
         // Only process jobs for this device. Verbose routing diagnostics stay
         // behind DEBUG_MODE; the clean operator trace below is emitted only
@@ -1096,17 +1216,34 @@ export class MCPDevice {
             return;
         }
 
+        this.remoteLatencyContexts.set(call_id, {
+            tool: tool_name, profile: 'production', inbound, terminalWrite: 'fenced',
+            receivedAtMs, createdAt: created_at,
+        });
+        this.recordRemoteLatency(call_id, 'recv', {
+            args: tool_args, handlerReceivedAtMs, rowFetchMs,
+            totalMs: Math.max(0, handlerReceivedAtMs - receivedAtMs),
+        });
+
         const operatorDescriptor = describeRemoteToolCall(tool_name, tool_args);
         writeRemoteToolTrace('RECV', call_id, operatorDescriptor);
 
         this.inFlightCallIds.add(call_id);
         let claimed = false;
+        const claimStartedAt = Date.now();
         try {
             claimed = await this.remoteChannel.markCallExecuting(call_id, metadata);
         } catch (claimError: any) {
             // Ownership was not established. Do not execute and do not write a
             // terminal result for a row another process may own. Because the id
             // is not remembered, a later redelivery can safely retry the claim.
+            const claimDoneAt = Date.now();
+            this.recordRemoteLatency(call_id, 'claim_done', {
+                rowFetchMs, claimMs: Math.max(0, claimDoneAt - claimStartedAt),
+                preToolMs: Math.max(0, claimDoneAt - receivedAtMs),
+                totalMs: Math.max(0, claimDoneAt - receivedAtMs), phaseOutcome: 'error',
+            });
+            this.remoteLatencyContexts.delete(call_id);
             console.error(`❌ Could not establish claim ownership for ${call_id}:`, claimError?.message);
             try {
                 await captureRemote('remote_device_tool_call_claim_failed', { error: claimError, tool_name, call_id });
@@ -1116,7 +1253,14 @@ export class MCPDevice {
             this.inFlightCallIds.delete(call_id);
         }
 
+        const claimDoneAt = Date.now();
+        this.recordRemoteLatency(call_id, 'claim_done', {
+            rowFetchMs, claimMs: Math.max(0, claimDoneAt - claimStartedAt),
+            preToolMs: Math.max(0, claimDoneAt - receivedAtMs),
+            totalMs: Math.max(0, claimDoneAt - receivedAtMs), phaseOutcome: claimed ? 'won' : 'lost',
+        });
         if (!claimed) {
+            this.remoteLatencyContexts.delete(call_id);
             this.rememberCallId(call_id);
             return;
         }
@@ -1159,8 +1303,17 @@ export class MCPDevice {
             console.error(`❌ Tool call ${tool_name} failed:`, errorMessage);
             captureRemote('remote_device_tool_call_failed', { error, tool_name }).catch(() => {});
         }
-        writeRemoteToolTrace(status === 'completed' ? 'OK' : 'FAIL', call_id, operatorDescriptor, Date.now() - operatorStartedAt);
+        const toolDoneAtMs = Date.now();
+        const toolMs = Math.max(0, toolDoneAtMs - operatorStartedAt);
+        const latencyContext = this.remoteLatencyContexts.get(call_id);
+        if (latencyContext) latencyContext.toolDoneAtMs = toolDoneAtMs;
+        this.recordRemoteLatency(call_id, 'tool_done', {
+            args: tool_args, result, toolMs,
+            totalMs: Math.max(0, toolDoneAtMs - receivedAtMs), phaseOutcome: status,
+        });
+        writeRemoteToolTrace(status === 'completed' ? 'OK' : 'FAIL', call_id, operatorDescriptor, toolMs);
 
+        if (latencyContext) latencyContext.localPersistStartedAtMs = Date.now();
         try {
             // Persist the exact terminal outcome locally before attempting the
             // remote write. A lost HTTP acknowledgement can therefore be replayed

@@ -37,7 +37,15 @@ type SemanticSeed = {
   relativePath: string;
   bodyLocation?: SemanticBodyLocation;
   answerChars: number;
+  ordinal: number;
 };
+type SemanticTruncatedQuery = { queryIndex: number; maxMatches: number; reportedMatches?: number };
+type SemanticTruncatedExpansionCall = {
+  kind: 'reference' | 'implementation';
+  seedNamePath: string;
+  seedRelativePath: string;
+};
+type ParsedSemanticRelations = { relations: SemanticRelation[]; files: string[]; truncated: boolean };
 type SemanticRelation = {
   kind: 'reference' | 'implementation';
   seedNamePath: string;
@@ -186,13 +194,110 @@ function serenaPayload(value: unknown): unknown {
   try { return JSON.parse(encoded); } catch { return encoded; }
 }
 
-function semanticSeedsFromResults(results: Array<{ query: SymbolQuery; result: unknown }>): { seeds: SemanticSeed[]; total: number } {
+function findSymbolCandidates(value: unknown): { candidates: unknown[]; truncated: boolean; reportedMatches?: number } {
+  const unwrapped = unwrapResult(value);
+  const object = recordValue(unwrapped);
+  const encoded = object && typeof object.result === 'string'
+    ? object.result
+    : typeof unwrapped === 'string' ? unwrapped : undefined;
+  if (encoded === undefined) {
+    if (Array.isArray(unwrapped)) return { candidates: unwrapped, truncated: false };
+    const direct = recordValue(unwrapped);
+    if (direct && typeof direct.name_path === 'string' && typeof direct.relative_path === 'string') {
+      return { candidates: [direct], truncated: false };
+    }
+    throw new Error('code_context Serena find_symbol returned an invalid symbol contract.');
+  }
+  try {
+    const parsed = JSON.parse(encoded);
+    if (typeof parsed !== 'string') {
+      if (Array.isArray(parsed)) return { candidates: parsed, truncated: false };
+      const direct = recordValue(parsed);
+      if (direct && typeof direct.name_path === 'string' && typeof direct.relative_path === 'string') {
+        return { candidates: [direct], truncated: false };
+      }
+      throw new Error('code_context Serena find_symbol returned an invalid symbol contract.');
+    }
+  } catch { /* Serena shortened output is a text prefix followed by JSON. */ }
+  const marker = 'Shortened result:';
+  const markerIndex = encoded.indexOf(marker);
+  if (markerIndex < 0) {
+    if (encoded.includes('The answer is too long')) return { candidates: [], truncated: true };
+    throw new Error('code_context Serena find_symbol returned an invalid symbol contract.');
+  }
+  const prefix = encoded.slice(0, markerIndex);
+  const reportedMatch = /Matched\s+(\d+)>/.exec(prefix);
+  let shortened: unknown;
+  try {
+    shortened = JSON.parse(encoded.slice(markerIndex + marker.length).trim());
+  } catch {
+    return { candidates: [], truncated: true, ...(reportedMatch ? { reportedMatches: Number(reportedMatch[1]) } : {}) };
+  }
+  const candidates: unknown[] = [];
+  const byPath = recordValue(shortened);
+  if (byPath) {
+    for (const [relativePath, rawNames] of Object.entries(byPath)) {
+      if (!Array.isArray(rawNames)) continue;
+      for (const rawName of rawNames) {
+        if (typeof rawName === 'string' && rawName.trim()) {
+          candidates.push({ name_path: rawName.trim(), relative_path: relativePath });
+        } else {
+          const item = recordValue(rawName);
+          if (item && typeof item.name_path === 'string') candidates.push({ ...item, relative_path: relativePath });
+        }
+      }
+    }
+  }
+  return {
+    candidates, truncated: true,
+    ...(reportedMatch ? { reportedMatches: Number(reportedMatch[1]) } : {}),
+  };
+}
+
+function semanticTerms(value: string): string[] {
+  return [...new Set(value
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((term) => term.length >= 3))];
+}
+
+function semanticSeedScore(seed: SemanticSeed, symbol: SymbolQuery, taskQuery: string): number {
+  const name = seed.namePath.toLowerCase();
+  const candidate = `${seed.namePath} ${seed.relativePath}`.toLowerCase();
+  const pattern = symbol.name_path_pattern.trim().toLowerCase();
+  let score = 0;
+  if (name === pattern) score += 240;
+  else if (name.endsWith(`/${pattern}`)) score += 180;
+  else if (name.includes(pattern)) score += 100;
+  if (symbol.relative_path && normalizeSlash(symbol.relative_path).toLowerCase() === seed.relativePath.toLowerCase()) score += 240;
+  const candidateTerms = new Set(semanticTerms(candidate));
+  for (const term of semanticTerms(taskQuery)) {
+    if (candidateTerms.has(term)) score += 24;
+    else if (candidate.includes(term)) score += 6;
+  }
+  for (const term of semanticTerms(symbol.name_path_pattern)) {
+    if (candidateTerms.has(term)) score += 12;
+  }
+  return score;
+}
+
+function semanticSeedsFromResults(
+  results: Array<{ query: SymbolQuery; result: unknown }>, taskQuery: string,
+): { seeds: SemanticSeed[]; total: number; sourceTruncated: boolean; truncatedQueries: SemanticTruncatedQuery[] } {
   const all: SemanticSeed[] = [];
   const seen = new Set<string>();
+  const truncatedQueries: SemanticTruncatedQuery[] = [];
+  let ordinal = 0;
   results.forEach((entry, queryIndex) => {
-    const payload = serenaPayload(entry.result);
-    const candidates = Array.isArray(payload) ? payload : [payload];
-    for (const candidate of candidates) {
+    const parsed = findSymbolCandidates(entry.result);
+    if (parsed.truncated) {
+      truncatedQueries.push({
+        queryIndex, maxMatches: entry.query.max_matches,
+        ...(parsed.reportedMatches !== undefined ? { reportedMatches: parsed.reportedMatches } : {}),
+      });
+    }
+    for (const candidate of parsed.candidates) {
       const item = recordValue(candidate);
       if (!item || typeof item.name_path !== 'string' || typeof item.relative_path !== 'string') continue;
       const namePath = item.name_path.trim();
@@ -202,12 +307,34 @@ function semanticSeedsFromResults(results: Array<{ query: SymbolQuery; result: u
       if (seen.has(key)) continue;
       seen.add(key);
       all.push({
-        queryIndex, namePath, relativePath, answerChars: entry.query.max_answer_chars,
+        queryIndex, namePath, relativePath, answerChars: entry.query.max_answer_chars, ordinal: ordinal++,
         ...(semanticBodyLocation(item.body_location) ? { bodyLocation: semanticBodyLocation(item.body_location) } : {}),
       });
     }
   });
-  return { seeds: all.slice(0, MAX_SEMANTIC_EXPANSION_SEEDS), total: all.length };
+  const ranked = [...all].sort((left, right) =>
+    semanticSeedScore(right, results[right.queryIndex].query, taskQuery)
+      - semanticSeedScore(left, results[left.queryIndex].query, taskQuery)
+    || left.ordinal - right.ordinal);
+  const selected: SemanticSeed[] = [];
+  const selectedKeys = new Set<string>();
+  for (let queryIndex = 0; queryIndex < results.length && selected.length < MAX_SEMANTIC_EXPANSION_SEEDS; queryIndex++) {
+    const best = ranked.find((seed) => seed.queryIndex === queryIndex);
+    if (!best) continue;
+    const key = `${best.relativePath}\u0000${best.namePath}`;
+    selected.push(best);
+    selectedKeys.add(key);
+  }
+  for (const seed of ranked) {
+    if (selected.length >= MAX_SEMANTIC_EXPANSION_SEEDS) break;
+    const key = `${seed.relativePath}\u0000${seed.namePath}`;
+    if (selectedKeys.has(key)) continue;
+    selected.push(seed);
+    selectedKeys.add(key);
+  }
+  return {
+    seeds: selected, total: all.length, sourceTruncated: truncatedQueries.length > 0, truncatedQueries,
+  };
 }
 
 function semanticScopePath(value: string, binding: ContextWorkspaceBinding): string | null {
@@ -225,9 +352,37 @@ function compactSnippet(value: unknown): string | undefined {
   return value.trim().slice(0, MAX_SEMANTIC_SNIPPET_CHARS);
 }
 
-function referenceRelations(value: unknown, seed: SemanticSeed, binding: ContextWorkspaceBinding): SemanticRelation[] {
-  const payload = recordValue(serenaPayload(value));
-  if (!payload) return [];
+function serenaResultText(value: unknown): string | undefined {
+  const unwrapped = unwrapResult(value);
+  const object = recordValue(unwrapped);
+  if (object && typeof object.result === 'string') return object.result;
+  return typeof unwrapped === 'string' ? unwrapped : undefined;
+}
+
+function jsonAfterMarker(encoded: string, marker: string): unknown | undefined {
+  const markerIndex = encoded.indexOf(marker);
+  if (markerIndex < 0) return undefined;
+  try { return JSON.parse(encoded.slice(markerIndex + marker.length).trim()); } catch { return undefined; }
+}
+
+function referenceRelations(value: unknown, seed: SemanticSeed, binding: ContextWorkspaceBinding): ParsedSemanticRelations {
+  const encoded = serenaResultText(value);
+  const tooLong = typeof encoded === 'string' && encoded.includes('The answer is too long');
+  const withoutContext = typeof encoded === 'string'
+    ? jsonAfterMarker(encoded, 'References without surrounding lines:')
+    : undefined;
+  const countOnly = withoutContext === undefined && typeof encoded === 'string'
+    ? jsonAfterMarker(encoded, 'Reference counts per file:')
+    : undefined;
+  if (countOnly !== undefined) {
+    const counts = recordValue(countOnly);
+    const files = counts
+      ? Object.keys(counts).map((rawFile) => semanticScopePath(rawFile, binding)).filter((item): item is string => item !== null)
+      : [];
+    return { relations: [], files: [...new Set(files)], truncated: true };
+  }
+  const payload = recordValue(withoutContext ?? serenaPayload(value));
+  if (!payload) return { relations: [], files: [], truncated: tooLong || withoutContext !== undefined };
   const relations: SemanticRelation[] = [];
   for (const [rawFile, rawKinds] of Object.entries(payload)) {
     const relativePath = semanticScopePath(rawFile, binding);
@@ -251,12 +406,15 @@ function referenceRelations(value: unknown, seed: SemanticSeed, binding: Context
       }
     }
   }
-  return relations;
+  return { relations, files: [], truncated: tooLong || withoutContext !== undefined };
 }
 
-function implementationRelations(value: unknown, seed: SemanticSeed, binding: ContextWorkspaceBinding): SemanticRelation[] {
+function implementationRelations(value: unknown, seed: SemanticSeed, binding: ContextWorkspaceBinding): ParsedSemanticRelations {
   const payload = serenaPayload(value);
-  if (!Array.isArray(payload)) return [];
+  if (!Array.isArray(payload)) {
+    const encoded = serenaResultText(value);
+    return { relations: [], files: [], truncated: typeof encoded === 'string' && encoded.includes('The answer is too long') };
+  }
   const relations: SemanticRelation[] = [];
   for (const rawItem of payload) {
     const item = recordValue(rawItem);
@@ -273,15 +431,18 @@ function implementationRelations(value: unknown, seed: SemanticSeed, binding: Co
       ...(semanticBodyLocation(item.body_location) ? { bodyLocation: semanticBodyLocation(item.body_location) } : {}),
     });
   }
-  return relations;
+  return { relations, files: [], truncated: false };
 }
 
 function requestedScopePrefix(binding: ContextWorkspaceBinding): string {
   return normalizeSlash(path.relative(binding.boundRoot, binding.requestedRoot));
 }
 
-function graphRelativeChangedFiles(values: string[], binding: ContextWorkspaceBinding): string[] {
+function translatedChangedFiles(
+  values: string[], binding: ContextWorkspaceBinding,
+): { graph: string[]; scope: string[] } {
   const prefix = requestedScopePrefix(binding);
+  const scope: string[] = [];
   const files: string[] = [];
   for (const value of values) {
     const normalized = normalizeSlash(value);
@@ -292,14 +453,23 @@ function graphRelativeChangedFiles(values: string[], binding: ContextWorkspaceBi
         : path.resolve(binding.requestedRoot, normalized);
     if (!pathWithin(binding.requestedRoot, absolute)) continue;
     const relative = normalizeSlash(path.relative(binding.boundRoot, absolute));
+    const scopeRelative = normalizeSlash(path.relative(binding.requestedRoot, absolute));
     if (relative && !files.includes(relative)) files.push(relative);
+    if (scopeRelative && !scope.includes(scopeRelative)) scope.push(scopeRelative);
   }
-  return files;
+  return { graph: files, scope };
 }
 
-function impactedFiles(value: unknown, binding: ContextWorkspaceBinding): { graph: string[]; scope: string[] } {
+function impactedFiles(
+  value: unknown, binding: ContextWorkspaceBinding,
+): { graph: string[]; scope: string[]; truncated: boolean } {
   const result = recordValue(unwrapResult(value));
-  const raw = Array.isArray(result?.impacted_files) ? result.impacted_files : [];
+  if (!result || !Array.isArray(result.impacted_files)
+      || result.impacted_files.some((item) => typeof item !== 'string')) {
+    throw new Error('code_context graph impact returned an invalid graph contract.');
+  }
+  const raw = result.impacted_files;
+  let truncated = false;
   const graph: string[] = [];
   const scope: string[] = [];
   for (const item of raw) {
@@ -308,16 +478,26 @@ function impactedFiles(value: unknown, binding: ContextWorkspaceBinding): { grap
     if (!pathWithin(binding.requestedRoot, absolute)) continue;
     const graphRelative = normalizeSlash(path.relative(binding.boundRoot, absolute));
     const scopeRelative = normalizeSlash(path.relative(binding.requestedRoot, absolute));
-    if (graphRelative && !graph.includes(graphRelative)) graph.push(graphRelative);
+    if (graphRelative && !graph.includes(graphRelative)) {
+      if (graph.length >= MAX_SEED_FILES) { truncated = true; continue; }
+      graph.push(graphRelative);
+    }
     if (scopeRelative && !scope.includes(scopeRelative)) scope.push(scopeRelative);
-    if (graph.length >= MAX_SEED_FILES) break;
+
   }
-  return { graph, scope };
+  return { graph, scope, truncated };
 }
 
 function compactContextPack(value: unknown) {
   const result = recordValue(unwrapResult(value));
-  if (!result) return value;
+  if (!result
+      || typeof result.repositoryRoot !== 'string'
+      || typeof result.scopeRoot !== 'string'
+      || !Array.isArray(result.seedFilesAccepted)
+      || !Array.isArray(result.missingSeedFiles)
+      || !Array.isArray(result.files)) {
+    throw new Error('code_context context_pack returned an invalid context contract.');
+  }
   const delta = recordValue(result.workspaceDelta);
   const changed = Array.isArray(delta?.changedFiles) ? delta.changedFiles : [];
   const working = Array.isArray(delta?.workingTreeChangedFiles) ? delta.workingTreeChangedFiles : [];
@@ -349,13 +529,13 @@ function compactContextPack(value: unknown) {
   };
 }
 
-function compactGraph(value: unknown, files: string[]) {
+function compactGraph(value: unknown, files: string[], locallyTruncated = false) {
   const result = recordValue(unwrapResult(value));
   if (!result) return { impactedFiles: files };
   return {
     status: typeof result.status === 'string' ? result.status : null,
     summary: typeof result.summary === 'string' ? result.summary.slice(0, 4000) : null,
-    truncated: result.truncated === true,
+    truncated: result.truncated === true || locallyTruncated,
     totalImpacted: typeof result.total_impacted === 'number' ? result.total_impacted : files.length,
     impactedFiles: files,
     ...(recordValue(result._sync) ? { sync: result._sync } : {}),
@@ -379,6 +559,7 @@ async function mapConcurrent<T, R>(values: T[], concurrency: number, fn: (value:
 
 async function expandSemanticResults(
   results: Array<{ query: SymbolQuery; result: unknown }>,
+  taskQuery: string,
   mode: SemanticExpandMode,
   maxFiles: number,
   maxRelations: number,
@@ -386,11 +567,11 @@ async function expandSemanticResults(
   callSemantic: (tool: string, args: Record<string, unknown>, timeoutMs: number) => Promise<unknown>,
   deadlineAt: number,
 ) {
-  const seedState = semanticSeedsFromResults(results);
+  const seedState = semanticSeedsFromResults(results, taskQuery);
   const files: string[] = [];
   const fileSet = new Set<string>();
   const scopedSeeds: SemanticSeed[] = [];
-  let truncated = seedState.total > seedState.seeds.length;
+  let truncated = seedState.sourceTruncated || seedState.total > seedState.seeds.length;
 
   const acceptFile = (candidate: string): boolean => {
     if (fileSet.has(candidate)) return true;
@@ -445,11 +626,23 @@ async function expandSemanticResults(
 
   const relations: SemanticRelation[] = [];
   const relationSet = new Set<string>();
+  let downstreamTruncated = false;
+  const truncatedExpansionCalls: SemanticTruncatedExpansionCall[] = [];
   for (const item of expanded) {
-    const candidates = item.task.kind === 'reference'
+    const parsed = item.task.kind === 'reference'
       ? referenceRelations(item.result, item.task.seed, binding)
       : implementationRelations(item.result, item.task.seed, binding);
-    for (const relation of candidates) {
+    if (parsed.truncated) {
+      truncated = true;
+      downstreamTruncated = true;
+      truncatedExpansionCalls.push({
+        kind: item.task.kind,
+        seedNamePath: item.task.seed.namePath,
+        seedRelativePath: item.task.seed.relativePath,
+      });
+    }
+    for (const file of parsed.files) acceptFile(file);
+    for (const relation of parsed.relations) {
       if (!acceptFile(relation.relativePath)) continue;
       const key = [
         relation.kind, relation.seedRelativePath, relation.seedNamePath, relation.relativePath,
@@ -469,6 +662,11 @@ async function expandSemanticResults(
     mode,
     seedCount: seedState.total,
     expandedSeedCount: scopedSeeds.length,
+    sourceTruncated: seedState.sourceTruncated,
+    truncatedQueries: seedState.truncatedQueries,
+    selectedSeeds: scopedSeeds.map(({ queryIndex, namePath, relativePath }) => ({ queryIndex, namePath, relativePath })),
+    downstreamTruncated,
+    truncatedExpansionCalls,
     calls: tasks.length,
     files,
     relations,
@@ -555,7 +753,10 @@ export async function callCodeContextOrchestrator(
   ]);
   const autoDelta = rawAutoDelta === null ? null : workspaceDeltaContract(rawAutoDelta);
   const changed = explicitChanged.length > 0 ? explicitChanged : (autoDelta?.changedFiles ?? []);
-  const graphChanged = graphBinding ? graphRelativeChangedFiles(changed, graphBinding) : changed;
+  const translatedChanged = graphBinding
+    ? translatedChangedFiles(changed, graphBinding)
+    : { graph: changed, scope: changed };
+  const graphChanged = translatedChanged.graph;
   if (graphServer && explicitChanged.length > 0 && graphChanged.length === 0) {
     throw new Error('code_context.graphServer received no changedFiles inside the requested root scope.');
   }
@@ -585,24 +786,30 @@ export async function callCodeContextOrchestrator(
         detail_level: 'compact',
       }, remainingOperationMs(deadlineAt, 'code_context graph impact'))
     : null;
-  const graphImpacts = graphResult && graphBinding ? impactedFiles(graphResult, graphBinding) : { graph: [], scope: [] };
-  const graphSeeds = graphImpacts.graph;
-  const explicitRelevanceSeeds = explicitChanged.length > 0 ? graphChanged : [];
+  const graphImpacts = graphResult && graphBinding
+    ? impactedFiles(graphResult, graphBinding)
+    : { graph: [], scope: [], truncated: false };
+  const graphSeeds = graphImpacts.scope;
+  const explicitRelevanceSeeds = explicitChanged.length > 0 ? translatedChanged.scope : [];
   const semanticOutcome = await semanticSettled;
   if (!semanticOutcome.ok) throw semanticOutcome.error;
   const semantic = semanticOutcome.value;
   const semanticExpansion = callSemantic && semanticBinding
     ? await expandSemanticResults(
-        semantic, semanticExpand, semanticMaxFiles, semanticMaxRelations,
+        semantic, query, semanticExpand, semanticMaxFiles, semanticMaxRelations,
         semanticBinding, callSemantic, deadlineAt,
       )
     : {
-        mode: 'none' as SemanticExpandMode, seedCount: 0, expandedSeedCount: 0, calls: 0,
+        mode: 'none' as SemanticExpandMode, seedCount: 0, expandedSeedCount: 0, sourceTruncated: false,
+        truncatedQueries: [] as SemanticTruncatedQuery[], selectedSeeds: [] as Array<{ queryIndex: number; namePath: string; relativePath: string }>,
+        downstreamTruncated: false, truncatedExpansionCalls: [] as SemanticTruncatedExpansionCall[], calls: 0,
         files: [] as string[], relations: [] as SemanticRelation[], truncated: false,
       };
-  const seeds = [...new Set([
+  const seedCandidates = [...new Set([
     ...explicitRelevanceSeeds, ...graphSeeds, ...semanticExpansion.files,
-  ])].slice(0, MAX_SEED_FILES);
+  ])];
+  const seedFilesTruncated = seedCandidates.length > MAX_SEED_FILES;
+  const seeds = seedCandidates.slice(0, MAX_SEED_FILES);
 
   const rawContextPack = await deps.callBuiltin('context_pack', {
     root,
@@ -621,7 +828,7 @@ export async function callCodeContextOrchestrator(
     graph: graphResult ? {
       server: graphServer,
       workspaceRoot: graphBinding?.boundRoot ?? null,
-      ...compactGraph(graphResult, graphImpacts.scope),
+      ...compactGraph(graphResult, graphImpacts.scope, graphImpacts.truncated),
     } : null,
     contextPack,
     semantic: hasSemanticProvider ? {
@@ -643,7 +850,9 @@ export async function callCodeContextOrchestrator(
       workspaceDeltaCalls: autoDelta ? 1 : 0,
       changedFilesSource: autoDelta ? 'workspace_delta' : (explicitChanged.length > 0 ? 'explicit' : 'none'),
       changedFiles: graphChanged.length,
+      seedCandidates: seedCandidates.length,
       seedFiles: seeds.length,
+      seedFilesTruncated,
       graphWorkspaceRelation: graphBinding ? (graphBinding.boundRoot === graphBinding.requestedRoot ? 'exact' : 'ancestor') : null,
     },
   };

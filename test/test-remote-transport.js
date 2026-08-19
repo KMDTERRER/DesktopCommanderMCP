@@ -23,6 +23,7 @@ import { RemoteCallMetrics } from '../dist/remote-device/remote-call-metrics.js'
 import { listNeutralToolAliases, resolveNeutralToolAlias } from '../dist/tools/neutral-tool-aliases.js';
 import { REMOTE_LATENCY_BASELINE_CONFIG, REMOTE_LATENCY_BASELINE_PROFILE } from '../dist/remote-device/remote-runtime-config.js';
 import { SessionTokenOwner } from '../dist/remote-device/session-token-owner.js';
+import { resolveMinimalLiveTestMode } from '../dist/remote-device/remote-live-test-guard.js';
 import { DesktopCommanderIntegration } from '../dist/remote-device/desktop-commander-integration.js';
 import fs from 'fs/promises';
 import os from 'os';
@@ -102,6 +103,60 @@ await test('remote call metrics record sizes and timings without retaining paylo
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
+});
+
+await test('production remote path emits phase metrics around claim, tool, local durability and detached delivery', async () => {
+  const { device } = makeDevice();
+  const events = [];
+  const realSetTimeout = globalThis.setTimeout;
+  device.callMetrics = { record: (event) => events.push(event) };
+  device.remoteChannel.markCallExecuting = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    return true;
+  };
+  device.resultOutbox.put = async () => { await new Promise((resolve) => setTimeout(resolve, 15)); };
+  device.resultTransport.updateCallResult = async () => { await new Promise((resolve) => setTimeout(resolve, 35)); };
+  device.remoteChannel.signalResultAvailable = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    return { attempted: true, status: 'ok', durationMs: 20 };
+  };
+
+  await device.handleNewToolCall({
+    new: {
+      id: 'phase-metrics', tool_name: 'read_file', tool_args: { path: 'C:/tmp/phase.txt' },
+      device_id: DEVICE_ID, metadata: {}, created_at: new Date(Date.now() - 80).toISOString(),
+    },
+    _remoteTiming: { inbound: 'broadcast_doorbell', receivedAtMs: Date.now() - 40, rowFetchMs: 18 },
+  });
+  const deadline = Date.now() + 1000;
+  while (!events.some((event) => event.stage === 'wake_done') && Date.now() < deadline) {
+    await new Promise((resolve) => realSetTimeout(resolve, 5));
+  }
+  const stages = events.map((event) => event.stage);
+  for (const stage of ['recv', 'claim_done', 'tool_done', 'local_persist_done', 'remote_commit_done', 'wake_done']) {
+    assert(stages.includes(stage), `production latency metrics missing ${stage}: ${JSON.stringify(stages)}`);
+  }
+  const claim = events.find((event) => event.stage === 'claim_done');
+  const commit = events.find((event) => event.stage === 'remote_commit_done');
+  const wake = events.find((event) => event.stage === 'wake_done');
+  assert(claim.rowFetchMs === 18 && claim.claimMs >= 20 && claim.preToolMs >= 40, `pre-tool phases not separated: ${JSON.stringify(claim)}`);
+  assert(commit.remoteCommitMs >= 30 && commit.postToolToRemoteCommitMs >= commit.remoteCommitMs, `remote commit latency missing: ${JSON.stringify(commit)}`);
+  assert(wake.wakeMs >= 15 && wake.wakeStatus === 'ok', `wake ACK latency missing: ${JSON.stringify(wake)}`);
+});
+
+await test('minimal live transport requires a separate explicit opt-in', async () => {
+  assert(resolveMinimalLiveTestMode(['node', 'remote'], {}) === false, 'production argv unexpectedly enabled minimal transport');
+  let rejected = false;
+  try { resolveMinimalLiveTestMode(['node', 'remote', '--minimal-live-test'], {}); }
+  catch (error) { rejected = /test-only/.test(String(error?.message)); }
+  assert(rejected, 'minimal-live-test flag did not fail closed without explicit opt-in');
+  assert(
+    resolveMinimalLiveTestMode(
+      ['node', 'remote', '--minimal-live-test'],
+      { DC_ALLOW_MINIMAL_LIVE_TEST: 'true' },
+    ) === true,
+    'explicit benchmark opt-in did not enable minimal transport',
+  );
 });
 
 await test('latency baseline contract stays minimal and parallel', async () => {
@@ -452,19 +507,24 @@ await test('outbound token lookup is memory-only and reflects rotation immediate
   assert(await tokens.accessToken() === 'rotated-access', 'rotated token was not immediately visible to outbound transport');
 });
 
-await test('result wake reuses the already joined realtime channel', async () => {
+await test('result wake reuses the already joined realtime channel and returns its ACK timing', async () => {
   const rc = new RemoteChannel(new SessionTokenOwner());
   const sent = [];
   rc.channel = {
     state: 'joined',
-    send: async (payload, opts) => { sent.push({ payload, opts }); return 'ok'; },
+    send: async (payload, opts) => {
+      sent.push({ payload, opts });
+      await new Promise((resolve) => realSetTimeout(resolve, 15));
+      return 'ok';
+    },
   };
-  rc.signalResultAvailable('joined-result');
-  await new Promise((resolve) => setImmediate(resolve));
+  const ack = await rc.signalResultAvailable('joined-result');
   assert(sent.length === 1, `expected one websocket wake, got ${sent.length}`);
   assert(sent[0].payload?.event === 'result' && sent[0].payload?.payload?.call_id === 'joined-result',
     'result wake payload was routed incorrectly');
   assert(sent[0].opts?.timeout === 1000, 'result wake must stay bounded');
+  assert(ack?.attempted === true && ack?.status === 'ok', `wake did not return the remote ACK: ${JSON.stringify(ack)}`);
+  assert(ack.durationMs >= 10, `wake ACK timing was not measured: ${JSON.stringify(ack)}`);
 });
 
 
@@ -781,6 +841,109 @@ await test('result-delivery slot wait is bounded instead of becoming an unresolv
 });
 
 // --- 2. Doorbell routing ----------------------------------------------------
+
+await test('legacy production subscription is scoped to this device', async () => {
+  const rc = new RemoteChannel(new SessionTokenOwner());
+  rc._user = { id: 'user-1', email: 'tester@example.com' };
+  rc.deviceId = DEVICE_ID;
+  let subscriptionFilter = null;
+  const channel = { state: 'joined', on: (_kind, options) => { subscriptionFilter = options?.filter ?? null; return channel; }, subscribe: () => channel };
+  rc.client = { channel: () => channel };
+  rc.createLegacyChannel();
+  assert(subscriptionFilter === `device_id=eq.${DEVICE_ID}`, `legacy subscription is not device-scoped: ${subscriptionFilter}`);
+});
+
+await test('slow legacy delivery of a broadcast-selected call degrades without channel churn', async () => {
+  const { rc, client } = makeRemoteChannel();
+  rc.transportCapableWritten = true; rc.presenceTracked = true; rc.channel = makeChannelState('joined');
+  let legacyCallback = null; let forcedRecreate = null;
+  const legacy = {
+    state: 'joined',
+    on: (_kind, _options, callback) => { legacyCallback = callback; return legacy; },
+    subscribe: () => legacy,
+  };
+  client.channel = () => legacy;
+  rc.recreateChannel = async (force) => { forcedRecreate = force; };
+  rc.createLegacyChannel();
+  legacyCallback({ new: {
+    id: 'broadcast-miss', device_id: DEVICE_ID, status: 'pending', tool_name: 'read_file', tool_args: {},
+    created_at: new Date(Date.now() - 2000).toISOString(), metadata: { transport: 'broadcast_v1' },
+  } });
+  await rc.capabilityWriteChain; rc.stopDegradedCallPolling();
+  assert(forcedRecreate === null, `broadcast miss unexpectedly recreated the channel: ${forcedRecreate}`);
+  assert(rc.transportCapableWritten === false, 'broadcast miss left broadcast capability advertised');
+});
+
+await test('broadcast miss does not retrack Presence or re-enable capability on the same channel', async () => {
+  const { rc } = makeRemoteChannel();
+  rc.transportCapableWritten = true;
+  rc.presenceTracked = true;
+  rc.channel = makeChannelState('joined');
+  let trackRetries = 0;
+  let enabledWrites = 0;
+  rc.trackPresenceWithRetry = async () => { trackRetries++; };
+  const realSetTransportCapable = rc.setTransportCapable.bind(rc);
+  rc.setTransportCapable = async (capable) => { if (capable) enabledWrites++; return realSetTransportCapable(capable); };
+
+  rc.handleBroadcastDeliveryMiss({
+    id: 'broadcast-health-miss', created_at: new Date(Date.now() - 2000).toISOString(),
+    metadata: { transport: 'broadcast_v1' },
+  }, Date.now());
+  await rc.capabilityWriteChain;
+  rc.checkConnectionHealth();
+  await rc.capabilityWriteChain;
+  rc.stopDegradedCallPolling();
+
+  assert(rc.presenceTracked === true, 'broadcast delivery miss invalidated an unrelated Presence registration');
+  assert(trackRetries === 0, `health check retracked Presence after broadcast miss: ${trackRetries}`);
+  assert(enabledWrites === 0, `health check re-enabled broadcast without delivery evidence: ${enabledWrites}`);
+  assert(rc.transportCapableWritten === false, 'broadcast capability oscillated back to true on the same channel');
+});
+
+await test('degraded REST poll dispatches a pending device call without waiting for postgres_changes', async () => {
+  const rc = new RemoteChannel(new SessionTokenOwner());
+  rc._user = { id: 'user-1', email: 'tester@example.com' };
+  rc.deviceId = DEVICE_ID; rc.channel = makeChannelState('errored'); rc.legacyChannel = makeChannelState('joined');
+  const delivered = []; const filters = [];
+  const row = { id: 'poll-call', status: 'pending', device_id: DEVICE_ID, tool_name: 'read_file', tool_args: { path: 'C:/tmp/x' }, created_at: new Date().toISOString() };
+  const chain = {
+    select: () => chain, eq: (field, value) => { filters.push([field, value]); return chain; }, order: () => chain, limit: () => chain,
+    abortSignal: async () => ({ data: [row], error: null }),
+  };
+  rc.client = { from: () => chain }; rc.onToolCall = (payload) => delivered.push(payload);
+  const count = await rc.pollPendingCallsOnce();
+  assert(count === 1 && delivered.length === 1, `degraded poll did not dispatch exactly one row: ${count}/${delivered.length}`);
+  assert(delivered[0].new === row && delivered[0]._remoteTiming?.inbound === 'degraded_poll', 'degraded poll lost row/timing provenance');
+  assert(filters.some(([field, value]) => field === 'device_id' && value === DEVICE_ID), 'degraded poll did not fence by device_id');
+  assert(filters.some(([field, value]) => field === 'status' && value === 'pending'), 'degraded poll did not fence by pending status');
+});
+
+await test('degraded poll scheduler never overlaps its own REST requests', async () => {
+  const rc = new RemoteChannel(new SessionTokenOwner());
+  rc._user = { id: 'user-1', email: 'tester@example.com' }; rc.deviceId = DEVICE_ID;
+  rc.channel = makeChannelState('errored'); rc.legacyChannel = makeChannelState('joined'); rc.onToolCall = () => {};
+  let active = 0; let maxActive = 0; let releaseFirst; const gate = new Promise((resolve) => { releaseFirst = resolve; });
+  const chain = {
+    select: () => chain, eq: () => chain, order: () => chain, limit: () => chain,
+    abortSignal: async () => { active++; maxActive = Math.max(maxActive, active); await gate; active--; return { data: [], error: null }; },
+  };
+  rc.client = { from: () => chain };
+  rc.startDegradedCallPolling(); rc.startDegradedCallPolling();
+  await new Promise((resolve) => realSetTimeout(resolve, 20));
+  assert(maxActive === 1, `degraded poll overlapped requests: ${maxActive}`);
+  releaseFirst(); await new Promise((resolve) => realSetTimeout(resolve, 20)); rc.stopDegradedCallPolling();
+});
+
+await test('IncreaseConnectionPool immediately withdraws a stale broadcast capability', async () => {
+  const { rc, client } = makeRemoteChannel();
+  rc.transportCapableWritten = true; rc.channel = makeChannelState('errored'); rc.legacyChannel = makeChannelState('joined');
+  rc.handlePrivateTransportFailure(new Error('IncreaseConnectionPool: Please increase your connection pool size'));
+  await rc.capabilityWriteChain; rc.stopDegradedCallPolling();
+  assert(rc.transportCapableWritten === false, 'hard private authorization failure left broadcast capability advertised');
+  const capabilityWrites = client.writes.filter((value) => value?.capabilities);
+  assert(capabilityWrites.length >= 1, 'hard private failure did not publish a capability withdrawal');
+  assert(capabilityWrites.every((value) => value.capabilities.transport_broadcast_v1 !== true), 'withdrawal still advertised broadcast_v1');
+});
 
 await test('doorbell for another device is ignored without fetching', async () => {
   const { rc, client } = makeRemoteChannel();
@@ -1193,6 +1356,27 @@ await test('private-channel failure keeps status online while legacy is joined',
   assert(client.writes[0].status === 'online', 'still reachable via legacy = online');
 });
 
+await test('soft private transport timeout does not tear down the existing channel', async () => {
+  const { rc } = makeRemoteChannel();
+  const channel = makeChannelState('errored');
+  rc.channel = channel;
+  rc.legacyChannel = makeChannelState('joined');
+  rc.transportCapableWritten = true;
+  rc.handlePrivateTransportFailure(new Error('Tool call channel subscription timed out'));
+  assert(rc.channel === channel, 'soft timeout destroyed the existing private channel');
+});
+
+await test('health watchdog does not duplicate realtime-js recovery on an open socket', async () => {
+  const { rc, client } = makeRemoteChannel();
+  rc.channel = makeChannelState('errored');
+  rc.legacyChannel = makeChannelState('joined');
+  client.realtime.connectionState = () => 'open';
+  let recreates = 0;
+  rc.recreateChannel = async () => { recreates++; };
+  rc.checkConnectionHealth();
+  assert(recreates === 0, `health watchdog duplicated realtime-js recovery: ${recreates}`);
+});
+
 await test('status goes offline when no transport is joined', async () => {
   const { rc, client } = makeRemoteChannel();
   rc.channel = makeChannelState('errored');
@@ -1235,6 +1419,32 @@ await test('concurrent status writes stay ordered', async () => {
 // device that cannot join the private channel must stop advertising the flag or
 // it is undispatchable however healthy its legacy channel is.
 
+await test('private recreate evicts a stale same-topic wrapper before one replacement', async () => {
+  const { rc, client } = makeRemoteChannel();
+  rc.sleep = () => Promise.resolve();
+  rc.channel = null;
+  rc.legacyChannel = makeChannelState('joined');
+
+  const stale = { topic: 'realtime:user:user-1', state: 'errored', teardown: () => {} };
+  const registry = [stale];
+  client.getChannels = () => registry;
+  client.removeChannel = async () => 'error';
+  client.realtime._remove = (channel) => {
+    const index = registry.indexOf(channel);
+    if (index >= 0) registry.splice(index, 1);
+  };
+
+  let privateCreates = 0;
+  let legacyCreates = 0;
+  rc.createChannel = async () => { privateCreates++; };
+  rc.createLegacyChannel = () => { legacyCreates++; };
+
+  await rc.recreateChannel();
+  assert(registry.length === 0, 'stale private wrapper remained registered');
+  assert(privateCreates === 1, `expected one private replacement, got ${privateCreates}`);
+  assert(legacyCreates === 0, 'private replacement touched the legacy channel');
+});
+
 await test('sustained recreate failure withdraws the transport capability', async () => {
   const { rc, client } = makeRemoteChannel();
   rc.transportCapableWritten = true; // previously proven
@@ -1250,15 +1460,15 @@ await test('sustained recreate failure withdraws the transport capability', asyn
 
   for (let i = 0; i < 3; i++) await rc.recreateChannel();
 
-  // Also proves the recreate reached createChannel rather than dying earlier,
-  // and that the legacy net is rebuilt first and on every attempt.
+  // Recovery owns only the private channel. The legacy safety net must remain
+  // untouched while private replacements fail.
   assert(
-    order.slice(0, 2).join(',') === 'legacy,private',
-    `legacy net must be rebuilt first: ${JSON.stringify(order)}`
+    order.join(',') === 'private,private,private',
+    `private recovery unexpectedly touched another transport: ${JSON.stringify(order)}`
   );
   assert(
-    order.filter((o) => o === 'legacy').length === 3,
-    'legacy net must be rebuilt on every recreate attempt'
+    order.filter((o) => o === 'legacy').length === 0,
+    'private recreate must not rebuild or close the legacy channel'
   );
   assert(rc.transportCapableWritten === false, 'capability must be withdrawn');
   const capWrite = client.writes.find((w) => w.capabilities);

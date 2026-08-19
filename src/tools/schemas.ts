@@ -191,7 +191,7 @@ export const EditBlockArgsSchema = z.object({
   // Text file string replacement
   old_string: z.string().optional(),
   new_string: z.string().optional(),
-  expected_replacements: z.number().optional().default(1),
+  expected_replacements: z.number().int().min(1).max(10000).optional().default(1),
   // Structured file range rewrite (Excel, etc.)
   range: z.string().optional(),
   content: z.any().optional(),

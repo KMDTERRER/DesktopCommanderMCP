@@ -15,7 +15,7 @@
  * 3. Unify the editRange() signature to handle both text search/replace and structured edits
  */
 
-import { getDefaultEditorMetadata, readFile, writeFile, readFileInternal, validatePath } from './filesystem.js';
+import { getDefaultEditorMetadata, readFile, writeFile, readFileInternal, validatePath, WRITE_OPERATION_TIMEOUT_MS } from './filesystem.js';
 import fs from 'fs/promises';
 import { ServerResult } from '../types.js';
 import { runFuzzySearchInWorker, getSimilarityRatio } from './fuzzySearch.js';
@@ -131,12 +131,9 @@ export async function performSearchReplace(filePath: string, block: SearchReplac
     
         // Capture file extension in telemetry without capturing the file path
         capture('server_edit_block_empty_search', {fileExtension: fileExtension, expectedReplacements});
-        return {
-            content: [{ 
-                type: "text", 
-                text: "Empty search strings are not allowed. Please provide a non-empty string to search for."
-            }],
-        };
+        return createErrorResponse(
+            "Empty search strings are not allowed. Please provide a non-empty string to search for."
+        );
     }
     
 
@@ -241,15 +238,12 @@ RECOMMENDATION: For large search/replace operations, consider breaking them into
     // If exact match found but count doesn't match expected, inform the user
     if (count > 0 && count !== expectedReplacements) {
         capture('server_edit_block_unexpected_count', {fileExtension: fileExtension, expectedReplacements, expectedReplacementsCount: count});
-        return {
-            content: [{ 
-                type: "text", 
-                text: `Expected ${expectedReplacements} occurrences but found ${count} in ${filePath}. ` + 
-            `Double check and make sure you understand all occurencies and if you want to replace all ${count} occurrences, set expected_replacements to ${count}. ` +
-            `If there are many occurrancies and you want to change some of them and keep the rest. Do it one by one, by adding more lines around each occurrence.` +
-`If you want to replace a specific occurrence, make your search string more unique by adding more lines around search string.`
-            }],
-        };
+        return createErrorResponse(
+            `Expected ${expectedReplacements} occurrences but found ${count} in ${filePath}. ` +
+            `Double check and make sure you understand all occurrences and if you want to replace all ${count} occurrences, set expected_replacements to ${count}. ` +
+            `If there are many occurrences and you want to change some of them and keep the rest, do it one by one by adding more lines around each occurrence. ` +
+            `If you want to replace a specific occurrence, make your search string more unique by adding more lines around it.`
+        );
     }
     
     // If exact match not found, try fuzzy search
@@ -291,14 +285,11 @@ RECOMMENDATION: For large search/replace operations, consider breaking them into
             
             // If we allow fuzzy matches, we would make the replacement here
             // For now, we'll return a detailed message about the fuzzy match
-            return {
-                content: [{ 
-                    type: "text", 
-                    text: `Exact match not found, but found a similar text with ${Math.round(similarity * 100)}% similarity (found in ${executionTime.toFixed(2)}ms):\n\n` +
-                          `Differences:\n${diff}\n\n` +
-                          `To replace this text, use the exact text found in the file.`
-                }],// TODO
-            };
+            return createErrorResponse(
+                `Exact match not found, but found a similar text with ${Math.round(similarity * 100)}% similarity (found in ${executionTime.toFixed(2)}ms):\n\n` +
+                `Differences:\n${diff}\n\n` +
+                `To replace this text, use the exact text found in the file.`
+            );
         } else {
             // If the fuzzy match isn't close enough
             // Still capture the fuzzy search event with all data
@@ -307,14 +298,11 @@ RECOMMENDATION: For large search/replace operations, consider breaking them into
                 below_threshold: true
             });
             
-            return {
-                content: [{ 
-                    type: "text", 
-                    text: `Search content not found in ${filePath}. The closest match was "${fuzzyResult.value}" ` +
-                          `with only ${Math.round(similarity * 100)}% similarity, which is below the ${Math.round(FUZZY_THRESHOLD * 100)}% threshold. ` +
-                          `(Fuzzy search completed in ${executionTime.toFixed(2)}ms)`
-                }],
-            };
+            return createErrorResponse(
+                `Search content not found in ${filePath}. The closest match was "${fuzzyResult.value}" ` +
+                `with only ${Math.round(similarity * 100)}% similarity, which is below the ${Math.round(FUZZY_THRESHOLD * 100)}% threshold. ` +
+                `(Fuzzy search completed in ${executionTime.toFixed(2)}ms)`
+            );
         }
     }
     
@@ -379,13 +367,11 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
     const hasRange = parsed.range !== undefined && parsed.range !== '';
     const hasContent = parsed.content !== undefined && parsed.content !== '';
 
-    // Validate path and resolve handler once — used by both dispatch paths below
+    // Validate authority before waiting for ownership. Resolve the content-sensitive
+    // handler only after the mutation lock is held so its decision cannot go stale.
     let validatedPath: string;
-    let handler: Awaited<ReturnType<typeof import('../utils/files/factory.js').getFileHandler>>;
     try {
         validatedPath = await validatePath(parsed.file_path);
-        const { getFileHandler } = await import('../utils/files/factory.js');
-        handler = await getFileHandler(validatedPath);
     } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         return createErrorResponse(errorMessage);
@@ -402,6 +388,18 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
     }
 
     try {
+    let handler: Awaited<ReturnType<typeof import('../utils/files/factory.js').getFileHandler>>;
+    try {
+        const { getFileHandler } = await import('../utils/files/factory.js');
+        handler = await getFileHandler(validatedPath);
+    } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        return createErrorResponse(errorMessage);
+    }
+    const editOptions = {
+        ...(parsed.options ?? {}),
+        deadlineAt: Date.now() + WRITE_OPERATION_TIMEOUT_MS,
+    };
     const hasEditRange = 'editRange' in handler && typeof handler.editRange === 'function';
 
     // Path 1: Range rewrite (Excel, etc.) — range + content
@@ -419,7 +417,7 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
         if (hasEditRange) {
             try {
                 // parsed.range is guaranteed non-empty string by hasRange check above
-                await handler.editRange!(validatedPath!, parsed.range!, content, parsed.options);
+                await handler.editRange!(validatedPath!, parsed.range!, content, editOptions);
                 const resolvedRangePath = resolveAbsolutePath(parsed.file_path);
                 return {
                     content: [{
@@ -458,7 +456,7 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
                 old_string: parsed.old_string,
                 new_string: parsed.new_string,
                 expected_replacements: parsed.expected_replacements,
-            });
+            }, editOptions);
 
             if (result.success) {
                 const resolvedEditRangePath = resolveAbsolutePath(parsed.file_path);

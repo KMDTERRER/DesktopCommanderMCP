@@ -10,7 +10,7 @@ const FileGetSchema = z.object({
 const FilePutSchema = z.object({
     path: z.string(),
     data: z.string(),
-    append: z.boolean().optional().default(false),
+    append: z.boolean().optional(),
 }).strict();
 
 const SearchRunSchema = z.object({
@@ -48,8 +48,18 @@ export function resolveNeutralToolAlias(name: string, rawArgs: unknown): AliasRe
             return { canonicalName: 'read_file', args: { path: v.path, offset: v.from ?? 0, length: v.count ?? 1000 } };
         }
         case 'file_put': {
-            const v = FilePutSchema.parse(rawArgs ?? {});
-            return { canonicalName: 'write_file', args: { path: v.path, content: v.data, mode: v.append ? 'append' : 'rewrite' } };
+            const raw = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)
+                ? rawArgs as Record<string, unknown>
+                : {};
+            const appendProvided = Object.prototype.hasOwnProperty.call(raw, 'append');
+            const v = FilePutSchema.parse(raw);
+            return {
+                canonicalName: 'write_file',
+                args: {
+                    path: v.path, content: v.data,
+                    ...(appendProvided ? { mode: v.append === true ? 'append' : 'rewrite' } : {}),
+                },
+            };
         }
         case 'search_run': {
             const v = SearchRunSchema.parse(rawArgs ?? {});
