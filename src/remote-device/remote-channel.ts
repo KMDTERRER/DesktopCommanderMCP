@@ -143,6 +143,7 @@ export class RemoteChannel {
 
     // Track last device status to prevent duplicate log messages
     private lastDeviceStatus: 'online' | 'offline' = 'offline';
+    private channelHealthReporter: ((ready: boolean) => void) | null = null;
 
     // Track last channel state for debug logging
     private lastChannelState: string | null = null;
@@ -153,6 +154,19 @@ export class RemoteChannel {
 
     private _user: User | null = null;
     get user(): User | null { return this._user; }
+
+    setChannelHealthReporter(reporter: ((ready: boolean) => void) | null): void {
+        this.channelHealthReporter = reporter;
+    }
+
+    private reportChannelHealth(ready: boolean): void {
+        if (this.shuttingDown) return;
+        if (this.channelHealthReporter) {
+            this.channelHealthReporter(ready);
+            return;
+        }
+        this.queueStatusWrite(ready ? 'online' : 'offline');
+    }
 
     constructor(
         private readonly tokens: SessionTokenOwner = new SessionTokenOwner(),
@@ -413,11 +427,11 @@ export class RemoteChannel {
         }
 
         if (existingDevice) {
-            console.debug('[DEBUG] Updating device status to online');
+            console.debug('[DEBUG] Bootstrapping device status to offline until child+channel health converge');
             // transport_broadcast_v1 is NOT set here: the server treats it as
             // binding, so it is written only once presence is proven.
             const { error: deviceUpdateError } = await this.updateDevice(existingDevice.id, {
-                status: 'online',
+                status: 'offline',
                 last_seen: new Date().toISOString(),
                 capabilities: this.capabilitiesPayload(false),
                 device_name: deviceName
@@ -796,6 +810,7 @@ export class RemoteChannel {
             const timer = setTimeout(() => finish(new Error('Minimal live channel subscribe timed out')), 15_000);
             timer.unref?.();
             channel.subscribe((status: string, error: any) => {
+                this.syncReachabilityStatus();
                 if (status === 'SUBSCRIBED') finish();
                 else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
                     finish(error ?? new Error(`Minimal live channel ${status}`));
@@ -900,6 +915,7 @@ export class RemoteChannel {
                 )
                 .subscribe((status: string) => {
                     console.debug(`[DEBUG] Legacy channel status: ${status}`);
+                    this.syncReachabilityStatus();
                 });
         } catch (error: any) {
             console.debug('[DEBUG] Legacy channel subscribe failed (doorbell path unaffected):', error?.message);
@@ -991,7 +1007,7 @@ export class RemoteChannel {
                         console.log(`✅ Channel subscribed${recovered > 0 ? ` (recovered after ${recovered} attempt${recovered === 1 ? '' : 's'})` : ''}`);
                         // Update device status on successful connection (queued, so
                         // it can't be overtaken by a teardown's status write).
-                        this.queueStatusWrite('online');
+                        this.syncReachabilityStatus();
                         // Presence is the live signal dispatch reads, so resolve
                         // only once it lands — otherwise registerDevice() reports
                         // "Device ready" while still undispatchable.
@@ -1222,10 +1238,9 @@ export class RemoteChannel {
         }
 
         // 'joining' is transitional — let realtime-js's rejoin backoff converge
-        // rather than tearing the channel down mid-join. But bound it: a
-        // half-open socket parks the channel here indefinitely, so past
-        // JOINING_WEDGE_TIMEOUT_MS force a recreate, the only path that
-        // disconnect()s the dead socket.
+        // rather than tearing the channel down mid-join. Bound it so an indefinitely
+        // parked private generation is replaced, but never reset the shared socket
+        // or sacrifice the legacy fallback from this watchdog.
         if (state === 'joining') {
             this.startDegradedCallPolling();
             const now = Date.now();
@@ -1549,34 +1564,22 @@ export class RemoteChannel {
 
     /**
      * Reachable by SOME transport — the private channel or, during the
-     * transition, the independent legacy one. Gates the heartbeat and `status`:
-     * asking only about the private channel starves last_seen for a device whose
-     * legacy channel is fine, and the 45s sweep then blacks it out.
+     * transition, the independent legacy one. Gates heartbeat bookkeeping and
+     * feeds aggregate channel health to the device-level status owner.
      * Collapses to a single check at the flip (009).
      */
     private isReachable(): boolean {
         return this.channel?.state === 'joined' || this.legacyChannel?.state === 'joined';
     }
 
-    /**
-     * Set `status` from actual reachability. `status` is transport-agnostic (the
-     * server filters on it), so it must not follow one channel's health — the
-     * private channel's error path re-fires on every rejoin and would oscillate
-     * the row against the heartbeat. Same predicate as the heartbeat gate.
-     */
+    /** Report aggregate remote reachability. MCPDevice normally routes this into
+     * DeviceStatusArbiter; standalone callers fall back to the serialized writer. */
     private syncReachabilityStatus(): void {
-        this.queueStatusWrite(this.isReachable() ? 'online' : 'offline');
+        this.reportChannelHealth(this.isReachable());
     }
 
-    /**
-     * Serialize the channel-callback status writes. They fire from un-awaited
-     * callbacks, and inside recreateChannel() a teardown's 'offline' and the
-     * fresh join's 'online' land ~100-300ms apart — unordered, 'offline' can win
-     * and leave a healthy device undispatchable until the next heartbeat.
-     *
-     * Not the single writer: updateHeartbeat, registerDevice and setOffline's
-     * subprocess write status directly, so this is not total ordering.
-     */
+    /** Legacy standalone status writer used only when no device-level arbiter is
+     * attached. Production MCPDevice owns runtime status through DeviceStatusArbiter. */
     private queueStatusWrite(status: 'online' | 'offline'): void {
         // After teardown begins, setOffline() owns the final status write.
         if (this.shuttingDown) {
@@ -1584,7 +1587,9 @@ export class RemoteChannel {
             return;
         }
         this.statusWriteChain = this.statusWriteChain
-            .then(() => (this.deviceId ? this.setOnlineStatus(this.deviceId, status) : undefined))
+            .then(async () => {
+                if (this.deviceId) await this.setOnlineStatus(this.deviceId, status);
+            })
             .catch((e: any) => {
                 console.error('[DEBUG] Status write failed:', e?.message);
             });
@@ -1603,11 +1608,9 @@ export class RemoteChannel {
 
     async updateHeartbeat(deviceId: string) {
         if (!this.client) return;
-        // This write asserts status:'online' too, so it MUST respect the
-        // shutdown gate — otherwise a heartbeat firing (or in flight) as SIGINT
-        // lands can be applied after setOffline()'s subprocess write and leave
-        // an exited process marked online with a fresh last_seen, which for a
-        // capable device the sweep then cannot age out for a full tier window.
+        // Heartbeat owns last_seen bookkeeping only; runtime status belongs to
+        // DeviceStatusArbiter. Still respect shutdown so an exited process cannot
+        // receive a fresh last_seen after its final offline transition.
         if (this.shuttingDown) {
             console.debug('[DEBUG] Skipping heartbeat write — shutting down');
             return;
@@ -1628,7 +1631,7 @@ export class RemoteChannel {
                 'updateHeartbeat', REMOTE_HEARTBEAT_WRITE_TIMEOUT_MS,
                 (signal) => this.client!
                     .from('mcp_devices')
-                    .update({ last_seen: new Date().toISOString(), status: 'online' })
+                    .update({ last_seen: new Date().toISOString() })
                     .contains('capabilities', this.deviceSessionFence())
                     .eq('id', deviceId)
                     .abortSignal(signal),
@@ -1647,6 +1650,11 @@ export class RemoteChannel {
     }
 
     startHeartbeat(deviceId: string) {
+        if (this.heartbeatDeviceId === deviceId && this.connectionCheckInterval && this.heartbeatInterval) {
+            console.debug('[DEBUG] Heartbeat already active for device:', deviceId);
+            return;
+        }
+        this.stopHeartbeat();
         console.debug('[DEBUG] Starting heartbeat for device:', deviceId);
         this.heartbeatDeviceId = deviceId;
         this.connectionCheckInterval = setInterval(() => {
@@ -1688,14 +1696,8 @@ export class RemoteChannel {
         }
     }
 
-    async setOnlineStatus(deviceId: string, status: 'online' | 'offline') {
-        if (!this.client) return;
-
-        // Only log if status changed
-        if (this.lastDeviceStatus !== status) {
-            console.log(`🔌 Device marked as ${status}`);
-            this.lastDeviceStatus = status;
-        }
+    async setOnlineStatus(deviceId: string, status: 'online' | 'offline'): Promise<boolean> {
+        if (!this.client) return false;
 
         const { error } = await this.runDbQuery(
             `setOnlineStatus:${status}`, REMOTE_CONTROL_QUERY_TIMEOUT_MS,
@@ -1713,12 +1715,16 @@ export class RemoteChannel {
                 console.error('Failed to update device status:', error.message);
             }
             await captureRemote('remote_channel_status_update_error', { error, status });
-            return;
-        } else {
-            console.debug(`[DEBUG] Device status set to ${status}`);
+            return false;
         }
 
-        // console.log(status === 'online' ? `🔌 Device marked as ${status}` : `❌ Device marked as ${status}`);
+        // Local transition state follows confirmed storage, never an attempted PATCH.
+        if (this.lastDeviceStatus !== status) {
+            console.log(`🔌 Device marked as ${status}`);
+            this.lastDeviceStatus = status;
+        }
+        console.debug(`[DEBUG] Device status set to ${status}`);
+        return true;
     }
 
     async setOffline(deviceId: string | undefined) {

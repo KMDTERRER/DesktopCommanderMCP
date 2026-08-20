@@ -13,6 +13,7 @@ import { BinaryFileHandler } from './binary.js';
 import { ExcelFileHandler } from './excel.js';
 import { PdfFileHandler } from './pdf.js';
 import { DocxFileHandler } from './docx.js';
+import { detectUtf16BomFile } from './text-encoding.js';
 
 // Singleton instances of each handler
 let excelHandler: ExcelFileHandler | null = null;
@@ -95,6 +96,9 @@ export async function getFileHandler(filePath: string): Promise<FileHandler> {
     }
 
     // Check Binary (content-based, async via isBinaryFile)
+    // A UTF-16 BOM is authoritative text evidence. Check it before generic binary detection.
+    if (await detectUtf16BomFile(filePath)) return getTextHandler();
+
     if (await getBinaryHandler().canHandle(filePath)) {
         return getBinaryHandler();
     }

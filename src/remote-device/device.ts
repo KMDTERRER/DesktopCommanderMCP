@@ -8,6 +8,7 @@ import { RemoteCallMetrics, type RemoteMetricEvent, type RemoteMetricStage } fro
 import { createRemoteOutcomeIdentity, type RemoteResultDeliveryMode } from './remote-result-contract.js';
 import { DeviceAuthenticator } from './device-authenticator.js';
 import { DesktopCommanderIntegration } from './desktop-commander-integration.js';
+import { DeviceStatusArbiter } from './device-status-arbiter.js';
 import { fileURLToPath } from 'url';
 import os from 'os';
 import fs from 'fs/promises';
@@ -197,6 +198,10 @@ export class MCPDevice {
     private minimalCallActive = 0;
     private minimalCallWaiters: Array<() => void> = [];
     private desktop: DesktopCommanderIntegration;
+    private statusArbiter: DeviceStatusArbiter;
+    private recoveringLocalMcp = false;
+    private localRestartAttempt = 0;
+    private localMcpStableSince = 0;
     private resultOutbox: RemoteResultOutbox;
     private resultOutboxFlushPromise: Promise<void> | null = null;
     private resultDeliveries = new Map<string, Promise<void>>();
@@ -259,6 +264,12 @@ export class MCPDevice {
 
         // Initialize desktop integration. Construction itself must stay process-lifecycle neutral.
         this.desktop = new DesktopCommanderIntegration();
+        this.statusArbiter = new DeviceStatusArbiter({
+            write: async (status) => {
+                if (!this.deviceId || this.isShuttingDown) return false;
+                return await this.remoteChannel.setOnlineStatus(this.deviceId, status);
+            },
+        });
     }
 
     private scheduleRuntimeHeartbeat(): void {
@@ -347,6 +358,40 @@ export class MCPDevice {
         this.shutdownSignalHandlers = null;
     }
 
+    async handleLocalMcpLoss(reason: string): Promise<void> {
+        if (this.recoveringLocalMcp || this.isShuttingDown) return;
+        this.recoveringLocalMcp = true;
+        this.statusArbiter.report('child', false);
+        await this.statusArbiter.flush();
+        try {
+            const baseMs = Math.max(1, Number(process.env.DC_LOCAL_RESTART_BACKOFF_BASE_MS) || 2_000);
+            const stableMs = Math.max(1, Number(process.env.DC_LOCAL_RESTART_STABLE_UPTIME_MS) || 60_000);
+            const ceilingMs = 5 * 60_000;
+            if (!this.localMcpStableSince || Date.now() - this.localMcpStableSince >= stableMs) this.localRestartAttempt = 0;
+            while (!this.isShuttingDown) {
+                const delayMs = Math.min(baseMs * 2 ** Math.min(this.localRestartAttempt, 16), ceilingMs);
+                this.localRestartAttempt += 1;
+                await new Promise((resolve) => setTimeout(resolve, delayMs + Math.random() * delayMs * 0.15));
+                if (this.isShuttingDown) return;
+                try {
+                    await this.desktop.ensureReady();
+                    const capabilities = await this.desktop.listClientTools();
+                    if (this.deviceId) await this.remoteChannel.refreshDeviceCapabilities(capabilities);
+                    this.localMcpStableSince = Date.now();
+                    this.statusArbiter.report('child', true);
+                    await this.statusArbiter.flush();
+                    console.log(`♻️ Local Desktop Commander MCP restarted (attempt ${this.localRestartAttempt})`);
+                    return;
+                } catch (error: any) {
+                    console.error(`❌ Local MCP restart attempt ${this.localRestartAttempt} failed: ${error?.message}`);
+                    void captureRemote('remote_device_local_mcp_restart_failed', { error, reason, attempt: this.localRestartAttempt });
+                }
+            }
+        } finally {
+            this.recoveringLocalMcp = false;
+        }
+    }
+
     async start() {
         try {
             this.setupShutdownHandlers();
@@ -357,7 +402,11 @@ export class MCPDevice {
 
 
             // Initialize desktop integration
+            this.desktop.onDisconnect((reason) => { void this.handleLocalMcpLoss(reason); });
+            this.remoteChannel.setChannelHealthReporter((ready) => this.statusArbiter.report('channel', ready));
             await this.desktop.initialize();
+            this.localMcpStableSince = Date.now();
+            this.statusArbiter.report('child', true);
             if (this.runtimeConfig) await this.runtimeConfig.initialize();
 
             console.log(`⏳ Connecting to Remote MCP ${this.baseServerUrl}`);
@@ -424,6 +473,7 @@ export class MCPDevice {
                 deviceName,
                 (payload: any) => this.handleNewToolCall(payload)
             );
+            await this.statusArbiter.sync();
             if (this.minimalLiveTest && this.runtimeConfig) {
                 await this.remoteChannel.setMinimalInboundMode(this.runtimeConfig.current().inbound);
             }

@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -15,6 +17,18 @@ function textOf(result) {
   return (result?.content ?? []).map((item) => item?.type === 'text' ? item.text ?? '' : '').join('\n');
 }
 
+function utf16Le(text) {
+  return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, 'utf16le')]);
+}
+
+function utf16Be(text) {
+  const body = Buffer.from(text, 'utf16le');
+  for (let i = 0; i + 1 < body.length; i += 2) {
+    const byte = body[i]; body[i] = body[i + 1]; body[i + 1] = byte;
+  }
+  return Buffer.concat([Buffer.from([0xfe, 0xff]), body]);
+}
+
 async function check(name, fn) {
   try { await fn(); console.log(`PASS ${name}`); }
   catch (error) { failures += 1; console.error(`FAIL ${name}: ${error?.stack || error}`); }
@@ -22,6 +36,22 @@ async function check(name, fn) {
 
 async function call(client, name, args, timeout = 15_000) {
   return client.callTool({ name, arguments: args }, undefined, { timeout });
+}
+
+function sha256Text(text) {
+  return `sha256:${crypto.createHash('sha256').update(text, 'utf8').digest('hex')}`;
+}
+
+async function compatMutation(client, tool, payload, conversationId, timeout = 35_000) {
+  return client.callTool({
+    name: 'write_file',
+    arguments: {
+      path: `mcp://desktop-accelerators/${tool}?timeout_ms=30000`,
+      content: JSON.stringify(payload),
+      mode: 'rewrite',
+    },
+    _meta: { conversation_id: conversationId },
+  }, undefined, { timeout });
 }
 async function main() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dc-write-e2e-'));
@@ -52,6 +82,25 @@ async function main() {
       assert.notEqual(read.isError, true, textOf(read));
       assert.match(textOf(read), /alpha/);
       assert.equal(await fs.readFile(base, 'utf8'), 'alpha\n');
+    });
+
+    await check('read_file decodes UTF-16 BOM files and text edits use the same decoder', async () => {
+      for (const [label, encode] of [['le', utf16Le], ['be', utf16Be]]) {
+        const file = path.join(root, `utf16-${label}.txt`);
+        await fs.writeFile(file, encode('ALPHA\r\nБЕТА\r\n'));
+        const read = await call(client, 'read_file', { path: file, offset: 0, length: 10 });
+        assert.notEqual(read.isError, true, textOf(read));
+        assert.match(textOf(read), /ALPHA/);
+        assert.match(textOf(read), /БЕТА/);
+        assert(!textOf(read).includes('\u0000'), `UTF-16 ${label} leaked NUL bytes`);
+        const edit = await call(client, 'edit_block', {
+          file_path: file, old_string: 'ALPHA', new_string: 'OMEGA', expected_replacements: 1,
+        });
+        assert.notEqual(edit.isError, true, textOf(edit));
+        const reread = await call(client, 'read_file', { path: file, offset: 0, length: 10 });
+        assert.match(textOf(reread), /OMEGA/);
+        assert.match(textOf(reread), /БЕТА/);
+      }
     });
 
     await check('write_file append is serialized and lossless', async () => {
@@ -150,6 +199,117 @@ async function main() {
       });
       assert.equal(fractional.isError, true, `fractional replacement count accepted: ${textOf(fractional)}`);
       assert.equal(await fs.readFile(editFile, 'utf8'), 'X');
+    });
+
+    await check('mcp edit_file rebases sibling patches only within the same conversation lineage', async () => {
+      const editFile = path.join(root, 'mcp-edit-lineage.txt');
+      const base = 'LEFT_0\nMIDDLE\nRIGHT_0\n';
+      const baseHash = sha256Text(base);
+      await fs.writeFile(editFile, base, 'utf8');
+      const sibling = (oldText, newText, conversationId) => compatMutation(client, 'edit_file', {
+        path: editFile, expectedHash: baseHash, dryRun: false,
+        edits: [{ oldText, newText, expectedReplacements: 1 }],
+      }, conversationId);
+      const sameSession = await Promise.all([
+        sibling('LEFT_0', 'LEFT_1', 'edit-lineage-a'),
+        sibling('RIGHT_0', 'RIGHT_1', 'edit-lineage-a'),
+      ]);
+      assert(sameSession.every((result) => result.isError !== true), sameSession.map(textOf).join('\n'));
+      assert.equal(await fs.readFile(editFile, 'utf8'), 'LEFT_1\nMIDDLE\nRIGHT_1\n');
+      const outcomes = sameSession.map((result) => JSON.parse(textOf(result)));
+      assert(outcomes.some((result) => result.rebasedFromHash === baseHash), 'sibling edit did not report hash-lineage rebase');
+
+      const burstFile = path.join(root, 'mcp-edit-lineage-burst.txt');
+      const burstTokens = Array.from({ length: 8 }, (_, index) => `TOKEN_${index}_0`);
+      const burstBase = `${burstTokens.join('\n')}\n`;
+      const burstHash = sha256Text(burstBase);
+      await fs.writeFile(burstFile, burstBase, 'utf8');
+      const burst = await Promise.all(burstTokens.map((token, index) => compatMutation(client, 'edit_file', {
+        path: burstFile, expectedHash: burstHash, dryRun: false,
+        edits: [{ oldText: token, newText: `TOKEN_${index}_1`, expectedReplacements: 1 }],
+      }, 'edit-lineage-burst')));
+      assert(burst.every((result) => result.isError !== true), burst.map(textOf).join('\n'));
+      assert.equal(await fs.readFile(burstFile, 'utf8'),
+        `${Array.from({ length: 8 }, (_, index) => `TOKEN_${index}_1`).join('\n')}\n`);
+      assert(burst.map((result) => JSON.parse(textOf(result))).filter((result) => result.rebasedFromHash === burstHash).length >= 7,
+        'burst siblings did not chain through one base revision');
+
+      const isolatedFile = path.join(root, 'mcp-edit-lineage-isolated.txt');
+      const isolatedBase = 'A_0\nB_0\n';
+      const isolatedHash = sha256Text(isolatedBase);
+      await fs.writeFile(isolatedFile, isolatedBase, 'utf8');
+      const first = await compatMutation(client, 'edit_file', {
+        path: isolatedFile, expectedHash: isolatedHash, dryRun: false,
+        edits: [{ oldText: 'A_0', newText: 'A_1', expectedReplacements: 1 }],
+      }, 'edit-lineage-owner');
+      assert.notEqual(first.isError, true, textOf(first));
+      const foreign = await compatMutation(client, 'edit_file', {
+        path: isolatedFile, expectedHash: isolatedHash, dryRun: false,
+        edits: [{ oldText: 'B_0', newText: 'B_1', expectedReplacements: 1 }],
+      }, 'edit-lineage-other');
+      assert.equal(foreign.isError, true, `foreign stale hash was rebased: ${textOf(foreign)}`);
+      assert.match(textOf(foreign), /SHA-256 fence failed/);
+      assert.equal(await fs.readFile(isolatedFile, 'utf8'), 'A_1\nB_0\n');
+
+      const externalFile = path.join(root, 'mcp-edit-lineage-external.txt');
+      const externalBase = 'X_0\nY_0\n';
+      const externalHash = sha256Text(externalBase);
+      await fs.writeFile(externalFile, externalBase, 'utf8');
+      const owned = await compatMutation(client, 'edit_file', {
+        path: externalFile, expectedHash: externalHash, dryRun: false,
+        edits: [{ oldText: 'X_0', newText: 'X_1', expectedReplacements: 1 }],
+      }, 'edit-lineage-external');
+      assert.notEqual(owned.isError, true, textOf(owned));
+      await fs.writeFile(externalFile, 'X_1\nY_EXTERNAL\n', 'utf8');
+      const staleAfterExternalWrite = await compatMutation(client, 'edit_file', {
+        path: externalFile, expectedHash: externalHash, dryRun: false,
+        edits: [{ oldText: 'Y_EXTERNAL', newText: 'Y_1', expectedReplacements: 1 }],
+      }, 'edit-lineage-external');
+      assert.equal(staleAfterExternalWrite.isError, true,
+        `external writer was absorbed into mutation lineage: ${textOf(staleAfterExternalWrite)}`);
+      assert.match(textOf(staleAfterExternalWrite), /SHA-256 fence failed/);
+      assert.equal(await fs.readFile(externalFile, 'utf8'), 'X_1\nY_EXTERNAL\n');
+    });
+
+    await check('mcp apply_patch rebases disjoint sibling patches from one base revision', async () => {
+      execFileSync('git', ['-C', root, 'init', '-q'], { stdio: 'ignore' });
+      const patchFile = path.join(root, 'patch-lineage.txt');
+      const base = 'left\nmiddle\nright\n';
+      const baseHash = sha256Text(base);
+      await fs.writeFile(patchFile, base, 'utf8');
+      const leftPatch = [
+        'diff --git a/patch-lineage.txt b/patch-lineage.txt',
+        '--- a/patch-lineage.txt',
+        '+++ b/patch-lineage.txt',
+        '@@ -1,2 +1,2 @@',
+        '-left',
+        '+LEFT',
+        ' middle',
+        '',
+      ].join('\n');
+      const rightPatch = [
+        'diff --git a/patch-lineage.txt b/patch-lineage.txt',
+        '--- a/patch-lineage.txt',
+        '+++ b/patch-lineage.txt',
+        '@@ -2,2 +2,2 @@',
+        ' middle',
+        '-right',
+        '+RIGHT',
+        '',
+      ].join('\n');
+      const sibling = (patchText) => compatMutation(client, 'apply_patch', {
+        root, patch: patchText, expectedFiles: ['patch-lineage.txt'],
+        expectedHashes: { 'patch-lineage.txt': baseHash }, dryRun: false,
+      }, 'patch-lineage-a');
+      const results = await Promise.all([
+        sibling(leftPatch),
+        sibling(rightPatch),
+      ]);
+      assert(results.every((result) => result.isError !== true), results.map(textOf).join('\n'));
+      assert.equal((await fs.readFile(patchFile, 'utf8')).replace(/\r\n/g, '\n'), 'LEFT\nmiddle\nRIGHT\n');
+      const outcomes = results.map((result) => JSON.parse(textOf(result)));
+      assert(outcomes.some((result) => result.rebasedExpectedHashes?.['patch-lineage.txt'] === baseHash),
+        'sibling patch did not report expected-hash rebase');
     });
 
     await check('parallel XLSX range edits survive full MCP round trip', async () => {

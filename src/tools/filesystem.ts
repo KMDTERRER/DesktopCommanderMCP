@@ -19,6 +19,7 @@ import { getAllowedDirs, PATH_VALIDATION_TIMEOUT_MS, validatePathAuthority } fro
 import { pathContainsManagedTrashSegment } from '../utils/trash-contract.js';
 import { renameReplacingWithRetry } from '../utils/atomic-rename.js';
 import { readFileBounded } from '../utils/bounded-file-read.js';
+import { decodeTextBuffer } from '../utils/files/text-encoding.js';
 import {
     AggregateByteBudget,
     MAX_IMAGE_INPUT_BYTES,
@@ -474,7 +475,7 @@ export async function readFileInternal(filePath: string, offset: number = 0, len
         READ_OPERATION_TIMEOUT_MS,
         `Internal read for ${filePath}`
     );
-    const content = contentBuffer.toString('utf8');
+    const content = decodeTextBuffer(contentBuffer);
 
     // If we need to apply offset/length, do it while preserving line endings
     if (offset === 0 && length >= Number.MAX_SAFE_INTEGER) {

@@ -443,6 +443,11 @@ async function handle(message) {
         name: 'echo_two',
         description: 'Second paginated tool.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false }
+      }, {
+        name: 'search_for_pattern',
+        description: 'Fake Serena pattern discovery.',
+        inputSchema: { type: 'object', properties: { substring_pattern: { type: 'string' } }, required: ['substring_pattern'], additionalProperties: false },
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
       }] });
       return;
     }
@@ -531,7 +536,7 @@ process.stdin.on('end', () => process.exit(0));
     await fs.writeFile(childScript, `
 import assert from 'node:assert';
 import fs from 'node:fs/promises';
-import { listExternalMcpTools, callExternalMcpTool, readExternalMcpCompatUri, callSerenaWorkspaceTool, callSessionSerenaTool, callSessionSerenaReadBatch, closeExternalMcpRuntime } from ${JSON.stringify(externalMcpUrl)};
+import { listExternalMcpTools, callExternalMcpTool, callExternalMcpCompatUri, readExternalMcpCompatUri, callSerenaWorkspaceTool, callSessionSerenaTool, callSessionSerenaReadBatch, closeExternalMcpRuntime } from ${JSON.stringify(externalMcpUrl)};
 const configPath = process.env.DESKTOP_COMMANDER_MCP_CONFIG;
 const fakeServer = process.env.DC_FAKE_SERVER;
 const configFor = (name) => ({ mcpServers: {
@@ -598,11 +603,21 @@ const afterListRace = JSON.parse((await listExternalMcpTools({ server: 'fake-a',
 const racedEcho = afterListRace.tools.find((tool) => tool.name === 'echo');
 assert(racedEcho?.description?.includes('generation=1'), 'tools/list_changed during discovery allowed a stale cache generation');
 
+const fixedSerenaTools = JSON.parse((await listExternalMcpTools({ server: 'serena-test', timeout_ms: 5000 })).content[0].text);
+assert(!fixedSerenaTools.tools.some((tool) => tool.name === 'search_for_pattern'), 'fixed Serena template unexpectedly gained session-only search_for_pattern');
 const cacheProbePath = process.env.DC_SERENA_ROOT + '/cache-probe.ts';
 await fs.writeFile(cacheProbePath, 'export const generation = 1;\\n', 'utf8');
 const workspaceSession = 'session_test_123';
 const boundSerena = await callSerenaWorkspaceTool({ operation: 'bind', root: process.env.DC_SERENA_ROOT, session: workspaceSession, templateServer: 'serena-test' }, 5000);
 assert.equal(boundSerena.workspaceSession, workspaceSession);
+const patternRead = JSON.parse((await callExternalMcpCompatUri(
+  'mcp://desktop-context/serena_call?timeout_ms=5000',
+  JSON.stringify({ tool: 'search_for_pattern', arguments: { substring_pattern: 'generation' }, session: workspaceSession }),
+)).content[0].text);
+assert.equal(patternRead.status, 'ready');
+assert.equal(patternRead.result.structuredContent.echoed.substring_pattern, 'generation');
+const sessionSerenaTools = JSON.parse((await listExternalMcpTools({ server: boundSerena.server, timeout_ms: 5000 })).content[0].text);
+assert(sessionSerenaTools.tools.some((tool) => tool.name === 'search_for_pattern'), 'warmed session Serena did not expose search_for_pattern through mcp://');
 const localReadArgs = { relative_path: 'cache-probe.ts', value: 'session-read' };
 const originalSerenaCacheReadFile = fs.readFile;
 let cacheProbeReads = 0;

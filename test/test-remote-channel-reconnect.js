@@ -177,6 +177,9 @@ function makeRemoteChannel() {
     rc.sleptMs.push(ms);
     return Promise.resolve();
   };
+  rc.degradedStarts = 0;
+  rc.startDegradedCallPolling = () => { rc.degradedStarts++; };
+  rc.stopDegradedCallPolling = () => {};
   return { rc, client };
 }
 
@@ -285,28 +288,25 @@ async function main() {
     const { rc, client } = makeRemoteChannel();
     await withQuietLogs(async () => {
       await goHalfOpen(rc, client);
-      client.realtime.disconnect(); // simulate the fix: force a fresh socket
-      const recovered = await driveHealthChecks(rc, 6);
-      assert.strictEqual(recovered, true, 'expected recovery after socket teardown');
+      client.realtime.disconnect(); // explicit transport-wide repair by the owner
+      await rc.recreateChannel();
+      assert.strictEqual(rc.channel?.state, 'joined', 'expected recovery after explicit socket teardown');
     });
     assert.strictEqual(client.realtime.socketDead, false);
   });
 
-  // After the socket goes half-open, driving the health-check / recreate path must
-  // end in a re-established subscription rather than retrying on the dead socket.
-  await test('channel recovers after the socket goes half-open', async () => {
+  // realtime-js owns errored-channel rejoin. Our watchdog must not add a second
+  // destructive recovery owner while the shared socket still reports open.
+  await test('errored half-open channel does not trigger a second recovery owner', async () => {
     const { rc, client } = makeRemoteChannel();
-    const recovered = await withQuietLogs(async () => goHalfOpenThenDrive(rc, client));
-
-    const reusedSocket = client.realtime.rebuilds === 0;
-    const readyState = client.realtime.conn.readyState;
-    assert.strictEqual(
-      recovered,
-      true,
-      `channel did not recover after the socket went half-open.\n` +
-        `     attempts(recreate)=${rc.reconnectAttempt} statuses=[${client.statusLog.join(', ')}]\n` +
-        `     socketReadyState=${readyState} reused=${reusedSocket} rebuilds=${client.realtime.rebuilds}`
-    );
+    await withQuietLogs(async () => {
+      await goHalfOpen(rc, client);
+      for (let i = 0; i < 6; i++) { rc.checkConnectionHealth(); await flush(); }
+    });
+    assert.strictEqual(rc.reconnectAttempt, 0, 'watchdog must leave errored recovery to realtime-js');
+    assert.strictEqual(client.realtime.rebuilds, 0, 'watchdog must not reset the shared socket');
+    assert.strictEqual(rc.channel?.state, 'errored');
+    assert(rc.degradedStarts > 0, 'errored channel must activate the degraded fallback');
   });
 
   // 'joining' is transitional — the health check must treat it as healthy and NOT
@@ -326,26 +326,23 @@ async function main() {
     });
   });
 
-  // REGRESSION REPRO (open bug 2026-06-27): a half-open socket can leave the channel
-  // parked in 'joining' instead of 'errored'. The previous test proves single-tick
-  // 'joining' must NOT recreate; THIS test proves 'joining' must not be healthy
-  // *forever* — if it overstays while the socket reads OPEN(1) (the half-open tell),
-  // the guard must force a recreate (the same path that recovers the 'errored' case),
-  // or the device wedges offline until restart. EXPECTED TO FAIL until the
-  // time-bounded-'joining' fix lands in checkConnectionHealth().
-  await test('recovers when a half-open socket leaves the channel stuck in joining', async () => {
+  // A channel stuck in joining is bounded, but the bounded repair owns only the
+  // private channel. It must not sacrifice a joined legacy channel or reset the
+  // shared socket merely to recover Broadcast.
+  await test('stuck joining triggers one private-only repair while legacy remains intact', async () => {
     const { rc, client } = makeRemoteChannel();
-    const recovered = await withQuietLogs(async () => {
+    const legacy = client.channel('legacy');
+    legacy.state = 'joined';
+    rc.legacyChannel = legacy;
+    await withQuietLogs(async () => {
       await goHalfOpenStuckJoining(rc, client);
-      return driveHealthChecksStuckJoining(rc, 8); // ~80s simulated; a 30s bound fires by tick ~4
+      await driveHealthChecksStuckJoining(rc, 10); // checks reach 80s; 75s bound fires once
     });
-    assert.strictEqual(
-      recovered,
-      true,
-      `channel wedged in 'joining' on a half-open socket and never recovered.\n` +
-        `     attempts(recreate)=${rc.reconnectAttempt} rebuilds=${client.realtime.rebuilds}\n` +
-        `     channelState=${rc.channel && rc.channel.state} socketReadyState=${client.realtime.conn.readyState}`
-    );
+    assert.strictEqual(rc.reconnectAttempt, 1, `expected one bounded private repair, got ${rc.reconnectAttempt}`);
+    assert.strictEqual(client.realtime.rebuilds, 0, 'private repair must not reset the shared socket while legacy is retained');
+    assert.strictEqual(rc.legacyChannel, legacy, 'private repair replaced the legacy fallback');
+    assert.strictEqual(legacy.state, 'joined', 'private repair closed the legacy fallback');
+    assert(rc.degradedStarts > 0, 'stuck joining must keep degraded fallback active');
   });
 
   // The jittered backoff exists so a fleet-wide event (server deploy, Supabase

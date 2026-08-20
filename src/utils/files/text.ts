@@ -17,6 +17,7 @@ import fs from "fs/promises";
 import path from "path";
 import { createReadStream } from 'fs';
 import { createInterface } from 'readline';
+import { createUtf16DecodeTransform, detectUtf16BomFile, type Utf16BomEncoding } from './text-encoding.js';
 import {
     MAX_TEXT_LINE_BYTES,
     MAX_TEXT_READ_OUTPUT_BYTES,
@@ -118,6 +119,12 @@ export class TextFileHandler implements FileHandler {
         const maxOutputBytes = normalizeOutputBudget(options?.maxOutputBytes, MAX_TEXT_READ_OUTPUT_BYTES);
 
         // Binary detection is done at factory level - just read as text
+        const utf16Encoding = await detectUtf16BomFile(filePath);
+        if (utf16Encoding) {
+            return this.readUtf16Sequential(
+                filePath, utf16Encoding, offset, length, 'text/plain', includeStatusMessage, options?.signal, maxOutputBytes
+            );
+        }
         return this.readFileWithSmartPositioning(
             filePath, offset, length, 'text/plain', includeStatusMessage, options?.signal, maxOutputBytes
         );
@@ -265,6 +272,59 @@ export class TextFileHandler implements FileHandler {
         }
 
         return lines;
+    }
+
+    private async readUtf16Sequential(
+        filePath: string, encoding: Utf16BomEncoding, offset: number, length: number,
+        mimeType: string, includeStatusMessage: boolean, signal?: AbortSignal,
+        maxOutputBytes: number = MAX_TEXT_READ_OUTPUT_BYTES,
+    ): Promise<FileResult> {
+        const raw = createReadStream(filePath, { start: 2, signal });
+        const decoded = raw.pipe(createUtf16DecodeTransform(encoding));
+        const rl = createInterface({ input: decoded, crlfDelay: Infinity });
+        const requestedTail = offset < 0 ? Math.abs(offset) : 0;
+        const tail: string[] = requestedTail > 0 ? new Array(requestedTail) : [];
+        const result: string[] = [];
+        let tailIndex = 0;
+        let totalLines = 0;
+        let resultBytes = 0;
+        try {
+            for await (const line of rl) {
+                const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
+                const lineLimit = Math.min(MAX_TEXT_LINE_BYTES, maxOutputBytes);
+                if (lineBytes > lineLimit) throw resourceLimitError('Text line', lineLimit, lineBytes);
+                if (offset < 0) {
+                    tail[tailIndex] = line;
+                    tailIndex = (tailIndex + 1) % requestedTail;
+                } else if (totalLines >= offset && result.length < length) {
+                    resultBytes = addLineResultBytes(resultBytes, line, maxOutputBytes);
+                    result.push(line);
+                }
+                totalLines++;
+                if (offset >= 0 && result.length >= length) break;
+            }
+        } finally {
+            rl.close();
+            decoded.destroy();
+            raw.destroy();
+        }
+
+        let selected = result;
+        if (offset < 0) {
+            const count = Math.min(totalLines, requestedTail);
+            selected = totalLines >= requestedTail
+                ? [...tail.slice(tailIndex), ...tail.slice(0, tailIndex)].filter((line) => line !== undefined)
+                : tail.slice(0, count);
+            resultBytes = 0;
+            for (const line of selected) resultBytes = addLineResultBytes(resultBytes, line, maxOutputBytes);
+        }
+        const status = offset < 0
+            ? this.generateEnhancedStatusMessage(selected.length, offset, totalLines, true)
+            : this.generateEnhancedStatusMessage(selected.length, offset, undefined, false);
+        return {
+            content: includeStatusMessage ? `${status}\n\n${selected.join('\n')}` : selected.join('\n'),
+            mimeType, metadata: {},
+        };
     }
 
     /**

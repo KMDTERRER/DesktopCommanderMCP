@@ -5,6 +5,7 @@ import path from 'path';
 
 const LOCK_ROOT = path.join(os.tmpdir(), 'desktop-commander-mutation-locks-v1');
 const LOCK_POLL_MS = 25;
+const WINDOWS_OPEN_CONTENTION_RETRY_MAX = 20;
 const UNKNOWN_OWNER_GRACE_MS = 5_000;
 const MAX_LOCK_METADATA_BYTES = 4 * 1024;
 
@@ -187,11 +188,13 @@ async function acquireOne(identity: string, deadlineAt: number, allResources: st
   await fs.mkdir(LOCK_ROOT, { recursive: true });
   const lockPath = lockPathFor(identity);
   const token = crypto.randomUUID();
+  let windowsOpenContentionRetries = 0;
 
   while (true) {
     remaining(deadlineAt, allResources);
     try {
       const handle = await fs.open(lockPath, 'wx', 0o600);
+      windowsOpenContentionRetries = 0;
       try {
         await handle.writeFile(JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }), 'utf8');
         await handle.sync();
@@ -211,7 +214,16 @@ async function acquireOne(identity: string, deadlineAt: number, allResources: st
         throw error;
       }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw error;
+      const code = (error as NodeJS.ErrnoException)?.code ?? '';
+      if (code !== 'EEXIST') {
+        const windowsDeleteRace = process.platform === 'win32'
+          && ['EACCES', 'EPERM', 'EBUSY'].includes(code)
+          && windowsOpenContentionRetries < WINDOWS_OPEN_CONTENTION_RETRY_MAX;
+        if (!windowsDeleteRace) throw error;
+        windowsOpenContentionRetries += 1;
+        await sleep(Math.min(LOCK_POLL_MS, remaining(deadlineAt, allResources)));
+        continue;
+      }
     }
 
     if (await reapDeadOwner(lockPath)) continue;

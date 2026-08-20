@@ -25,7 +25,10 @@ const TRASH_MAX_ENTRIES = 1000;
 const TRASH_MAX_LIST_CHILDREN = 500;
 const TRASH_PURGE_MAX_NODES = 100_000;
 const TRASH_PURGE_MAX_DEPTH = 128;
+const TRASH_MAX_WORKSPACES = 128;
+const TRASH_MAX_SESSION_BINDINGS = 256;
 const TRASH_WORKSPACE_REGISTRY_KEY = 'trashWorkspaceRootsV1';
+const TRASH_GITIGNORE_CONTENT = '*\n';
 
 type TrashKind = 'file' | 'directory' | 'symlink' | 'other';
 type TrashManifest = {
@@ -80,6 +83,16 @@ function pathIdentity(value: string): string {
 
 function samePath(left: string, right: string): boolean {
   return pathIdentity(left) === pathIdentity(right);
+}
+
+function setBoundedMap(map: Map<string, string>, key: string, value: string, maximum: number): void {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > maximum) {
+    const oldest = map.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
 }
 
 function isInside(root: string, candidate: string): boolean {
@@ -148,6 +161,32 @@ async function readJsonBounded(filePath: string, deadlineAt: number): Promise<un
     throw new Error(`Managed trash metadata is invalid JSON: ${filePath}`);
   }
 }
+
+async function ensureTrashGitIgnore(storage: TrashStorage, deadlineAt: number): Promise<void> {
+  const ignorePath = path.join(storage.root, '.gitignore');
+  try {
+    await runWithAbortableTimeout(
+      (signal) => fs.writeFile(ignorePath, TRASH_GITIGNORE_CONTENT, {
+        encoding: 'utf8', flag: 'wx', mode: 0o600, flush: true, signal,
+      }),
+      remaining(deadlineAt, 'Create managed trash Git exclude'), 'Create managed trash Git exclude',
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw error;
+  }
+  const stats = await lstatBounded(ignorePath, deadlineAt, 'Stat managed trash Git exclude');
+  if (!stats.isFile() || stats.isSymbolicLink()) {
+    throw new Error('Managed trash .gitignore must be a real file.');
+  }
+  const bytes = await runWithAbortableTimeout(
+    (signal) => readFileBounded(ignorePath, 128, signal, 'managed trash Git exclude'),
+    remaining(deadlineAt, 'Read managed trash Git exclude'), 'Read managed trash Git exclude',
+  );
+  if (bytes.toString('utf8') !== TRASH_GITIGNORE_CONTENT) {
+    throw new Error('Managed trash .gitignore does not match the owner-controlled ignore contract.');
+  }
+}
+
 async function gitWorkspaceFrom(directory: string, deadlineAt: number): Promise<string> {
   const executable = process.platform === 'win32' ? 'git.exe' : 'git';
   const result = await runBoundedSubprocess(
@@ -274,12 +313,16 @@ async function ensureTrashStorage(workspaceRoot: string, deadlineAt: number, cre
   if (!marker || typeof marker !== 'object' || Array.isArray(marker)) {
     throw new Error('Managed trash marker has an invalid shape.');
   }
-  if (!(await ensurePlainDirectory(storage.entries, workspaceRoot, deadlineAt, create))) return null;
   const markerRecord = marker as Record<string, unknown>;
   if (markerRecord.version !== 1 || typeof markerRecord.workspaceRoot !== 'string'
       || !samePath(markerRecord.workspaceRoot, workspaceRoot)) {
     throw new Error('Managed trash marker does not match this workspace.');
   }
+  // Keep the manager-owned store invisible to Git without modifying tracked
+  // .gitignore files or repository metadata. The file lives inside the already
+  // reserved storage root and ignores that root's contents, including itself.
+  await ensureTrashGitIgnore(storage, deadlineAt);
+  if (!(await ensurePlainDirectory(storage.entries, workspaceRoot, deadlineAt, create))) return null;
   return storage;
 }
 
@@ -414,10 +457,10 @@ export class TrashManager {
     try { configured = await configManager.getValue(TRASH_WORKSPACE_REGISTRY_KEY); }
     catch { configured = undefined; }
     const roots = Array.isArray(configured) ? configured.filter((item): item is string => typeof item === 'string') : [];
-    for (const raw of roots.slice(0, 128)) {
+    for (const raw of roots.slice(-TRASH_MAX_WORKSPACES)) {
       try {
         const root = await validateWorkspaceRoot(raw, Date.now() + 10_000);
-        this.workspaces.set(pathIdentity(root), root);
+        setBoundedMap(this.workspaces, pathIdentity(root), root, TRASH_MAX_WORKSPACES);
       } catch {
         // Stale or no-longer-authorized roots are ignored fail-closed.
       }
@@ -427,16 +470,16 @@ export class TrashManager {
   }
 
   private registerWorkspace(root: string): void {
-    this.workspaces.set(pathIdentity(root), root);
+    setBoundedMap(this.workspaces, pathIdentity(root), root, TRASH_MAX_WORKSPACES);
     const key = sessionKey();
-    if (key) this.sessionWorkspaces.set(key, root);
+    if (key) setBoundedMap(this.sessionWorkspaces, key, root, TRASH_MAX_SESSION_BINDINGS);
     void this.persistWorkspaceRegistry();
   }
 
   private async persistWorkspaceRegistry(): Promise<void> {
     try {
       await configManager.setValueNonBlocking(
-        TRASH_WORKSPACE_REGISTRY_KEY, [...this.workspaces.values()].slice(0, 128),
+        TRASH_WORKSPACE_REGISTRY_KEY, [...this.workspaces.values()],
       );
     } catch {
       // Persistence is recovery metadata; it must never gate a trash operation.

@@ -151,9 +151,39 @@ export class DesktopCommanderIntegration {
     private mcpClient: Client | null = null;
     private mcpTransport: StdioClientTransport | null = null;
     private isReady: boolean = false;
+    private isShuttingDown = false;
+    private disconnectHandler: ((reason: string) => void) | null = null;
+    private reinitPromise: Promise<void> | null = null;
+    private transportGeneration = 0;
     private toolsChangedHandler: (() => void | Promise<void>) | null = null;
 
+    get ready(): boolean { return this.isReady && this.mcpClient !== null && this.mcpTransport !== null; }
+
+    onDisconnect(handler: ((reason: string) => void) | null): void { this.disconnectHandler = handler; }
+
+    private handleLocalDisconnect(reason: string, generation: number, transport: StdioClientTransport): void {
+        if (this.isShuttingDown || generation !== this.transportGeneration || this.mcpTransport !== transport) return;
+        const wasReady = this.isReady;
+        this.isReady = false;
+        this.mcpClient = null;
+        this.mcpTransport = null;
+        if (!wasReady) return;
+        console.error(` - ❌ Local Desktop Commander MCP disconnected (${reason})`);
+        void captureRemote('desktop_integration_local_disconnected', { reason });
+        this.disconnectHandler?.(reason);
+    }
+
+    async ensureReady(): Promise<void> {
+        if (this.ready) return;
+        if (this.isShuttingDown) throw new Error('Desktop Commander integration is shutting down');
+        if (!this.reinitPromise) {
+            this.reinitPromise = this.initialize().finally(() => { this.reinitPromise = null; });
+        }
+        await this.reinitPromise;
+    }
+
     async initialize() {
+        if (this.ready) return;
         console.debug('[DEBUG] DesktopCommanderIntegration.initialize() called');
         const config = await this.resolveMcpConfig();
 
@@ -171,10 +201,16 @@ export class DesktopCommanderIntegration {
             // environment. Forward only the small set of Desktop Commander
             // runtime controls that the local child actually consumes; never
             // leak the foreground process environment wholesale.
-            this.mcpTransport = new StdioClientTransport({
+            const transport = new StdioClientTransport({
                 ...config,
                 env: buildLocalMcpChildEnvironment(config.env)
             });
+            const generation = ++this.transportGeneration;
+            this.mcpTransport = transport;
+            // Install before connect(): the MCP SDK chains handlers already present
+            // when it attaches its own close/error handling for in-flight calls.
+            transport.onclose = () => this.handleLocalDisconnect('stdio transport closed', generation, transport);
+            transport.onerror = (error: Error) => this.handleLocalDisconnect(`stdio transport error: ${error?.message ?? String(error)}`, generation, transport);
 
             // Create MCP client
             console.debug('[DEBUG] Creating MCP Client');
@@ -202,7 +238,7 @@ export class DesktopCommanderIntegration {
             // starts but never speaks MCP, Remote startup must still recover.
             console.debug('[DEBUG] Connecting MCP client to transport');
             await withDeadline(
-                this.mcpClient.connect(this.mcpTransport),
+                this.mcpClient.connect(transport),
                 LOCAL_MCP_CONNECT_TIMEOUT_MS,
                 'Local MCP connect'
             );
@@ -303,17 +339,16 @@ export class DesktopCommanderIntegration {
     }
 
     async callClientTool(toolName: string, args: any, metadata?: any) {
-        if (!this.isReady || !this.mcpClient) {
-            console.debug('[DEBUG] callClientTool() failed - not ready or no client');
-            throw new Error('DesktopIntegration not initialized');
-        }
+        await this.ensureReady();
+        const client = this.mcpClient;
+        if (!client) throw new Error('Local Desktop Commander MCP connection was lost while dispatching');
 
         // Proxy other tools to MCP server
         try {
             const toolArguments = normalizeMcpArgumentsObject(args, `Remote MCP arguments for ${toolName}`);
             console.debug('[DEBUG] Calling MCP tool:', toolName, 'args:', JSON.stringify(toolArguments).substring(0, 100));
             const requestTimeoutMs = localMcpRequestTimeoutMs(toolName, toolArguments);
-            const result = await this.mcpClient.callTool({
+            const result = await client.callTool({
                 name: toolName,
                 arguments: toolArguments,
                 _meta: { remote: true, ...metadata || {} }
@@ -357,6 +392,7 @@ export class DesktopCommanderIntegration {
 
     async shutdown() {
         console.debug('[DEBUG] DesktopCommanderIntegration.shutdown() called');
+        this.isShuttingDown = true;
         const localServerPid = this.mcpTransport?.pid ?? null;
         let clientCloseError: any = null;
         let transportCloseError: any = null;

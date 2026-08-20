@@ -25,6 +25,7 @@ import { renameReplacingWithRetry } from '../utils/atomic-rename.js';
 import { findWindowsFileLockers } from '../utils/windows-file-locks.js';
 import { acquireMutationResourceLocks } from '../utils/mutation-resource-lock.js';
 import { acquireCoordinatedMutationOwnership } from '../utils/resource-lease-owner.js';
+import { getToolCallSessionIdentity } from '../utils/client-context.js';
 import { readFileBounded } from '../utils/bounded-file-read.js';
 import { MANAGED_TRASH_DIRECTORY_NAME, isManagedTrashRelativePath } from '../utils/trash-contract.js';
 import { runBoundedSubprocess, type BoundedSubprocessResult } from '../utils/bounded-subprocess.js';
@@ -175,6 +176,68 @@ async function sha256File(filePath: string, deadlineAt: number): Promise<string>
 
 function sha256Text(content: string): string {
   return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
+}
+
+type MutationHashLineage = { hashes: string[]; touchedAt: number };
+const MUTATION_HASH_LINEAGE_TTL_MS = 5 * 60 * 1000;
+const MUTATION_HASH_LINEAGE_MAX_ENTRIES = 512;
+const MUTATION_HASH_LINEAGE_MAX_HASHES = 128;
+const mutationHashLineages = new Map<string, MutationHashLineage>();
+
+function mutationHashLineageKey(filePath: string): string | undefined {
+  const session = getToolCallSessionIdentity();
+  if (!session) return undefined;
+  const sessionKey = crypto.createHash('sha256').update(session, 'utf8').digest('hex').slice(0, 32);
+  const resolved = path.normalize(path.resolve(filePath));
+  const pathKey = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  return `${sessionKey}\0${pathKey}`;
+}
+
+function pruneMutationHashLineages(now = Date.now()): void {
+  for (const [key, lineage] of mutationHashLineages) {
+    if (now - lineage.touchedAt > MUTATION_HASH_LINEAGE_TTL_MS) mutationHashLineages.delete(key);
+  }
+  while (mutationHashLineages.size > MUTATION_HASH_LINEAGE_MAX_ENTRIES) {
+    const oldest = mutationHashLineages.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    mutationHashLineages.delete(oldest);
+  }
+}
+
+function mutationHashLineageAllowsRebase(filePath: string, expectedHash: string, currentHash: string): boolean {
+  const key = mutationHashLineageKey(filePath);
+  if (!key) return false;
+  const now = Date.now();
+  pruneMutationHashLineages(now);
+  const lineage = mutationHashLineages.get(key);
+  if (!lineage) return false;
+  const latestIndex = lineage.hashes.length - 1;
+  if (latestIndex < 1 || lineage.hashes[latestIndex] !== currentHash) {
+    mutationHashLineages.delete(key);
+    return false;
+  }
+  const expectedIndex = lineage.hashes.lastIndexOf(expectedHash);
+  if (expectedIndex < 0 || expectedIndex >= latestIndex) return false;
+  lineage.touchedAt = now;
+  mutationHashLineages.delete(key);
+  mutationHashLineages.set(key, lineage);
+  return true;
+}
+
+function recordMutationHashTransition(filePath: string, beforeHash: string, afterHash: string): void {
+  if (beforeHash === afterHash) return;
+  const key = mutationHashLineageKey(filePath);
+  if (!key) return;
+  const now = Date.now();
+  pruneMutationHashLineages(now);
+  const existing = mutationHashLineages.get(key);
+  let hashes = existing?.hashes.at(-1) === beforeHash
+    ? [...existing.hashes, afterHash]
+    : [beforeHash, afterHash];
+  if (hashes.length > MUTATION_HASH_LINEAGE_MAX_HASHES) hashes = hashes.slice(-MUTATION_HASH_LINEAGE_MAX_HASHES);
+  mutationHashLineages.delete(key);
+  mutationHashLineages.set(key, { hashes, touchedAt: now });
+  pruneMutationHashLineages(now);
 }
 
 async function replaceTextFileAtomically(
@@ -1622,8 +1685,15 @@ async function editFile(args: Record<string, unknown>, deadlineAt: number) {
     throw new Error('edit_file only supports text files.');
   }
   const beforeHash = crypto.createHash('sha256').update(beforeBytes).digest('hex');
-  if (typeof args.expectedHash === 'string' && parseSha256(args.expectedHash) !== beforeHash) {
-    throw new Error(`SHA-256 fence failed for ${validPath}. Expected ${args.expectedHash}, actual sha256:${beforeHash}.`);
+  let rebasedFromHash: string | undefined;
+  if (typeof args.expectedHash === 'string') {
+    const expectedHash = parseSha256(args.expectedHash);
+    if (expectedHash !== beforeHash) {
+      if (!mutationHashLineageAllowsRebase(validPath, expectedHash, beforeHash)) {
+        throw new Error(`SHA-256 fence failed for ${validPath}. Expected ${args.expectedHash}, actual sha256:${beforeHash}.`);
+      }
+      rebasedFromHash = `sha256:${expectedHash}`;
+    }
   }
   const before = beforeBytes.toString('utf8');
   let after = before;
@@ -1655,6 +1725,7 @@ async function editFile(args: Record<string, unknown>, deadlineAt: number) {
       throw new Error(`File changed after edit_file read and before write: ${validPath}. No accelerator write was performed.`);
     }
     await replaceTextFileAtomically(validPath, after, beforeHash, afterHash, deadlineAt);
+    recordMutationHashTransition(validPath, beforeHash, afterHash);
   }
 
   return {
@@ -1663,6 +1734,7 @@ async function editFile(args: Record<string, unknown>, deadlineAt: number) {
     changed: before !== after,
     beforeHash: `sha256:${beforeHash}`,
     afterHash: `sha256:${afterHash}`,
+    ...(rebasedFromHash ? { rebasedFromHash } : {}),
     bytesBefore: Buffer.byteLength(before),
     bytesAfter: Buffer.byteLength(after),
     edits: applied,
@@ -1754,7 +1826,8 @@ async function verifyExpectedHashes(
   files: Array<{ relative: string; absolute: string }>,
   expectedHashesRaw: unknown,
   deadlineAt: number,
-): Promise<Record<string, string>> {
+  allowSessionRebase = false,
+): Promise<{ currentHashes: Record<string, string>; rebasedExpectedHashes: Record<string, string> }> {
   const expectedHashes = expectedHashesRaw && typeof expectedHashesRaw === 'object' && !Array.isArray(expectedHashesRaw)
     ? expectedHashesRaw as Record<string, unknown>
     : {};
@@ -1772,6 +1845,7 @@ async function verifyExpectedHashes(
   }
 
   const currentHashes: Record<string, string> = {};
+  const rebasedExpectedHashes: Record<string, string> = {};
 
   for (const file of files) {
     const current = await sha256File(file.absolute, deadlineAt);
@@ -1779,12 +1853,16 @@ async function verifyExpectedHashes(
     const expected = normalizedExpectedHashes.get(pathIdentity(file.relative));
     if (expected !== undefined) {
       if (typeof expected !== 'string') throw new Error(`expectedHashes['${file.relative}'] must be a string.`);
-      if (parseSha256(expected) !== current) {
-        throw new Error(`SHA-256 fence failed for ${file.relative}. Expected ${expected}, actual sha256:${current}.`);
+      const parsedExpected = parseSha256(expected);
+      if (parsedExpected !== current) {
+        if (!allowSessionRebase || !mutationHashLineageAllowsRebase(file.absolute, parsedExpected, current)) {
+          throw new Error(`SHA-256 fence failed for ${file.relative}. Expected ${expected}, actual sha256:${current}.`);
+        }
+        rebasedExpectedHashes[file.relative] = `sha256:${parsedExpected}`;
       }
     }
   }
-  return currentHashes;
+  return { currentHashes, rebasedExpectedHashes };
 }
 
 async function applyPatch(args: Record<string, unknown>, deadlineAt: number) {
@@ -1802,7 +1880,9 @@ async function applyPatch(args: Record<string, unknown>, deadlineAt: number) {
     files.map((file) => file.absolute), deadlineAt, { label: 'apply_patch' },
   );
   try {
-  const beforeHashes = await verifyExpectedHashes(files, args.expectedHashes, deadlineAt);
+  const { currentHashes: beforeHashes, rebasedExpectedHashes } = await verifyExpectedHashes(
+    files, args.expectedHashes, deadlineAt, true,
+  );
   const run = (gitArgs: string[], input?: string) =>
     runGit(repoRoot, gitArgs, input, remainingTimeout(deadlineAt));
 
@@ -1826,6 +1906,7 @@ async function applyPatch(args: Record<string, unknown>, deadlineAt: number) {
       applicable: true,
       files: expectedFiles,
       beforeHashes,
+      ...(Object.keys(rebasedExpectedHashes).length > 0 ? { rebasedExpectedHashes } : {}),
     };
   }
 
@@ -1854,6 +1935,12 @@ async function applyPatch(args: Record<string, unknown>, deadlineAt: number) {
       for (const file of files) {
         afterHashes[file.relative] = `sha256:${await sha256File(file.absolute, verificationDeadlineAt)}`;
       }
+      for (const file of files) {
+        const after = afterHashes[file.relative];
+        if (after) recordMutationHashTransition(
+          file.absolute, parseSha256(beforeHashes[file.relative]), parseSha256(after),
+        );
+      }
       const checked = await runGit(
         repoRoot, ['diff', '--check', '--', ...expectedFiles], undefined,
         remainingTimeout(verificationDeadlineAt),
@@ -1877,6 +1964,7 @@ async function applyPatch(args: Record<string, unknown>, deadlineAt: number) {
     files: expectedFiles,
     beforeHashes,
     afterHashes,
+    ...(Object.keys(rebasedExpectedHashes).length > 0 ? { rebasedExpectedHashes } : {}),
     ...(diffCheck ? { diffCheck } : {}),
     ...(verificationError ? { verificationIncomplete: true, verificationError } : {}),
   };

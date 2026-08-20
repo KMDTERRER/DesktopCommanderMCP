@@ -91,6 +91,7 @@ await test('remote MCP integration preserves the exact argument object', async (
   const integration = new DesktopCommanderIntegration();
   let seenRequest;
   integration.isReady = true;
+  integration.ensureReady = async () => {}; // supervision is covered by remote-supervision-e2e
   integration.mcpClient = {
     callTool: async (request) => {
       seenRequest = request;

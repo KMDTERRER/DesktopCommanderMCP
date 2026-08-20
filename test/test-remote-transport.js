@@ -279,7 +279,7 @@ function makeDevice({ claimResults = [] } = {}) {
  * `update(...).eq(...)` (awaited) and `select(...).eq(...).maybeSingle()`.
  * Records every mcp_devices write in `writes`.
  */
-function makeFakeClient({ row = null, failFetches = 0, writeLatencies = [] } = {}) {
+function makeFakeClient({ row = null, failFetches = 0, writeLatencies = [], writeErrors = [] } = {}) {
   const writes = [];
   // Recorded when a write COMPLETES, not when it is issued. `writes` alone
   // cannot test ordering: setOnlineStatus evaluates .update() synchronously
@@ -313,6 +313,7 @@ function makeFakeClient({ row = null, failFetches = 0, writeLatencies = [] } = {
       pendingWrite = {
         payload,
         delay: writeLatencies.length ? writeLatencies.shift() : 0,
+        error: writeErrors.length ? writeErrors.shift() : null,
       };
       return chain;
     },
@@ -321,12 +322,12 @@ function makeFakeClient({ row = null, failFetches = 0, writeLatencies = [] } = {
     contains: (column, value) => { containsFilters.push({ column, value }); return chain; },
     eq: () => {
       if (!pendingWrite) return result();
-      const { payload, delay } = pendingWrite;
+      const { payload, delay, error } = pendingWrite;
       pendingWrite = null;
       const p = new Promise((resolve) => {
         const settle = () => {
           completions.push(payload);
-          resolve({ data: null, error: null });
+          resolve({ data: null, error });
         };
         // Only defer when a test actually asked for latency, so every other
         // test keeps the original resolve-immediately semantics.
@@ -842,6 +843,30 @@ await test('result-delivery slot wait is bounded instead of becoming an unresolv
 
 // --- 2. Doorbell routing ----------------------------------------------------
 
+await test('heartbeat startup is idempotent for the same device', async () => {
+  const rc = new RemoteChannel(new SessionTokenOwner());
+  const realSetInterval = globalThis.setInterval;
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearInterval = globalThis.clearInterval;
+  const realClearTimeout = globalThis.clearTimeout;
+  let intervals = 0; let timeouts = 0;
+  globalThis.setInterval = () => ({ kind: 'interval', id: ++intervals });
+  globalThis.setTimeout = () => ({ kind: 'timeout', id: ++timeouts, unref() {} });
+  globalThis.clearInterval = () => {}; globalThis.clearTimeout = () => {};
+  try {
+    rc.startHeartbeat(DEVICE_ID);
+    const firstInterval = rc.connectionCheckInterval;
+    const firstHeartbeat = rc.heartbeatInterval;
+    rc.startHeartbeat(DEVICE_ID);
+    assert(intervals === 1 && timeouts === 1, `duplicate heartbeat timers created: ${intervals}/${timeouts}`);
+    assert(rc.connectionCheckInterval === firstInterval && rc.heartbeatInterval === firstHeartbeat, 'idempotent heartbeat replaced active timers');
+  } finally {
+    rc.stopHeartbeat();
+    globalThis.setInterval = realSetInterval; globalThis.setTimeout = realSetTimeout;
+    globalThis.clearInterval = realClearInterval; globalThis.clearTimeout = realClearTimeout;
+  }
+});
+
 await test('legacy production subscription is scoped to this device', async () => {
   const rc = new RemoteChannel(new SessionTokenOwner());
   rc._user = { id: 'user-1', email: 'tester@example.com' };
@@ -1316,18 +1341,31 @@ await test('stopHeartbeat halts the self-rescheduling timer', async () => {
 });
 
 // --- 5. Reachability and status writes --------------------------------------
+
+await test('status transition is committed locally only after the DB PATCH succeeds', async () => {
+  const { rc } = makeRemoteChannel({ writeErrors: [{ message: 'db unavailable' }, null] });
+  rc.lastDeviceStatus = 'offline';
+
+  const failed = await rc.setOnlineStatus(DEVICE_ID, 'online');
+  assert(failed === false, 'failed status PATCH was reported as persisted');
+  assert(rc.lastDeviceStatus === 'offline', 'failed status PATCH advanced local transition state');
+
+  const succeeded = await rc.setOnlineStatus(DEVICE_ID, 'online');
+  assert(succeeded === true, 'successful status PATCH was not acknowledged');
+  assert(rc.lastDeviceStatus === 'online', 'confirmed status PATCH did not advance local transition state');
+});
 // `status` is what the server's device selection filters on, and it is
 // transport-agnostic — so it must follow "reachable by ANY transport", never the
 // private channel alone.
 
-await test('heartbeat writes when only the legacy channel is joined', async () => {
+await test('heartbeat writes bookkeeping only when the legacy channel is joined', async () => {
   const { rc, client } = makeRemoteChannel();
   rc.channel = null; // private channel never joined
   rc.legacyChannel = makeChannelState('joined'); // fallback is up
   await rc.updateHeartbeat(DEVICE_ID);
   assert(client.writes.length === 1, 'legacy-only reachable device must still write last_seen');
   assert(client.writes[0].last_seen, 'write should bump last_seen');
-  assert(client.writes[0].status === 'online', 'write should assert online');
+  assert(!Object.hasOwn(client.writes[0], 'status'), 'heartbeat must not compete with DeviceStatusArbiter for status ownership');
 });
 
 await test('heartbeat stays silent when no transport is joined', async () => {
