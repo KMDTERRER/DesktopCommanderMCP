@@ -11,6 +11,7 @@ import { DeviceAuthenticator } from '../dist/remote-device/device-authenticator.
 import {
   DesktopCommanderIntegration,
   buildLocalMcpChildEnvironment,
+  LOCAL_MCP_CONNECT_TIMEOUT_MS,
   localMcpRequestTimeoutMs,
 } from '../dist/remote-device/desktop-commander-integration.js';
 import { isTransientRemoteError } from '../dist/remote-device/transient-remote-error.js';
@@ -26,7 +27,8 @@ import { toolHistory } from '../dist/utils/toolHistory.js';
 import { featureFlagManager } from '../dist/utils/feature-flags.js';
 import { usageTracker } from '../dist/utils/usageTracker.js';
 import {
-  CPP_BUILD_AUTO_OBSERVE_MAX_MS, PROCESS_CLIENT_RESPONSE_RESERVE_MS, PROCESS_TRANSPORT_RESERVE_MS,
+  CPP_BUILD_AUTO_OBSERVE_MAX_MS, PROCESS_CLIENT_RESPONSE_RESERVE_MS, PROCESS_REMOTE_OBSERVE_MAX_MS,
+  PROCESS_TRANSPORT_RESERVE_MS, processObservationWaitMs,
 } from '../dist/utils/process-wait-contract.js';
 import {
   currentClient,
@@ -34,9 +36,12 @@ import {
   runInToolCallContext,
   setCurrentClient,
 } from '../dist/utils/client-context.js';
+import { mcpStdioTraceEnabled } from '../dist/utils/mcp-stdio-trace.js';
+import { createMcpToolErrorResult, normalizeMcpToolResult } from '../dist/utils/mcp-tool-error.js';
 
 const remoteBackgroundModuleUrl = new URL('../dist/remote-device/remote-background.js', import.meta.url).href;
 const remoteLifecycleModuleUrl = new URL('../dist/remote-device/remote-lifecycle.js', import.meta.url).href;
+const toolHistoryModuleUrl = new URL('../dist/utils/toolHistory.js', import.meta.url).href;
 
 let failures = 0;
 async function test(name, fn) {
@@ -105,6 +110,143 @@ await test('remote MCP integration preserves the exact argument object', async (
   assert.equal(seenRequest._meta.source, 'regression');
 });
 
+await test('local MCP restart resumes stateless post-restart work without a synthetic server error', async () => {
+  const integration = new DesktopCommanderIntegration();
+  const oldTransport = {};
+  integration.isReady = true;
+  integration.transportGeneration = 7;
+  integration.mcpTransport = oldTransport;
+  integration.mcpClient = { callTool: async () => { throw new Error('old client must not be used'); } };
+
+  integration.handleLocalDisconnect('test transport closed', 7, oldTransport);
+  let calls = 0;
+  integration.ensureReady = async () => {
+    integration.isReady = true;
+    integration.transportGeneration = 8;
+    integration.mcpTransport = {};
+    integration.mcpClient = { callTool: async () => { calls++; return { content: [{ type: 'text', text: 'recovered' }] }; } };
+  };
+
+  const recovered = await integration.callClientTool('get_config', {});
+  assert.equal(recovered.content?.[0]?.text, 'recovered');
+  assert.equal(calls, 1, 'the first post-restart call must execute on the recovered child');
+});
+
+await test('native tool errors are marked as errors rather than successful text', async () => {
+  const result = createMcpToolErrorResult(new Error('native failure'));
+  assert.equal(result.isError, true);
+  assert.equal(result.content?.[0]?.type, 'text');
+  assert.equal(result.content?.[0]?.text, 'Error: native failure');
+  const protocolFailure = createMcpToolErrorResult(new Error('MCP error -32000: Connection closed'));
+  assert.equal(protocolFailure.content?.[0]?.text, 'Error: Connection closed',
+    'SDK protocol prefix leaked into the native tool result');
+  const directProxyFailure = createMcpToolErrorResult(new Error('MCP error -32000: Connection closed'), 'mcp_call_tool');
+  assert.equal(directProxyFailure.content?.[0]?.text, 'Connection closed',
+    'direct proxy failure did not keep the mcp_call_tool error convention');
+});
+
+await test('local MCP crash during a tool call becomes the native tool error result', async () => {
+  const integration = new DesktopCommanderIntegration();
+  const transport = {};
+  integration.isReady = true;
+  integration.transportGeneration = 3;
+  integration.mcpTransport = transport;
+  integration.ensureReady = async () => {};
+  integration.mcpClient = {
+    callTool: async () => {
+      integration.handleLocalDisconnect('test stdio failure', 3, transport);
+      throw new Error('connection closed');
+    },
+  };
+  const result = await integration.callClientTool('get_config', {});
+  assert.equal(result.isError, true, 'transport failure was returned as successful text');
+  assert.equal(result.content?.[0]?.text, 'Error: connection closed');
+});
+
+await test('remote adapter selects the error convention from the requested frozen tool', async () => {
+  const integration = new DesktopCommanderIntegration();
+  integration.isReady = true;
+  integration.mcpTransport = {};
+  integration.ensureReady = async () => {};
+  integration.mcpClient = {
+    callTool: async () => { throw new Error('MCP error -32000: Connection closed'); },
+  };
+
+  const directProxy = await integration.callClientTool('mcp_call_tool', {
+    server: 'desktop-core', tool: 'get_config', arguments: {},
+  });
+  assert.equal(directProxy.isError, true);
+  assert.equal(directProxy.content?.[0]?.text, 'Connection closed');
+
+  const frozenRead = await integration.callClientTool('read_file', {
+    path: 'mcp://desktop-core/get_config', options: {},
+  });
+  assert.equal(frozenRead.isError, true);
+  assert.equal(frozenRead.content?.[0]?.text, 'Error: Connection closed');
+});
+
+await test('malformed local MCP results cannot escape the requested tool contract', async () => {
+  const integration = new DesktopCommanderIntegration();
+  integration.isReady = true;
+  integration.mcpTransport = {};
+  integration.ensureReady = async () => {};
+  integration.mcpClient = { callTool: async () => [] };
+
+  const direct = await integration.callClientTool('mcp_call_tool', {
+    server: 'desktop-context', tool: 'serena_call', arguments: {},
+  });
+  assert.equal(direct.isError, true);
+  assert.match(direct.content?.[0]?.text ?? '', /^Local MCP result for mcp_call_tool is not an MCP CallToolResult object\.$/);
+
+  const frozen = await integration.callClientTool('read_file', {
+    path: 'mcp://desktop-context/serena_call', options: {},
+  });
+  assert.equal(frozen.isError, true);
+  assert.match(frozen.content?.[0]?.text ?? '', /^Error: Local MCP result for read_file is not an MCP CallToolResult object\.$/);
+});
+
+await test('CallToolResult validation rejects non-serializable data and preserves extensions', async () => {
+  const extended = normalizeMcpToolResult({
+    content: [],
+    structuredContent: { ready: true },
+    vendorExtension: { sequence: 7 },
+  });
+  assert.deepEqual(extended.content, []);
+  assert.deepEqual(extended.vendorExtension, { sequence: 7 });
+
+  const circular = {};
+  circular.self = circular;
+  assert.throws(
+    () => normalizeMcpToolResult({ content: [], structuredContent: circular }),
+    /circular reference/,
+  );
+  assert.throws(
+    () => normalizeMcpToolResult({ content: [], structuredContent: { sequence: 1n } }),
+    /JSON cannot encode/,
+  );
+});
+
+await test('concurrent malformed and valid local MCP results remain call-local', async () => {
+  const integration = new DesktopCommanderIntegration();
+  integration.isReady = true;
+  integration.mcpTransport = {};
+  integration.ensureReady = async () => {};
+  integration.mcpClient = {
+    callTool: async ({ arguments: args }) => {
+      await new Promise((resolve) => setTimeout(resolve, args.delay));
+      return args.invalid ? null : { content: [{ type: 'text', text: args.marker }] };
+    },
+  };
+  const [invalid, valid] = await Promise.all([
+    integration.callClientTool('write_file', { invalid: true, delay: 5 }),
+    integration.callClientTool('read_file', { marker: 'chat-b', delay: 0 }),
+  ]);
+  assert.equal(invalid.isError, true);
+  assert.match(invalid.content?.[0]?.text ?? '', /^Error: Local MCP result for write_file/);
+  assert.equal(valid.isError, undefined);
+  assert.equal(valid.content?.[0]?.text, 'chat-b');
+});
+
 await test('remote MCP client reserves return-path time for cpp_build_execute', async () => {
   const downstream = { root: 'C:/repo', operation: 'build', timeoutMs: 120_000, executionMode: 'inline' };
   const expected = 135_000;
@@ -143,6 +285,15 @@ await test('local MCP child inherits only allowlisted runtime environment contro
     'AST_GREP_BIN',
     'DESKTOP_COMMANDER_DISABLE_TELEMETRY',
     'DESKTOP_COMMANDER_MCP_READ_ONLY_POLICY',
+    'DESKTOP_COMMANDER_SERENA_PROJECT',
+    'DESKTOP_COMMANDER_SERENA_HOME',
+    'DESKTOP_COMMANDER_SERENA_PROJECT_DATA_ROOT',
+    'DESKTOP_COMMANDER_SERENA_UV_CACHE_DIR',
+    'DESKTOP_COMMANDER_SERENA_UV_PROJECT_ENVIRONMENT',
+    'DESKTOP_COMMANDER_SERENA_PYTHONPYCACHEPREFIX',
+    'DESKTOP_COMMANDER_SERENA_UV_COMMAND',
+    'DESKTOP_COMMANDER_SERENA_CPP_PROFILE_JSON',
+    'DC_MCP_STDIO_TRACE',
     'DC_TEST_PRIVATE_ENV',
   ];
   const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
@@ -153,6 +304,15 @@ await test('local MCP child inherits only allowlisted runtime environment contro
     process.env.AST_GREP_BIN = 'C:/tools/ast-grep.exe';
     process.env.DESKTOP_COMMANDER_DISABLE_TELEMETRY = '1';
     process.env.DESKTOP_COMMANDER_MCP_READ_ONLY_POLICY = JSON.stringify({ 'fake-serena': ['find_symbol'] });
+    process.env.DESKTOP_COMMANDER_SERENA_PROJECT = 'C:/runtime/fork/serena';
+    process.env.DESKTOP_COMMANDER_SERENA_HOME = 'C:/runtime/state/serena-home';
+    process.env.DESKTOP_COMMANDER_SERENA_PROJECT_DATA_ROOT = 'C:/runtime/state/serena-projects';
+    process.env.DESKTOP_COMMANDER_SERENA_UV_CACHE_DIR = 'C:/runtime/cache/uv';
+    process.env.DESKTOP_COMMANDER_SERENA_UV_PROJECT_ENVIRONMENT = 'C:/runtime/cache/venv';
+    process.env.DESKTOP_COMMANDER_SERENA_PYTHONPYCACHEPREFIX = 'C:/runtime/cache/pycache';
+    process.env.DESKTOP_COMMANDER_SERENA_UV_COMMAND = 'C:/tools/uv.exe';
+    process.env.DESKTOP_COMMANDER_SERENA_CPP_PROFILE_JSON = '{"root":"C:/repo"}';
+    process.env.DC_MCP_STDIO_TRACE = 'false';
     process.env.DC_TEST_PRIVATE_ENV = 'must-not-leak';
 
     const env = buildLocalMcpChildEnvironment({ RUFF_BIN: 'C:/config/ruff.exe', CUSTOM_LOCAL: 'yes' });
@@ -162,15 +322,78 @@ await test('local MCP child inherits only allowlisted runtime environment contro
     assert.equal(env.AST_GREP_BIN, 'C:/tools/ast-grep.exe');
     assert.equal(env.DESKTOP_COMMANDER_DISABLE_TELEMETRY, '1');
     assert.equal(env.DESKTOP_COMMANDER_MCP_READ_ONLY_POLICY, process.env.DESKTOP_COMMANDER_MCP_READ_ONLY_POLICY);
+    assert.equal(env.DESKTOP_COMMANDER_SERENA_PROJECT, 'C:/runtime/fork/serena');
+    assert.equal(env.DESKTOP_COMMANDER_SERENA_HOME, 'C:/runtime/state/serena-home');
+    assert.equal(env.DESKTOP_COMMANDER_SERENA_PROJECT_DATA_ROOT, 'C:/runtime/state/serena-projects');
+    assert.equal(env.DESKTOP_COMMANDER_SERENA_UV_CACHE_DIR, 'C:/runtime/cache/uv');
+    assert.equal(env.DESKTOP_COMMANDER_SERENA_UV_PROJECT_ENVIRONMENT, 'C:/runtime/cache/venv');
+    assert.equal(env.DESKTOP_COMMANDER_SERENA_PYTHONPYCACHEPREFIX, 'C:/runtime/cache/pycache');
+    assert.equal(env.DESKTOP_COMMANDER_SERENA_UV_COMMAND, 'C:/tools/uv.exe');
+    assert.equal(env.DESKTOP_COMMANDER_SERENA_CPP_PROFILE_JSON, '{"root":"C:/repo"}');
+    assert.equal(env.DC_MCP_STDIO_TRACE, 'false', 'explicit operator trace disable must be preserved');
     assert.equal(env.CUSTOM_LOCAL, 'yes');
     assert.equal(env.DC_REMOTE_DEVICE, 'true');
     assert.equal(env.DC_TEST_PRIVATE_ENV, undefined, 'unrelated host env must not leak to local MCP child');
+
+    delete process.env.DC_MCP_STDIO_TRACE;
+    const defaultTraceEnv = buildLocalMcpChildEnvironment();
+    assert.equal(defaultTraceEnv.DC_MCP_STDIO_TRACE, undefined, 'remote local-MCP trace must require explicit opt-in');
   } finally {
     for (const key of keys) {
       if (previous[key] === undefined) delete process.env[key];
       else process.env[key] = previous[key];
     }
   }
+});
+
+await test('MCP stdio tracing stays off for remote children unless explicitly enabled', async () => {
+  const previousTrace = process.env.DC_MCP_STDIO_TRACE;
+  const previousRemote = process.env.DC_REMOTE_DEVICE;
+  try {
+    delete process.env.DC_MCP_STDIO_TRACE;
+    process.env.DC_REMOTE_DEVICE = 'true';
+    assert.equal(mcpStdioTraceEnabled(), false, 'remote child enabled protocol tracing implicitly');
+    process.env.DC_MCP_STDIO_TRACE = 'true';
+    assert.equal(mcpStdioTraceEnabled(), true, 'explicit protocol trace opt-in was ignored');
+  } finally {
+    if (previousTrace === undefined) delete process.env.DC_MCP_STDIO_TRACE;
+    else process.env.DC_MCP_STDIO_TRACE = previousTrace;
+    if (previousRemote === undefined) delete process.env.DC_REMOTE_DEVICE;
+    else process.env.DC_REMOTE_DEVICE = previousRemote;
+  }
+});
+
+await test('local MCP connect budget covers the bounded pre-connect startup contract', async () => {
+  assert(LOCAL_MCP_CONNECT_TIMEOUT_MS >= 25_000,
+    `local MCP connect budget is shorter than bounded server startup headroom: ${LOCAL_MCP_CONNECT_TIMEOUT_MS}ms`);
+});
+
+await test('remote process observation returns model control without shortening local waits', async () => {
+  assert.equal(processObservationWaitMs(120_000, true), PROCESS_REMOTE_OBSERVE_MAX_MS);
+  assert.equal(processObservationWaitMs(10_000, true), 10_000);
+  assert.equal(processObservationWaitMs(120_000, false), 120_000);
+  assert(PROCESS_REMOTE_OBSERVE_MAX_MS < 45_000,
+    'remote process observation window no longer fits inside the caller return budget');
+});
+
+await test('remote local-MCP history startup performs no synchronous filesystem I/O', async () => {
+  const probe = spawnSync(process.execPath, [
+    '--input-type=module',
+    '-e',
+    `import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';
+const { ToolHistory } = await import(${JSON.stringify(toolHistoryModuleUrl)} + '?remote-startup=' + Date.now());
+for (const name of ['existsSync','mkdirSync','statSync','readFileSync','writeFileSync']) fs[name] = () => { throw new Error('SYNC_HISTORY_IO:' + name); };
+syncBuiltinESMExports();
+new ToolHistory();
+process.stdout.write('REMOTE_HISTORY_STARTUP_OK');`,
+  ], {
+    cwd: process.cwd(),
+    env: { ...process.env, DC_REMOTE_DEVICE: 'true' },
+    encoding: 'utf8',
+    timeout: 5000,
+  });
+  assert.equal(probe.status, 0, probe.stderr || probe.stdout || `unexpected probe status ${probe.status}`);
+  assert.match(probe.stdout, /REMOTE_HISTORY_STARTUP_OK/);
 });
 
 await test('tool history response budget keeps newest records without bulk diagnostic backpressure', async () => {

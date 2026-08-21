@@ -5,6 +5,8 @@ export const MANAGED_TRASH_ENTRIES_DIRECTORY_NAME = 'entries';
 export const MANAGED_TRASH_RETENTION_MS = 20 * 60 * 1000;
 export const MANAGED_TRASH_SWEEP_INTERVAL_MS = 30 * 1000;
 export const MANAGED_TRASH_ENTRY_NAME = /^tr_[a-f0-9]{32}$/;
+export const MANAGED_TRASH_WORKSPACE_REGISTRY_FILE_NAME = 'trash-workspaces-v1.json';
+export const MANAGED_TRASH_WORKSPACE_REGISTRY_TEMP_PREFIX = '.trash-workspaces-v1.';
 
 export function pathContainsManagedTrashSegment(value: string): boolean {
   const normalized = path.normalize(value);

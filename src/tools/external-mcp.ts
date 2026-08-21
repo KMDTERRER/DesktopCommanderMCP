@@ -8,7 +8,8 @@ import type { ServerResult } from '../types.js';
 import { bindExternalMcpWorkspaceDefinition, resolveExternalMcpWorkspaceDefinition } from './external-mcp-binding.js';
 import { validatePathAuthority as validatePath } from './path-security.js';
 import { BUILTIN_CONTEXT_SERVER_ID, callCodeContextOrchestrator, listBuiltinContextTools } from './code-context-orchestrator.js';
-import { normalizeMcpArgumentsObject } from '../utils/mcp-arguments.js';
+import { assertNoUnexpectedJsonControlCharacters, normalizeMcpArgumentsObject } from '../utils/mcp-arguments.js';
+import { normalizeFrozenWrapperResult, normalizeMcpToolResult } from '../utils/mcp-tool-error.js';
 import { isMcpCompatUri } from '../utils/mcp-uri.js';
 import { runWithAbortableTimeout } from '../utils/withTimeout.js';
 import { OperationScope, remainingOperationMs, waitForOperationUntil } from '../utils/operation-scope.js';
@@ -26,6 +27,14 @@ import {
   READ_MULTIPLE_PER_FILE_OUTPUT_BYTES,
   resourceLimitError,
 } from '../utils/read-resource-limits.js';
+import {
+  assertSessionSerenaContextWorkspace as assertPrivateSerenaContextWorkspace,
+  callSerenaWorkspaceTool as callPrivateSerenaWorkspaceTool,
+  callSessionSerenaReadBatch as callPrivateSerenaReadBatch,
+  callSessionSerenaTool as callPrivateSerenaTool,
+  callTrustedReadOnlySessionSerenaTool as callPrivateReadOnlySerenaTool,
+  closePrivateSerenaRuntime,
+} from '../serena/serena-runtime-manager.js';
 
 const BUILTIN_SERVER_ID = 'desktop-accelerators';
 const BUILTIN_CORE_SERVER_ID = 'desktop-core';
@@ -51,22 +60,6 @@ const MCP_READ_ONLY_POLICY_MAX_BYTES = 64 * 1024;
 const MCP_READ_ONLY_POLICY_MAX_SERVERS = 128;
 const MCP_READ_ONLY_POLICY_MAX_TOOLS_PER_SERVER = 256;
 const MCP_READ_ONLY_POLICY_NAME = /^[A-Za-z0-9_.-]{1,128}$/;
-const SERENA_COLD_START_WAIT_MS = 15_000;
-const SERENA_READ_BATCH_MAX_CALLS = 16;
-const SERENA_READ_BATCH_MAX_CONCURRENCY = 8;
-const SERENA_SESSION_MAX = 32;
-const SERENA_SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
-const SERENA_FILE_CACHE_MAX_BYTES = 16 * 1024 * 1024;
-const SERENA_FILE_LOCAL_CACHE_TOOLS = new Set(['get_symbols_overview', 'find_symbol']);
-const SERENA_SESSION_TOKEN = /^[A-Za-z0-9_-]{8,128}$/;
-const SERENA_DYNAMIC_PREFIX = 'serena-session-';
-const SERENA_SESSION_ADDITIONAL_TOOLS = ['search_for_pattern'] as const;
-const SERENA_CPP_ENV_KEYS = new Set([
-  'SERENA_FORCED_LANGUAGE_SERVERS',
-  'SERENA_CPP_COMPILATION_DATABASE_PATH',
-  'SERENA_CPP_QUERY_DRIVERS',
-  'SERENA_CPP_TOOLCHAIN_PROFILE_FINGERPRINT',
-]);
 
 type ReadOnlyRoutePolicy = Map<string, ReadonlySet<string>>;
 let cachedReadOnlyRoutePolicyRaw: string | undefined;
@@ -237,39 +230,6 @@ async function callTrustedReadOnlyExternalMcpTool(
   return callExternalMcpTool({ server, tool, arguments: args, timeout_ms: timeoutMs });
 }
 
-async function assertSessionSerenaContextWorkspace(
-  session: string, requestedRoot: string, timeoutMs: number,
-): Promise<{ requestedRoot: string; boundRoot: string }> {
-  const bounded = boundedTimeout(timeoutMs, 10_000, MCP_CALL_TIMEOUT_MAX_MS, 'code_context Serena session workspace timeout');
-  const deadlineAt = Date.now() + bounded;
-  const binding = serenaBindingForCall(session);
-  const requested = await validateSerenaWorkspaceRoot(requestedRoot, deadlineAt);
-  const [canonicalRequested, canonicalBound] = await Promise.all([
-    waitForOperationUntil(fs.realpath(requested), deadlineAt, 'Resolve code_context Serena requested workspace'),
-    waitForOperationUntil(fs.realpath(binding.root), deadlineAt, 'Resolve code_context Serena session workspace'),
-  ]);
-  if (!sameWorkspacePath(canonicalRequested, canonicalBound)) {
-    throw new Error(
-      `Serena workspace session '${binding.token}' is bound to '${canonicalBound}' and cannot provide context for requested root '${canonicalRequested}'.`,
-    );
-  }
-  return { requestedRoot: canonicalRequested, boundRoot: canonicalBound };
-}
-
-async function callTrustedReadOnlySessionSerenaTool(
-  session: string, tool: string, args: Record<string, unknown>, timeoutMs: number,
-): Promise<unknown> {
-  const outcome = await callSessionSerenaTool({ tool, arguments: args, session }, timeoutMs, true);
-  if (outcome.status !== 'ready' || !('result' in outcome)) {
-    const error = new Error(
-      `Serena workspace session '${session}' is still ${outcome.status}; retry code_context with the same semanticSession.`,
-    ) as NodeJS.ErrnoException;
-    error.code = 'EAGAIN';
-    throw error;
-  }
-  return outcome.result;
-}
-
 async function closeRuntimeBounded(
   runtime: Runtime | undefined,
   timeoutMs = MCP_RUNTIME_CLOSE_TIMEOUT_MS,
@@ -289,7 +249,7 @@ async function closeRuntimeBounded(
 }
 
 export const EXTERNAL_MCP_ROUTING_GUIDANCE =
-  'For repository work, start with desktop-accelerators/workspace_snapshot instead of repeating Git preflight shell calls. For code-text discovery that would otherwise require start_search -> get_more_search_results -> read_file, prefer one desktop-accelerators/context_pack call; use ast_search for structural syntax and keep generic start_search for non-code/background discovery. Reuse desktop-accelerators/workspace_delta cursors between turns to avoid rediscovering unchanged worktree state. For one broad context request that needs CRG impact plus bounded source retrieval, prefer desktop-context/code_context; add explicit symbolQueries only when exact symbol names are already known, because this deterministic layer never infers symbol identity from natural-language prose. When serena_workspace already owns the task workspace, pass its workspaceSession as code_context.semanticSession instead of rebinding a fixed Serena server or issuing separate serena_call rounds. Exact Serena hits expand to bounded cross-file references by default, and those files are promoted into context_pack; use semanticExpand=all only when implementations matter. For bulk or multi-symbol code_context lookups, keep include_info=false; request hover/type enrichment only for the small number of exact symbols that actually need it. For several already-known independent Serena read queries in one workspace, prefer desktop-context/serena_read_batch instead of serial serena_call rounds. When the exact symbol name is not known yet, use session Serena search_for_pattern for bounded regex/text discovery, then move to find_symbol/references/implementations once candidates are known. For narrow retrieval or a single graph/semantic step, keep using context_pack, CRG, or Serena directly; when CRG already produced impacted_files, pass those paths as context_pack.seedFiles rather than repeating graph discovery. For C/C++ changes that need toolchain profile, build impact, and/or a build plan together, prefer desktop-accelerators/cpp_build_context: it reuses one request-scoped build_metadata snapshot and runs independent profile/impact derivation in parallel. For narrow questions, keep using build_metadata, cpp_toolchain_profile, cpp_build_impact, or cpp_build_plan directly. Use CRG/context_pack/Serena separately where architecture or symbol semantics matter. For routine configured CMake build/test verification, prefer desktop-accelerators/cpp_build_execute: omit buildDir when one configured CMake tree is unambiguous, or use configureMode=if_missing with an explicit project-owned configurePreset so CMake owns binaryDir, generator, compiler, linker, toolchain, preset and parallelism semantics. It reuses cpp_build_context/plan plus the native start/wait owner and returns bounded normalized diagnostics in one call. Keep cpp_build_context -> desktop-core/start_process -> wait_process for custom orchestration and debugging. Prefer desktop-accelerators/edit_file for multiple exact edits in one text file, desktop-accelerators/apply_patch for bounded multi-file text changes, desktop-accelerators/safe_fix for preview-only engine-classified safe fixes before applying them through the mutation tools, and desktop-accelerators/wait_process for finite builds/tests instead of repeated read_process_output polling. Use desktop-accelerators/ast_search or ast_rule_search for bounded structural syntax queries before broad grep/read loops. When the same syntax shape must be changed repeatedly, prefer ast_rewrite in preview mode before text edits; apply only with its regenerated preview identity/exact file set, and keep Serena/LSP preferred for semantic rename/type-aware refactoring. For configured programmatic CRG adapters, use get_impact_radius_tool/get_review_context_tool with explicit changed_files when the task already has a bounded change set, and use query_graph_tool only for explicit graph relationships. The adapter owns mandatory freshness reconciliation; do not call CRG build/update, semantic-search, or traversal tools from the agent path. Use Serena or SCIP for type- and symbol-aware semantics. When a configured external MCP server provides a task-specific semantic tool, prefer it over generic filesystem text search/read or shell emulation. For code intelligence, discover the bound server with mcp_list_tools and prefer semantic symbols, references, implementations, diagnostics, and refactoring tools when applicable; use native search/read as fallback. Inspect an exact tool schema before calling it unless already known. Frozen clients use read_file(mcp://<server>/<tool>) for schema discovery when options are omitted. Trusted read-only desktop-accelerators and external tools explicitly allowlisted by the local DESKTOP_COMMANDER_MCP_READ_ONLY_POLICY may be invoked with read_file(path=mcp://<server>/<tool>?timeout_ms=..., options=<flat downstream arguments>); the URI owns the bridge deadline so any downstream timeout_ms field remains available to the tool. Downstream MCP readOnlyHint annotations never grant this route. Mutating and not-yet-trusted tools continue through write_file(path=mcp://<server>/<tool>, content=<the downstream arguments JSON object>). The content is passed as the tool arguments without reinterpretation. If a bridge deadline is needed, put it in the URI query, e.g. mcp://<server>/<tool>?timeout_ms=45000. The historical {arguments:{...},timeout_ms:N} wrapper is supported when unambiguous; for an open/dynamic downstream schema use ?envelope=legacy explicitly. desktop-core mirrors current Desktop Commander core schemas through the same stable path.';
+  'Frozen-client discovery root is exactly read_file(path=mcp://servers). Do not append /discovery; mcp://servers/discovery is accepted only as a recovery alias. After choosing a server, use read_file(path=mcp://<server>) for its tool list and read_file(path=mcp://<server>/<tool>) with no options for the exact schema. For repository work, start with desktop-accelerators/workspace_snapshot instead of repeating Git preflight shell calls. For code-text discovery that would otherwise require start_search -> get_more_search_results -> read_file, prefer one desktop-accelerators/context_pack call; use ast_search for structural syntax and keep generic start_search for non-code/background discovery. Reuse desktop-accelerators/workspace_delta cursors between turns to avoid rediscovering unchanged worktree state. For one broad context request that needs CRG impact plus bounded source retrieval, prefer desktop-context/code_context; add explicit symbolQueries only when exact symbol names are already known, because this deterministic layer never infers symbol identity from natural-language prose. When serena_workspace already owns the task workspace, pass its workspaceSession as code_context.semanticSession instead of rebinding a fixed Serena server or issuing separate serena_call rounds. Exact Serena hits expand to bounded cross-file references by default, and those files are promoted into context_pack; use semanticExpand=all only when implementations matter. For bulk or multi-symbol code_context lookups, keep include_info=false; request hover/type enrichment only for the small number of exact symbols that actually need it. For several already-known independent Serena read queries in one workspace, prefer desktop-context/serena_read_batch instead of serial serena_call rounds. When the exact symbol name is not known yet, use session Serena search_for_pattern for bounded regex/text discovery, then move to find_symbol/references/implementations once candidates are known. For narrow retrieval or a single graph/semantic step, keep using context_pack, CRG, or Serena directly; when CRG already produced impacted_files, pass those paths as context_pack.seedFiles rather than repeating graph discovery. For C/C++ changes that need toolchain profile, build impact, and/or a build plan together, prefer desktop-accelerators/cpp_build_context: it reuses one request-scoped build_metadata snapshot and runs independent profile/impact derivation in parallel. For narrow questions, keep using build_metadata, cpp_toolchain_profile, cpp_build_impact, or cpp_build_plan directly. Use CRG/context_pack/Serena separately where architecture or symbol semantics matter. For routine configured CMake build/test verification, prefer desktop-accelerators/cpp_build_execute: omit buildDir when one configured CMake tree is unambiguous, or use configureMode=if_missing with an explicit project-owned configurePreset so CMake owns binaryDir, generator, compiler, linker, toolchain, preset and parallelism semantics. It reuses cpp_build_context/plan plus the native start/wait owner and returns bounded normalized diagnostics in one call. Keep cpp_build_context -> desktop-core/start_process -> wait_process for custom orchestration and debugging. Prefer desktop-accelerators/edit_file for multiple exact edits in one text file, desktop-accelerators/apply_patch for bounded multi-file text changes, desktop-accelerators/safe_fix for preview-only engine-classified safe fixes before applying them through the mutation tools, and desktop-accelerators/wait_process for finite builds/tests instead of repeated read_process_output polling. Use desktop-accelerators/ast_search or ast_rule_search for bounded structural syntax queries before broad grep/read loops. When the same syntax shape must be changed repeatedly, prefer ast_rewrite in preview mode before text edits; apply only with its regenerated preview identity/exact file set, and keep Serena/LSP preferred for semantic rename/type-aware refactoring. For configured programmatic CRG adapters, use get_impact_radius_tool/get_review_context_tool with explicit changed_files when the task already has a bounded change set, and use query_graph_tool only for explicit graph relationships. The adapter owns mandatory freshness reconciliation; do not call CRG build/update, semantic-search, or traversal tools from the agent path. Use Serena or SCIP for type- and symbol-aware semantics. When a configured external MCP server provides a task-specific semantic tool, prefer it over generic filesystem text search/read or shell emulation. For code intelligence, discover the bound server with mcp_list_tools and prefer semantic symbols, references, implementations, diagnostics, and refactoring tools when applicable; use native search/read as fallback. Inspect an exact tool schema before calling it unless already known. Frozen clients use read_file(mcp://<server>/<tool>) for schema discovery when options are omitted. Trusted read-only desktop-accelerators and external tools explicitly allowlisted by the local DESKTOP_COMMANDER_MCP_READ_ONLY_POLICY may be invoked with read_file(path=mcp://<server>/<tool>?timeout_ms=..., options=<flat downstream arguments>); the URI owns the bridge deadline so any downstream timeout_ms field remains available to the tool. Downstream MCP readOnlyHint annotations never grant this route. Mutating and not-yet-trusted tools continue through write_file(path=mcp://<server>/<tool>, content=<the downstream arguments JSON object>). The content is passed as the tool arguments without reinterpretation. If a bridge deadline is needed, put it in the URI query, e.g. mcp://<server>/<tool>?timeout_ms=45000. The historical {arguments:{...},timeout_ms:N} wrapper is supported when unambiguous; for an open/dynamic downstream schema use ?envelope=legacy explicitly. desktop-core mirrors current Desktop Commander core schemas through the same stable path.';
 
 type ConfigSourceStamp = { source: string; size: number; mtimeMs: number; ctimeMs: number };
 
@@ -311,35 +271,8 @@ type RuntimeLease = {
   runtime: Runtime;
 };
 
-type SerenaReadCacheEntry = {
-  result: unknown;
-  runtimeGeneration: number;
-  relativePath: string;
-  contentHash: string;
-};
-
-type SerenaSessionBinding = {
-  token: string;
-  implicitIdentityHash?: string;
-  root: string;
-  serverName: string;
-  templateServer?: string;
-  createdAt: number;
-  lastUsedAt: number;
-  idleTimer?: NodeJS.Timeout;
-  warmup?: Promise<void>;
-  transportReady: boolean;
-  transportReadyAt?: number;
-  semanticReady: boolean;
-  lastError?: string;
-  pendingReads: Map<string, Promise<unknown>>;
-  completedReads: Map<string, SerenaReadCacheEntry>;
-};
-
 let runtimeState: RuntimeState | undefined;
 let runtimeGenerationCounter = 0;
-const serenaSessionBindings = new Map<string, SerenaSessionBinding>();
-const serenaImplicitSessions = new Map<string, string>();
 const runtimeMutationOwner = new SerializedOperationOwner();
 
 async function withRuntimeMutationLock<T>(
@@ -770,7 +703,11 @@ async function listRuntimeTools(
         break;
       }
 
-      const pageBudget = assertBoundedProxyValue(response.tools ?? [], 'MCP tool discovery page');
+      // The MCP SDK validates the tools/list result before it reaches this
+      // point. Keep the original empty-list semantics for a valid empty catalog;
+      // malformed envelopes retain the SDK's original protocol error.
+      const pageTools = response.tools ?? [];
+      const pageBudget = assertBoundedProxyValue(pageTools, 'MCP tool discovery page');
       snapshotBytes += pageBudget.bytes;
       snapshotNodes += pageBudget.nodes;
       if (snapshotBytes > MCP_PROXY_RESULT_MAX_BYTES) {
@@ -780,7 +717,7 @@ async function listRuntimeTools(
         throw resourceLimitError('MCP tool discovery snapshot structure', MCP_PROXY_RESULT_MAX_NODES, snapshotNodes);
       }
 
-      for (const tool of response.tools ?? []) {
+      for (const tool of pageTools) {
         if (!toolAllowedByDefinition(runtime, server, tool.name)) continue;
         if (names.has(tool.name)) throw new Error(`MCP server '${server}' returned duplicate tool '${tool.name}' across pages.`);
         names.add(tool.name);
@@ -878,492 +815,6 @@ async function callRuntimeTool(
   } finally {
     retryScope.dispose();
   }
-}
-
-function serenaIdentityHash(identity: string): string {
-  return crypto.createHash('sha256').update(identity, 'utf8').digest('hex').slice(0, 32);
-}
-
-function serenaExplicitToken(value: unknown): string | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== 'string' || !SERENA_SESSION_TOKEN.test(value)) {
-    throw new Error('Serena workspace session must be an opaque 8-128 character token.');
-  }
-  return value;
-}
-
-function implicitSerenaIdentityHash(): string | undefined {
-  const identity = getToolCallSessionIdentity();
-  return identity ? serenaIdentityHash(identity) : undefined;
-}
-
-function scheduleSerenaIdleHibernate(binding: SerenaSessionBinding): void {
-  if (binding.idleTimer) clearTimeout(binding.idleTimer);
-  const timer = setTimeout(() => {
-    if (serenaSessionBindings.get(binding.token) !== binding) return;
-    if (Date.now() - binding.lastUsedAt < SERENA_SESSION_IDLE_TIMEOUT_MS) {
-      scheduleSerenaIdleHibernate(binding);
-      return;
-    }
-    void hibernateSerenaBinding(binding, Date.now() + 10_000).catch(() => undefined);
-  }, SERENA_SESSION_IDLE_TIMEOUT_MS);
-  timer.unref();
-  binding.idleTimer = timer;
-}
-
-function touchSerenaBinding(binding: SerenaSessionBinding): void {
-  binding.lastUsedAt = Date.now();
-  scheduleSerenaIdleHibernate(binding);
-}
-
-function serenaBindingForCall(explicitSession: unknown): SerenaSessionBinding {
-  const explicit = serenaExplicitToken(explicitSession);
-  const implicitHash = implicitSerenaIdentityHash();
-  const token = explicit ?? (implicitHash ? serenaImplicitSessions.get(implicitHash) : undefined);
-  const binding = token ? serenaSessionBindings.get(token) : undefined;
-  if (!binding) {
-    throw new Error('No Serena workspace is bound for this chat/session. Call desktop-context/serena_workspace operation=bind first.');
-  }
-  touchSerenaBinding(binding);
-  return binding;
-}
-
-function comparableRoot(value: string): string {
-  const normalized = path.normalize(value);
-  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
-}
-
-async function validateSerenaWorkspaceRoot(value: unknown, deadlineAt: number): Promise<string> {
-  if (typeof value !== 'string' || !value.trim() || value.length > 4096) {
-    throw new Error('serena_workspace.root must be a non-empty project directory path.');
-  }
-  const validated = await validatePath(value.trim(), remainingOperationMs(deadlineAt, 'Validate Serena workspace root'));
-  const stats = await waitForOperationUntil(fs.stat(validated), deadlineAt, 'Stat Serena workspace root');
-  if (!stats.isDirectory()) throw new Error(`Serena workspace root is not a directory: ${validated}`);
-  return validated;
-}
-
-function replaceSerenaProjectArg(args: string[], root: string): string[] {
-  const next = [...args];
-  const start = next.lastIndexOf('start-mcp-server');
-  if (start < 0) throw new Error('Configured Serena template does not launch start-mcp-server.');
-  for (let index = start + 1; index < next.length; index++) {
-    if (next[index] === '--project' && typeof next[index + 1] === 'string') {
-      next[index + 1] = root;
-      return next;
-    }
-    if (typeof next[index] === 'string' && next[index].startsWith('--project=')) {
-      next[index] = `--project=${root}`;
-      return next;
-    }
-  }
-  next.push('--project', root);
-  return next;
-}
-
-async function selectSerenaTemplate(
-  runtime: Runtime, root: string, requestedTemplate: string | undefined, deadlineAt: number,
-): Promise<{ definition: ServerDefinition; exactRoot: boolean }> {
-  const candidates = runtime.listServers().filter((name) => name.startsWith('serena-') && !name.startsWith(SERENA_DYNAMIC_PREFIX));
-  if (requestedTemplate) {
-    if (!candidates.includes(requestedTemplate)) throw new Error(`Unknown configured Serena template '${requestedTemplate}'.`);
-    const definition = runtime.getDefinition(requestedTemplate);
-    const bound = await resolveExternalMcpWorkspaceDefinition(definition, deadlineAt);
-    return { definition, exactRoot: Boolean(bound && comparableRoot(bound) === comparableRoot(root)) };
-  }
-  for (const name of candidates) {
-    const definition = runtime.getDefinition(name);
-    const bound = await resolveExternalMcpWorkspaceDefinition(definition, deadlineAt).catch(() => undefined);
-    if (bound && comparableRoot(bound) === comparableRoot(root)) return { definition, exactRoot: true };
-  }
-  const fallback = candidates.includes('serena-ai-agent') ? 'serena-ai-agent' : candidates[0];
-  if (!fallback) throw new Error('No configured Serena MCP template is available.');
-  return { definition: runtime.getDefinition(fallback), exactRoot: false };
-}
-
-function cloneSerenaDefinition(
-  template: ServerDefinition, root: string, serverName: string, exactRoot: boolean,
-): ServerDefinition {
-  if (template.command.kind !== 'stdio') throw new Error('Session-scoped Serena requires a stdio Serena template.');
-  const env = { ...(template.env ?? {}) };
-  if (!exactRoot) {
-    for (const key of SERENA_CPP_ENV_KEYS) delete env[key];
-  }
-  const templateTools = (template as ServerDefinition & { allowedTools?: string[] }).allowedTools;
-  const allowedTools = Array.isArray(templateTools)
-    ? [...new Set([...templateTools, ...SERENA_SESSION_ADDITIONAL_TOOLS])]
-    : undefined;
-  return {
-    ...template,
-    name: serverName,
-    description: `Session-scoped Serena semantic tools for ${root}`,
-    command: { ...template.command, args: replaceSerenaProjectArg(template.command.args, root) },
-    env,
-    ...(allowedTools ? { allowedTools } : {}),
-    lifecycle: { mode: 'keep-alive', idleTimeoutMs: SERENA_SESSION_IDLE_TIMEOUT_MS },
-    source: undefined,
-    sources: undefined,
-  };
-}
-
-async function ensureSerenaDefinition(runtime: Runtime, binding: SerenaSessionBinding, deadlineAt: number): Promise<void> {
-  if (runtime.listServers().includes(binding.serverName)) return;
-  const selected = await selectSerenaTemplate(runtime, binding.root, binding.templateServer, deadlineAt);
-  runtime.registerDefinition(cloneSerenaDefinition(selected.definition, binding.root, binding.serverName, selected.exactRoot));
-}
-
-function startSerenaWarmup(binding: SerenaSessionBinding): Promise<void> {
-  if (binding.warmup) return binding.warmup;
-  const deadlineAt = Date.now() + MCP_CALL_TIMEOUT_MAX_MS;
-  let warmup!: Promise<void>;
-  warmup = withRuntimeLease(deadlineAt, async (runtime) => {
-    await ensureSerenaDefinition(runtime, binding, deadlineAt);
-    await listRuntimeTools(runtime, binding.serverName, true, deadlineAt);
-    binding.transportReady = true;
-    binding.transportReadyAt = Date.now();
-    binding.lastError = undefined;
-  }).catch((error) => {
-    binding.transportReady = false;
-    binding.lastError = error instanceof Error ? error.message : String(error);
-    if (binding.warmup === warmup) binding.warmup = undefined;
-    throw error;
-  });
-  binding.warmup = warmup;
-  void warmup.catch(() => undefined);
-  return warmup;
-}
-
-async function settledWithin<T>(promise: Promise<T>, waitMs: number): Promise<{ done: true; value: T } | { done: false }> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise.then((value) => ({ done: true as const, value })),
-      new Promise<{ done: false }>((resolve) => { timer = setTimeout(() => resolve({ done: false }), waitMs); }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-function serenaColdStart(binding: SerenaSessionBinding, stage: string) {
-  return {
-    status: 'cold_start',
-    workspaceSession: binding.token,
-    root: binding.root,
-    stage,
-    retryAfterMs: 3000,
-    message: 'Serena is still starting for this workspace. Keep this workspaceSession and retry the same call; do not create another Serena process.',
-  };
-}
-
-async function hibernateSerenaBinding(binding: SerenaSessionBinding, deadlineAt: number): Promise<void> {
-  if (serenaSessionBindings.get(binding.token) !== binding) return;
-  if (Date.now() - binding.lastUsedAt < SERENA_SESSION_IDLE_TIMEOUT_MS) {
-    scheduleSerenaIdleHibernate(binding);
-    return;
-  }
-  if (binding.idleTimer) clearTimeout(binding.idleTimer);
-  binding.idleTimer = undefined;
-  await withRuntimeLease(deadlineAt, async (runtime) => {
-    if (runtime.listServers().includes(binding.serverName)) await runtime.close(binding.serverName);
-  }).catch(() => undefined);
-  binding.warmup = undefined;
-  binding.transportReady = false;
-  binding.transportReadyAt = undefined;
-  binding.semanticReady = false;
-  binding.lastError = undefined;
-  binding.pendingReads.clear();
-  binding.completedReads.clear();
-}
-
-async function closeSerenaBinding(binding: SerenaSessionBinding, deadlineAt: number): Promise<void> {
-  if (binding.idleTimer) clearTimeout(binding.idleTimer);
-  binding.idleTimer = undefined;
-  serenaSessionBindings.delete(binding.token);
-  if (binding.implicitIdentityHash && serenaImplicitSessions.get(binding.implicitIdentityHash) === binding.token) {
-    serenaImplicitSessions.delete(binding.implicitIdentityHash);
-  }
-  await withRuntimeLease(deadlineAt, async (runtime) => {
-    if (runtime.listServers().includes(binding.serverName)) await runtime.close(binding.serverName);
-  }).catch(() => undefined);
-}
-
-function newSerenaToken(): string {
-  return `ws_${crypto.randomBytes(18).toString('base64url')}`;
-}
-
-export async function callSerenaWorkspaceTool(args: Record<string, unknown>, timeoutMs = 30_000) {
-  const allowed = new Set(['operation', 'root', 'session', 'templateServer', 'warm']);
-  const unknown = Object.keys(args).filter((key) => !allowed.has(key));
-  if (unknown.length) throw new Error(`serena_workspace received unsupported argument(s): ${unknown.join(', ')}.`);
-  const operation = args.operation;
-  if (operation !== 'bind' && operation !== 'status' && operation !== 'release') {
-    throw new Error('serena_workspace.operation must be bind, status, or release.');
-  }
-  const deadlineAt = Date.now() + Math.min(timeoutMs, MCP_CALL_TIMEOUT_MAX_MS);
-  if (operation !== 'bind') {
-    const binding = serenaBindingForCall(args.session);
-    if (operation === 'release') {
-      await closeSerenaBinding(binding, deadlineAt);
-      return { status: 'released', workspaceSession: binding.token, root: binding.root };
-    }
-    return {
-      status: binding.lastError ? 'failed' : binding.semanticReady ? 'ready' : binding.transportReady ? 'warming' : 'starting',
-      workspaceSession: binding.token, root: binding.root, server: binding.serverName,
-      transportReady: binding.transportReady, semanticReady: binding.semanticReady,
-      ageMs: Date.now() - binding.createdAt, ...(binding.lastError ? { error: binding.lastError } : {}),
-    };
-  }
-
-  const root = await validateSerenaWorkspaceRoot(args.root, deadlineAt);
-  const explicit = serenaExplicitToken(args.session);
-  const implicitHash = implicitSerenaIdentityHash();
-  const implicitToken = implicitHash ? serenaImplicitSessions.get(implicitHash) : undefined;
-  const token = explicit ?? implicitToken ?? newSerenaToken();
-  const templateServer = args.templateServer === undefined ? undefined : String(args.templateServer);
-  if (templateServer && !MCP_READ_ONLY_POLICY_NAME.test(templateServer)) throw new Error('serena_workspace.templateServer is invalid.');
-  const serverName = `${SERENA_DYNAMIC_PREFIX}${serenaIdentityHash(`${token}\0${root}\0${templateServer ?? ''}`).slice(0, 20)}`;
-  const previous = serenaSessionBindings.get(token);
-  if (previous && previous.serverName !== serverName) await closeSerenaBinding(previous, deadlineAt);
-  if (!previous && serenaSessionBindings.size >= SERENA_SESSION_MAX) {
-    const oldest = [...serenaSessionBindings.values()].sort((a, b) => a.lastUsedAt - b.lastUsedAt)[0];
-    if (oldest) await closeSerenaBinding(oldest, deadlineAt);
-  }
-  const binding: SerenaSessionBinding = previous?.serverName === serverName ? previous : {
-    token, implicitIdentityHash: implicitHash, root, serverName, templateServer,
-    createdAt: Date.now(), lastUsedAt: Date.now(), transportReady: false, semanticReady: false,
-    pendingReads: new Map(), completedReads: new Map(),
-  };
-  touchSerenaBinding(binding);
-  serenaSessionBindings.set(token, binding);
-  if (implicitHash) serenaImplicitSessions.set(implicitHash, token);
-  if (args.warm !== false) startSerenaWarmup(binding);
-  return {
-    status: binding.semanticReady ? 'ready' : binding.transportReady ? 'warming' : 'starting',
-    workspaceSession: token, sessionIdentity: implicitHash ? 'transport' : 'explicit-token-required',
-    root, server: serverName, coldStartWaitMs: SERENA_COLD_START_WAIT_MS,
-  };
-}
-
-function discoveredToolReadOnly(tool: DiscoveredTool): boolean {
-  const annotations = tool.annotations;
-  if (!annotations || typeof annotations !== 'object' || Array.isArray(annotations)) return false;
-  const value = annotations as Record<string, unknown>;
-  return value.readOnlyHint === true && value.destructiveHint !== true;
-}
-
-function serenaReadCacheKey(tool: string, args: Record<string, unknown>): string {
-  return crypto.createHash('sha256').update(tool).update('\0').update(JSON.stringify(args)).digest('hex');
-}
-
-async function serenaFileCacheDependency(
-  binding: SerenaSessionBinding, tool: string, args: Record<string, unknown>, deadlineAt: number,
-): Promise<{ relativePath: string; contentHash: string } | undefined> {
-  if (!SERENA_FILE_LOCAL_CACHE_TOOLS.has(tool)) return undefined;
-  const requested = typeof args.relative_path === 'string' ? args.relative_path.trim() : '';
-  if (!requested || path.isAbsolute(requested)) return undefined;
-  const lexical = path.resolve(binding.root, requested);
-  const [rootReal, fileReal] = await Promise.all([
-    waitForOperationUntil(fs.realpath(binding.root), deadlineAt, 'Resolve Serena cache workspace root'),
-    waitForOperationUntil(fs.realpath(lexical), deadlineAt, 'Resolve Serena cache dependency'),
-  ]).catch((error) => {
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return [undefined, undefined] as const;
-    throw error;
-  });
-  if (!rootReal || !fileReal) return undefined;
-  const relative = path.relative(rootReal, fileReal);
-  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return undefined;
-  const stats = await waitForOperationUntil(fs.stat(fileReal), deadlineAt, 'Stat Serena cache dependency');
-  if (!stats.isFile() || stats.size > SERENA_FILE_CACHE_MAX_BYTES) return undefined;
-  const bytes = await runWithAbortableTimeout(
-    (signal) => fs.readFile(fileReal, { signal }),
-    remainingOperationMs(deadlineAt, 'Read Serena cache dependency'),
-    'Read Serena cache dependency',
-  );
-  return {
-    relativePath: relative.replace(/\\/g, '/'),
-    contentHash: crypto.createHash('sha256').update(bytes).digest('hex'),
-  };
-}
-
-export async function callSessionSerenaTool(
-  args: Record<string, unknown>, timeoutMs = MCP_CALL_TIMEOUT_DEFAULT_MS, requireReadOnly = false,
-) {
-  const allowed = new Set(['tool', 'arguments', 'session']);
-  const unknown = Object.keys(args).filter((key) => !allowed.has(key));
-  if (unknown.length) throw new Error(`serena_call received unsupported argument(s): ${unknown.join(', ')}.`);
-  if (typeof args.tool !== 'string' || !MCP_READ_ONLY_POLICY_NAME.test(args.tool)) throw new Error('serena_call.tool is invalid.');
-  const tool = args.tool;
-  const toolArguments = normalizeMcpArgumentsObject(args.arguments, 'serena_call.arguments');
-  const binding = serenaBindingForCall(args.session);
-  const warmup = startSerenaWarmup(binding);
-  const warm = await settledWithin(warmup, Math.min(SERENA_COLD_START_WAIT_MS, timeoutMs));
-  if (!warm.done) return serenaColdStart(binding, 'transport');
-  await warmup;
-
-  const discoveryDeadline = Date.now() + Math.min(timeoutMs, MCP_CALL_TIMEOUT_MAX_MS);
-  const selected = await withRuntimeLease(discoveryDeadline, async (runtime, state) => {
-    await ensureSerenaDefinition(runtime, binding, discoveryDeadline);
-    const tools = await listRuntimeTools(runtime, binding.serverName, true, discoveryDeadline);
-    const found = tools.find((candidate) => candidate.name === tool);
-    if (!found) throw new Error(`Serena tool '${tool}' is not available for this workspace.`);
-    return { tool: found, runtimeGeneration: state.generation };
-  });
-
-  const selectedReadOnly = discoveredToolReadOnly(selected.tool);
-  if (requireReadOnly && !selectedReadOnly) {
-    throw new Error(`Serena read batch requires a read-only tool; '${tool}' is not read-only.`);
-  }
-
-  if (selectedReadOnly) {
-    const cacheKey = serenaReadCacheKey(tool, toolArguments);
-    const dependency = await serenaFileCacheDependency(binding, tool, toolArguments, discoveryDeadline);
-    const cached = binding.completedReads.get(cacheKey);
-    if (cached) {
-      if (dependency && cached.runtimeGeneration === selected.runtimeGeneration &&
-          cached.relativePath === dependency.relativePath && cached.contentHash === dependency.contentHash) {
-        return { status: 'ready', workspaceSession: binding.token, root: binding.root, cached: true, result: cached.result };
-      }
-      binding.completedReads.delete(cacheKey);
-    }
-    let pending = binding.pendingReads.get(cacheKey);
-    if (!pending) {
-      const callDeadline = Date.now() + MCP_CALL_TIMEOUT_MAX_MS;
-      let pendingPromise!: Promise<unknown>;
-      const releasePending = () => {
-        if (binding.pendingReads.get(cacheKey) === pendingPromise) binding.pendingReads.delete(cacheKey);
-      };
-      pendingPromise = withRuntimeLease(callDeadline, async (runtime, state) => {
-        await ensureSerenaDefinition(runtime, binding, callDeadline);
-        return {
-          result: await callRuntimeTool(
-            runtime, binding.serverName, tool, toolArguments, callDeadline, 'read_only',
-          ),
-          runtimeGeneration: state.generation,
-        };
-      }).then(({ result, runtimeGeneration }) => {
-        binding.semanticReady = true;
-        binding.lastError = undefined;
-        if (dependency) {
-          // The semantic result is already complete. Cache bookkeeping must never
-          // delay its return path; keep the resolved pending read reusable until
-          // the post-read dependency check either publishes or declines the cache.
-          void serenaFileCacheDependency(
-            binding, tool, toolArguments, Date.now() + 5_000,
-          ).then((dependencyAfter) => {
-            if (serenaSessionBindings.get(binding.token) !== binding) return;
-            if (dependencyAfter && dependencyAfter.relativePath === dependency.relativePath &&
-                dependencyAfter.contentHash === dependency.contentHash) {
-              binding.completedReads.set(cacheKey, {
-                result, runtimeGeneration, relativePath: dependency.relativePath, contentHash: dependency.contentHash,
-              });
-              while (binding.completedReads.size > 16) binding.completedReads.delete(binding.completedReads.keys().next().value!);
-            }
-          }).catch(() => undefined).finally(releasePending);
-        } else {
-          queueMicrotask(releasePending);
-        }
-        return result;
-      }).catch((error) => {
-        binding.lastError = error instanceof Error ? error.message : String(error);
-        releasePending();
-        throw error;
-      });
-      pending = pendingPromise;
-      binding.pendingReads.set(cacheKey, pending);
-      void pending.catch(() => undefined);
-    }
-    const settled = await settledWithin(pending, Math.min(SERENA_COLD_START_WAIT_MS, timeoutMs));
-    if (!settled.done) return serenaColdStart(binding, 'semantic');
-    return { status: 'ready', workspaceSession: binding.token, root: binding.root, cached: false, result: settled.value };
-  }
-
-  // Mutating Serena operations can invalidate any file-local semantic cache.
-  // Clear before execution because a failing refactor may still have changed the workspace.
-  binding.completedReads.clear();
-
-  if (!binding.semanticReady && binding.transportReadyAt) {
-    const remainingWarmWindow = SERENA_COLD_START_WAIT_MS - (Date.now() - binding.transportReadyAt);
-    if (remainingWarmWindow > 0) await new Promise((resolve) => setTimeout(resolve, remainingWarmWindow));
-  }
-  const callDeadline = Date.now() + Math.min(timeoutMs, MCP_CALL_TIMEOUT_MAX_MS);
-  const result = await withRuntimeLease(callDeadline, async (runtime) => {
-    await ensureSerenaDefinition(runtime, binding, callDeadline);
-    return callRuntimeTool(runtime, binding.serverName, tool, toolArguments, callDeadline);
-  });
-  binding.semanticReady = true;
-  return { status: 'ready', workspaceSession: binding.token, root: binding.root, cached: false, result };
-}
-
-export async function callSessionSerenaReadBatch(
-  args: Record<string, unknown>, timeoutMs = MCP_CALL_TIMEOUT_DEFAULT_MS,
-) {
-  const allowed = new Set(['calls', 'session', 'concurrency']);
-  const unknown = Object.keys(args).filter((key) => !allowed.has(key));
-  if (unknown.length) throw new Error(`serena_read_batch received unsupported argument(s): ${unknown.join(', ')}.`);
-  if (!Array.isArray(args.calls) || args.calls.length < 1 || args.calls.length > SERENA_READ_BATCH_MAX_CALLS) {
-    throw new Error(`serena_read_batch.calls must contain 1-${SERENA_READ_BATCH_MAX_CALLS} calls.`);
-  }
-  const concurrency = args.concurrency === undefined ? 4 : Number(args.concurrency);
-  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > SERENA_READ_BATCH_MAX_CONCURRENCY) {
-    throw new Error(`serena_read_batch.concurrency must be an integer from 1 to ${SERENA_READ_BATCH_MAX_CONCURRENCY}.`);
-  }
-  const calls = args.calls.map((raw, index) => {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-      throw new Error(`serena_read_batch.calls[${index}] must be an object.`);
-    }
-    const item = raw as Record<string, unknown>;
-    const itemUnknown = Object.keys(item).filter((key) => key !== 'tool' && key !== 'arguments');
-    if (itemUnknown.length) {
-      throw new Error(`serena_read_batch.calls[${index}] has unsupported field(s): ${itemUnknown.join(', ')}.`);
-    }
-    if (typeof item.tool !== 'string' || !MCP_READ_ONLY_POLICY_NAME.test(item.tool)) {
-      throw new Error(`serena_read_batch.calls[${index}].tool is invalid.`);
-    }
-    return {
-      tool: item.tool,
-      arguments: normalizeMcpArgumentsObject(item.arguments, `serena_read_batch.calls[${index}].arguments`),
-    };
-  });
-
-  const binding = serenaBindingForCall(args.session);
-  const warmup = startSerenaWarmup(binding);
-  const warm = await settledWithin(warmup, Math.min(SERENA_COLD_START_WAIT_MS, timeoutMs));
-  if (!warm.done) {
-    return { ...serenaColdStart(binding, 'transport'), results: [], requestedCalls: calls.length };
-  }
-  await warmup;
-
-  const deadlineAt = Date.now() + Math.min(timeoutMs, MCP_CALL_TIMEOUT_MAX_MS);
-  const results = new Array<unknown>(calls.length);
-  let next = 0;
-  const worker = async () => {
-    for (;;) {
-      const index = next++;
-      if (index >= calls.length) return;
-      const item = calls[index];
-      const remainingMs = remainingOperationMs(deadlineAt, `Serena read batch call ${index}`);
-      const outcome = await callSessionSerenaTool({
-        tool: item.tool, arguments: item.arguments, session: binding.token,
-      }, remainingMs, true);
-      results[index] = 'cached' in outcome && 'result' in outcome
-        ? {
-            index, tool: item.tool, status: outcome.status, cached: outcome.cached === true,
-            ...(outcome.result === undefined ? {} : { result: outcome.result }),
-          }
-        : { index, tool: item.tool, status: outcome.status };
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(concurrency, calls.length) }, worker));
-  const allReady = results.every((value) =>
-    !!value && typeof value === 'object' && (value as Record<string, unknown>).status === 'ready');
-  return {
-    status: allReady ? 'ready' : 'cold_start',
-    workspaceSession: binding.token,
-    root: binding.root,
-    concurrency: Math.min(concurrency, calls.length),
-    results,
-  };
 }
 
 export function assertBoundedProxyValue(value: unknown, label: string): { bytes: number; nodes: number } {
@@ -1467,7 +918,6 @@ export async function listExternalMcpTools(args: {
       ...(args.tool
         ? { tool: listBuiltinAcceleratorTools(args.tool) }
         : { tools: listBuiltinAcceleratorTools() }),
-      routing_guidance: EXTERNAL_MCP_ROUTING_GUIDANCE,
     });
   }
 
@@ -1478,7 +928,6 @@ export async function listExternalMcpTools(args: {
       ...(args.tool
         ? { tool: listBuiltinCoreTools(args.tool) }
         : { tools: listBuiltinCoreTools() }),
-      routing_guidance: EXTERNAL_MCP_ROUTING_GUIDANCE,
     });
   }
 
@@ -1486,7 +935,6 @@ export async function listExternalMcpTools(args: {
     return textResult({
       server: BUILTIN_CONTEXT_SERVER_ID,
       ...(args.tool ? { tool: listBuiltinContextTools(args.tool) } : { tools: listBuiltinContextTools() }),
-      routing_guidance: EXTERNAL_MCP_ROUTING_GUIDANCE,
     });
   }
 
@@ -1507,7 +955,6 @@ export async function listExternalMcpTools(args: {
       server: args.server,
       tools: discovery.tools.map((tool) => compactTool(tool, args.server)) ,
       ...(instructions ? { instructions } : {}),
-      routing_guidance: EXTERNAL_MCP_ROUTING_GUIDANCE,
     });
   }
 
@@ -1589,15 +1036,15 @@ export async function callExternalMcpTool(args: {
   if (args.server === BUILTIN_CONTEXT_SERVER_ID) {
     listBuiltinContextTools(args.tool);
     if (args.tool === 'serena_workspace') {
-      const operation = callSerenaWorkspaceTool(toolArguments, operationTimeoutMs);
+      const operation = callPrivateSerenaWorkspaceTool(toolArguments, operationTimeoutMs);
       return textResult(await waitForOperationUntil(operation, responseDeadlineAt, 'Builtin Serena workspace call'));
     }
     if (args.tool === 'serena_call') {
-      const operation = callSessionSerenaTool(toolArguments, operationTimeoutMs);
+      const operation = callPrivateSerenaTool(toolArguments, operationTimeoutMs);
       return textResult(await waitForOperationUntil(operation, responseDeadlineAt, 'Builtin session Serena call'));
     }
     if (args.tool === 'serena_read_batch') {
-      const operation = callSessionSerenaReadBatch(toolArguments, operationTimeoutMs);
+      const operation = callPrivateSerenaReadBatch(toolArguments, operationTimeoutMs);
       return textResult(await waitForOperationUntil(operation, responseDeadlineAt, 'Builtin session Serena read batch'));
     }
     const operation = (async () => {
@@ -1606,8 +1053,8 @@ export async function callExternalMcpTool(args: {
         callBuiltin: (tool, toolArgs, callTimeout) => callBuiltinAcceleratorTool(tool, toolArgs, callTimeout),
         callTrustedExternal: callTrustedReadOnlyExternalMcpTool,
         assertWorkspace: assertExternalContextWorkspace,
-        callSessionSemantic: callTrustedReadOnlySessionSerenaTool,
-        assertSessionWorkspace: assertSessionSerenaContextWorkspace,
+        callSessionSemantic: callPrivateReadOnlySerenaTool,
+        assertSessionWorkspace: assertPrivateSerenaContextWorkspace,
       }, operationTimeoutMs);
     })();
     return textResult(await waitForOperationUntil(operation, responseDeadlineAt, 'Builtin code-context orchestration call'));
@@ -1633,13 +1080,10 @@ export async function callExternalMcpTool(args: {
   );
 
   assertBoundedProxyValue(result, `External MCP result ${args.server}/${args.tool}`);
-  if (result && typeof result === 'object' && Array.isArray((result as { content?: unknown }).content)) {
-    // Preserve the complete extensible CallToolResult. Whitelisting today's
-    // known fields would silently drop future MCP/server-specific extensions.
-    const downstream = result as Record<string, unknown> & { content: ServerResult['content'] };
-    return { ...downstream, content: downstream.content } as ServerResult;
-  }
-  return textResult(result);
+  // A downstream MCP call has exactly one legal response interface. Do not
+  // turn arrays, null, strings, or foreign JSON into successful text results:
+  // that hides a protocol break and can poison the frozen remote call lane.
+  return normalizeMcpToolResult(result, `External MCP result ${args.server}/${args.tool}`);
 }
 
 
@@ -1691,7 +1135,15 @@ export function parseExternalMcpCompatUri(raw: string): ExternalMcpCompatTarget 
     throw new Error('MCP compatibility URI server/tool names cannot contain path separators.');
   }
   const query = { ...(timeout_ms ? { timeout_ms } : {}), ...(envelope ? { envelope } : {}) };
-  if (parts.length === 0 || (parts.length === 1 && parts[0] === 'servers')) return query;
+  if (
+    parts.length === 0
+    || (parts.length === 1 && parts[0] === 'servers')
+    // Recovery alias for a model-generated discovery URI. Without this exact
+    // alias, mcp://servers/discovery is misparsed as server="servers" and
+    // tool="discovery", so a healthy first discovery turn is followed by a
+    // deterministic second-turn failure before any intended tool can run.
+    || (parts.length === 2 && parts[0] === 'servers' && parts[1] === 'discovery')
+  ) return query;
   if (parts.length > 2) throw new Error('MCP compatibility URI must be mcp://<server>[/<tool>].');
   return { server: parts[0], ...(parts[1] ? { tool: parts[1] } : {}), ...query };
 }
@@ -1775,12 +1227,13 @@ export async function readExternalMcpCompatUri(raw: string, options?: Record<str
     throw new Error(`MCP read-only invocation is not enabled for '${target.server}/${target.tool}'. The local ${MCP_READ_ONLY_POLICY_ENV} policy must explicitly allow it; downstream annotations are not trusted.`);
   }
   const toolArguments = normalizeMcpArgumentsObject(options, 'MCP compatibility read options');
-  return callExternalMcpTool({
+  const result = await callExternalMcpTool({
     server: target.server,
     tool: target.tool,
     arguments: toolArguments,
     timeout_ms: target.timeout_ms,
   });
+  return normalizeFrozenWrapperResult('read_file', result);
 }
 
 function serverResultContentBytes(result: ServerResult): number {
@@ -1864,6 +1317,7 @@ export async function callExternalMcpCompatUri(raw: string, content: string) {
   } catch {
     throw new Error('MCP write_file compatibility payload must be JSON.');
   }
+  assertNoUnexpectedJsonControlCharacters(parsed, 'MCP compatibility payload');
   const value = normalizeMcpArgumentsObject(parsed, 'MCP compatibility payload');
   const legacyShape = looksLikeLegacyCompatEnvelope(value);
   const processBudgetArgs = isLocalProcessWaitTarget(target.server, target.tool) && legacyShape
@@ -1937,17 +1391,24 @@ export async function callExternalMcpCompatUri(raw: string, content: string) {
     target.server, target.tool, toolArguments, totalTimeout, remaining,
   );
 
-  return callExternalMcpTool({
+  const result = await callExternalMcpTool({
     server: target.server,
     tool: target.tool,
     arguments: toolArguments,
     timeout_ms,
   });
+  return normalizeFrozenWrapperResult('write_file', result);
 }
 
 export async function closeExternalMcpRuntime(): Promise<void> {
   const current = runtimeState;
   runtimeState = undefined;
-  if (!current) return;
-  await closeRuntimeStateBounded(current, MCP_RUNTIME_CLOSE_TIMEOUT_MS);
+  if (current) await closeRuntimeStateBounded(current, MCP_RUNTIME_CLOSE_TIMEOUT_MS);
+}
+
+export async function closeAllMcpRuntimes(): Promise<void> {
+  await Promise.all([
+    closeExternalMcpRuntime(),
+    closePrivateSerenaRuntime(),
+  ]);
 }

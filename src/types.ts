@@ -29,6 +29,10 @@ export interface OutputDecodingInfo {
 
 export interface TerminalSession {
   pid: number;
+  /** Opaque capability for process-scoped follow-up calls. */
+  terminalSessionId: string;
+  /** Remote conversation/thread identity that created this session, when supplied. */
+  ownerSessionIdentity?: string;
   process: TerminalProcessHandle;
   backend: 'pipe' | 'pty';
   processTreeOwner?: 'windows_job' | 'posix_group' | 'pid_tree';
@@ -90,6 +94,7 @@ export interface OutputEvent {
 
 export interface ActiveSession {
   pid: number;
+  terminalSessionId: string;
   backend: 'pipe' | 'pty';
   processTreeOwner?: TerminalSession['processTreeOwner'];
   executionKind: 'auto' | 'finite' | 'interactive' | 'service';

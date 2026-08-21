@@ -12,7 +12,7 @@ import { runSetup } from './npm-scripts/setup.js';
 import { runUninstall } from './npm-scripts/uninstall.js';
 import { capture } from './utils/capture.js';
 import { logToStderr, logger } from './utils/logger.js';
-import { closeExternalMcpRuntime } from './tools/external-mcp.js';
+import { closeAllMcpRuntimes } from './tools/external-mcp.js';
 import { runRemote } from './npm-scripts/remote.js';
 import { ensureChromeAvailable } from './tools/pdf/markdown.js';
 
@@ -55,16 +55,31 @@ async function runServer() {
     // This must happen before any code that might use logger.*
     const transport = new FilteredStdioServerTransport();
     // Protocol.connect preserves and chains a pre-existing transport.onclose.
-    // Close external MCP stdio children when this local DC stdio session ends,
-    // otherwise Serena/CRG transports can keep the process/resource tree alive.
+    // This stdio transport owns the entire local Desktop Commander child process.
+    // Consecutive remote tool calls reuse the same child/transport; an onclose here
+    // therefore means the child lifetime is ending and all owned MCP/Serena/LSP
+    // resources must be released deterministically.
     transport.onclose = () => {
-      void closeExternalMcpRuntime().catch((error) => {
-        process.stderr.write(`[WARN] External MCP cleanup failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      void closeAllMcpRuntimes().catch((error) => {
+        process.stderr.write(`[WARN] MCP transport cleanup failed: ${error instanceof Error ? error.message : String(error)}\n`);
       });
     };
 
     // Export transport for use throughout the application
     global.mcpTransport = transport;
+
+    let signalShutdownStarted = false;
+    const shutdownFromSignal = (signal: 'SIGINT' | 'SIGTERM', exitCode: number) => {
+      if (signalShutdownStarted) return;
+      signalShutdownStarted = true;
+      void closeAllMcpRuntimes()
+        .catch((error) => {
+          process.stderr.write(`[WARN] MCP ${signal} cleanup failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        })
+        .finally(() => process.exit(exitCode));
+    };
+    process.once('SIGINT', () => shutdownFromSignal('SIGINT', 130));
+    process.once('SIGTERM', () => shutdownFromSignal('SIGTERM', 143));
 
     try {
       deferLog('info', 'Loading configuration...');
@@ -102,6 +117,7 @@ async function runServer() {
       });
 
       logger.error(`Uncaught exception: ${errorMessage}`);
+      await closeAllMcpRuntimes().catch(() => undefined);
       process.exit(1);
     });
 
@@ -120,6 +136,7 @@ async function runServer() {
       });
 
       logger.error(`Unhandled rejection: ${errorMessage}`);
+      await closeAllMcpRuntimes().catch(() => undefined);
       process.exit(1);
     });
 
@@ -178,6 +195,7 @@ async function runServer() {
     capture('run_server_failed_start_error', {
       error: errorMessage
     });
+    await closeAllMcpRuntimes().catch(() => undefined);
     process.exit(1);
   }
 }
@@ -196,5 +214,6 @@ runServer().catch(async (error) => {
   capture('run_server_fatal_error', {
     error: errorMessage
   });
+  await closeAllMcpRuntimes().catch(() => undefined);
   process.exit(1);
 });

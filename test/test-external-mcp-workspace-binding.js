@@ -55,21 +55,6 @@ async function main() {
     }, {});
     assert.equal(path.resolve(relativeDefinition.repo_root), path.join(repoRoot, 'src'));
 
-    const serenaDefinition = {
-      name: 'serena-bound',
-      command: {
-        kind: 'stdio', command: 'uv', cwd: repoRoot,
-        args: ['run', '--project', path.join(repoRoot, 'vendor-runtime'), 'serena', 'start-mcp-server', '--project', path.join(repoRoot, 'src')],
-      },
-    };
-    const serenaWorkspace = await resolveExternalMcpWorkspaceDefinition(serenaDefinition);
-    assert.equal(path.resolve(serenaWorkspace), path.join(repoRoot, 'src'));
-    const serenaBound = await bindExternalMcpWorkspaceDefinition(
-      serenaDefinition, { relative_path: 'server.ts' }, Date.now() + 30_000, false,
-    );
-    assert.equal(Object.hasOwn(serenaBound, 'repo_root'), false);
-    assert.equal(serenaBound.relative_path, 'server.ts');
-
     const serverOwnedRoot = await bindExternalMcpWorkspaceDefinition({
       name: 'server-owned-root',
       command: { kind: 'stdio', command: 'node', args: ['--repo', repoRoot], cwd: repoRoot },

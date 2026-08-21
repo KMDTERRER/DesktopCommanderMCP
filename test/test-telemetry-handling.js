@@ -5,7 +5,11 @@ import {
   isTelemetryDisabledValue,
   normalizeTelemetryEnabledValue,
 } from '../dist/config-manager.js';
-import { isInsideUiOriginCall, runInUiOriginCallContext } from '../dist/utils/capture.js';
+import {
+  isInsideUiOriginCall,
+  normalizeRemoteTelemetryForUpstream,
+  runInUiOriginCallContext,
+} from '../dist/utils/capture.js';
 import { setConfigValue } from '../dist/tools/config.js';
 
 function testTelemetryHelpers() {
@@ -22,6 +26,39 @@ function testTelemetryHelpers() {
   assert.strictEqual(isTelemetryDisabledValue('true'), false);
 
   console.log('ok: telemetry helpers');
+}
+
+function testRemoteTelemetryMatchesUpstreamContract() {
+  console.log('\n--- Test: remote telemetry matches upstream contract ---');
+
+  assert.strictEqual(
+    normalizeRemoteTelemetryForUpstream('remote_device_result_outbox_write_failed', { call_id: 'secret' }),
+    null,
+    'fork-only telemetry event must be dropped',
+  );
+  assert.deepStrictEqual(
+    normalizeRemoteTelemetryForUpstream('remote_channel_state_health', {
+      state: 'errored', attempt: 2, owner: 'fork-only', call_id: 'secret',
+    }),
+    { event: 'remote_channel_state_health', properties: { state: 'errored', attempt: 2 } },
+    'fork-only fields must be removed from an upstream event',
+  );
+  assert.deepStrictEqual(
+    normalizeRemoteTelemetryForUpstream('remote_result_transport_commit_error', {
+      error: 'failed', callId: 'secret', status: 'completed', deliveryMode: 'replay',
+    }),
+    { event: 'remote_channel_update_call_result_error', properties: { error: 'failed' } },
+    'new result transport failures must use the original upstream event envelope',
+  );
+  assert.deepStrictEqual(
+    normalizeRemoteTelemetryForUpstream('remote_channel_result_wake_failed', {
+      call_id: 'secret', error: 'failed',
+    }),
+    { event: 'remote_channel_result_doorbell_send_failed', properties: { error: 'failed' } },
+    'new result wake failures must use the original upstream event envelope',
+  );
+
+  console.log('ok: remote telemetry upstream contract');
 }
 
 async function testConfigManagerCoercion() {
@@ -166,6 +203,7 @@ export default async function runTests() {
 
   try {
     testTelemetryHelpers();
+    testRemoteTelemetryMatchesUpstreamContract();
     await testConfigManagerCoercion();
     await testSetConfigValueCoercion();
     await testCapturePathRespectsStringFalse();

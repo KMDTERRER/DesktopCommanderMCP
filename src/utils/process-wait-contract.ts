@@ -1,6 +1,10 @@
 export const PROCESS_WAIT_DEFAULT_MS = 90_000;
 export const PROCESS_WAIT_MAX_MS = 7 * 60_000;
 export const CPP_BUILD_AUTO_OBSERVE_MAX_MS = 30_000;
+// Remote tool RPCs must periodically return control to the model even when the
+// owned terminal session is still healthy. The process itself is never killed;
+// callers can observe the same PID again.
+export const PROCESS_REMOTE_OBSERVE_MAX_MS = 30_000;
 export const PROCESS_STALL_DEFAULT_MS = 0;
 export const PROCESS_INTERACTION_DEFAULT_MS = 8_000;
 export const PROCESS_TRANSPORT_RESERVE_MS = 10_000;
@@ -8,6 +12,7 @@ export const PROCESS_TRANSPORT_TIMEOUT_MAX_MS = PROCESS_WAIT_MAX_MS + PROCESS_TR
 export const PROCESS_CLIENT_RESPONSE_RESERVE_MS = 5_000;
 export const PROCESS_CLIENT_TIMEOUT_MAX_MS = PROCESS_TRANSPORT_TIMEOUT_MAX_MS + PROCESS_CLIENT_RESPONSE_RESERVE_MS;
 export const PROCESS_INITIAL_OUTPUT_MAX_CHARS = 64 * 1024;
+export const PROCESS_STRUCTURED_OUTPUT_MAX_CHARS = 64 * 1024;
 
 export type ProcessWaitToolName =
   | 'start_process'
@@ -19,6 +24,10 @@ export type ProcessWaitToolName =
 export function isProcessWaitToolName(tool: string): tool is ProcessWaitToolName {
   return tool === 'start_process' || tool === 'read_process_output' ||
     tool === 'interact_with_process' || tool === 'wait_process' || tool === 'cpp_build_execute';
+}
+
+export function processObservationWaitMs(requestedMs: number, isRemote: boolean): number {
+  return isRemote ? Math.min(requestedMs, PROCESS_REMOTE_OBSERVE_MAX_MS) : requestedMs;
 }
 
 export function processToolWaitMs(tool: string, args: Record<string, unknown>): number | null {

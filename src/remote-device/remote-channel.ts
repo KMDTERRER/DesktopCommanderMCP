@@ -4,23 +4,24 @@ import { runWithAbortableTimeout } from '../utils/withTimeout.js';
 import { VERSION } from '../version.js';
 import { randomUUID } from 'crypto';
 import { SessionTokenOwner, type AuthSession } from './session-token-owner.js';
-import { CLAIM_METADATA_KEY, stripNullBytes } from './remote-result-contract.js';
-import type { RemoteInboundMode } from './remote-runtime-config.js';
+import { createRemoteOutcomeIdentity, stripNullBytes, type RemoteResultDeliveryMode } from './remote-result-contract.js';
 import { describeRemoteError } from './transient-remote-error.js';
 import { diagnoseRemoteEndpoint } from './remote-network-diagnostics.js';
-
-const DEVICE_SESSION_CAPABILITY_KEY = 'device_session_v1';
-
-interface DeviceSessionLease {
-    generation: string;
-    acquired_at: string;
-}
+import { normalizeMcpToolResult } from '../utils/mcp-tool-error.js';
 
 export interface RemoteResultWakeAck {
     attempted: boolean;
     status: string;
     durationMs: number;
 }
+
+export interface RemoteCallClaimTarget {
+    deviceId: string;
+    userId: string;
+    toolName: string;
+}
+
+export type RemoteResultCommitDisposition = 'committed' | 'already_committed';
 
 interface DeviceData {
     user_id: string;
@@ -62,19 +63,6 @@ const REMOTE_CALL_CLAIM_ATTEMPTS = 3;
 // chains such as statusWriteChain; abortSignal cancels the request itself.
 const REMOTE_CONTROL_QUERY_TIMEOUT_MS = 15000;
 const REMOTE_HEARTBEAT_WRITE_TIMEOUT_MS = 5000;
-// When private Broadcast is unavailable, Postgres Changes can lag by seconds.
-// Poll only while degraded: fast during an active recovery window, then idle-slow.
-const DEGRADED_CALL_POLL_FAST_MS = 250;
-const DEGRADED_CALL_POLL_IDLE_MS = 1000;
-const DEGRADED_CALL_POLL_BURST_MS = 30_000;
-const DEGRADED_CALL_POLL_TIMEOUT_MS = 5000;
-const DEGRADED_CALL_POLL_BATCH = 16;
-// A broadcast-selected row arriving this late through legacy delivery proves the
-// primary transport missed its low-latency contract, even if SDK state says joined.
-const BROADCAST_DELIVERY_MISS_MS = 750;
-const BROADCAST_MISS_RECOVERY_COOLDOWN_MS = 30_000;
-const RECENT_BROADCAST_CALL_TTL_MS = 60_000;
-const RECENT_BROADCAST_CALLS_MAX = 256;
 // realtime-js parks in 'disconnecting' for ~100ms after a disconnect and
 // connect() early-returns for that whole window (see waitForSocketSettled).
 // Bound generously — this only ever delays a recreate, which RECREATE_TIMEOUT_MS
@@ -103,8 +91,6 @@ export class RemoteChannel {
     private capabilityWriteChain: Promise<void> = Promise.resolve();
     /** Fences terminal writes to the process that won pending -> executing. */
     private callClaimTokens = new Map<string, string>();
-    /** Exact metadata written with the winning claim, retained for durable terminal identity. */
-    private callClaimMetadata = new Map<string, Record<string, unknown>>();
     /** Set by unsubscribe(): suppresses status/heartbeat writes so they can't
      * land after setOffline()'s durable write. */
     private shuttingDown = false;
@@ -119,28 +105,18 @@ export class RemoteChannel {
     /** False when presence publishing failed on an otherwise healthy channel;
      * the health check retries, since SUBSCRIBED won't fire again. */
     private presenceTracked = false;
-    /** Local MCP tools/resources advertised by DesktopCommanderIntegration.
-     * Kept separately from transport state so capability flag updates cannot
-     * erase the tool catalog in the device JSONB record. */
+    /** Last validated local MCP catalog. It is deliberately process-local.
+     *
+     * The hosted relay owns its public tool catalog. Upstream v0.2.47 publishes
+     * only transport/version data in mcp_devices.capabilities. Publishing the
+     * complete child tools/list envelope here makes the hosted relay treat local
+     * implementation detail as connector capabilities (and can invalidate the
+     * connector when the fork exposes tools the relay does not know about). */
     private deviceCapabilities: Record<string, any> = {};
-    /** Device-process generation used to fence every write after registration acquisition. */
-    private deviceSessionLease: DeviceSessionLease | null = null;
     /** Last transport capability value written (null = never), to avoid redundant writes. */
     private transportCapableWritten: boolean | null = null;
     /** Presence push in flight for the current private-channel generation. */
     private trackingPresenceGeneration: number | null = null;
-    private minimalInboundMode: RemoteInboundMode | null = null;
-    private minimalInboundSwitch: Promise<void> = Promise.resolve();
-    private degradedCallPollTimer: NodeJS.Timeout | null = null;
-    private degradedCallPollInFlight = false;
-    private degradedCallPollBurstUntil = 0;
-    private lastBroadcastMissRecoveryAt = 0;
-    /** Broadcast doorbells already observed; late postgres_changes copies are expected duplicates. */
-    private recentBroadcastCalls = new Map<string, number>();
-    /** A delivery miss suppresses broadcast capability for this exact channel generation.
-     * Presence can remain valid; only a new private-channel generation may clear suppression. */
-    private broadcastSuppressedGeneration: number | null = null;
-
     // Track last device status to prevent duplicate log messages
     private lastDeviceStatus: 'online' | 'offline' = 'offline';
     private channelHealthReporter: ((ready: boolean) => void) | null = null;
@@ -168,20 +144,10 @@ export class RemoteChannel {
         this.queueStatusWrite(ready ? 'online' : 'offline');
     }
 
-    constructor(
-        private readonly tokens: SessionTokenOwner = new SessionTokenOwner(),
-        private readonly minimalLiveTest = false,
-    ) {}
+    constructor(private readonly tokens: SessionTokenOwner = new SessionTokenOwner()) {}
 
     initialize(url: string, key: string): void {
-        this.client = createClient(url, key, this.minimalLiveTest ? {
-            auth: {
-                autoRefreshToken: false,
-                persistSession: false,
-                detectSessionInUrl: false,
-            },
-            realtime: { timeout: REALTIME_ACK_TIMEOUT_MS },
-        } : {
+        this.client = createClient(url, key, {
             realtime: { timeout: REALTIME_ACK_TIMEOUT_MS },
         });
     }
@@ -383,26 +349,14 @@ export class RemoteChannel {
     }
 
     async refreshDeviceCapabilities(capabilities: any): Promise<void> {
-        this.deviceCapabilities = capabilities && typeof capabilities === 'object' ? capabilities : {};
-        if (!this.client || !this.deviceId) return;
-        await this.enqueueCapabilityWrite(async () => {
-            if (!this.client || !this.deviceId) return;
-            const { error } = await this.runDbQuery(
-                'refreshDeviceCapabilities', REMOTE_CONTROL_QUERY_TIMEOUT_MS,
-                (signal) => this.client!
-                    .from('mcp_devices')
-                    .update({ capabilities: this.capabilitiesPayload(this.transportCapableWritten === true) })
-                    .contains('capabilities', this.deviceSessionFence())
-                    .eq('id', this.deviceId!)
-                    .abortSignal(signal),
-            );
-            if (error) {
-                console.error('[DEBUG] Failed to refresh device capabilities:', error.message);
-                await captureRemote('remote_channel_capabilities_refresh_error', { error });
-                throw error;
-            }
-            console.debug('[DEBUG] Device tool capabilities refreshed');
-        });
+        if (!capabilities || typeof capabilities !== 'object' || !Array.isArray(capabilities.tools)) {
+            throw new Error('Refusing to replace device capabilities with an invalid tools/list envelope');
+        }
+        this.deviceCapabilities = capabilities;
+        // Keep this validation/cache boundary because a restarted child may have
+        // a different local catalog. Do not publish it into the hosted relay's
+        // capability namespace; the relay's public schemas are server-owned.
+        console.debug('[DEBUG] Local MCP tool catalog refreshed (not published to hosted capabilities)');
     }
 
     async registerDevice(capabilities: any, currentDeviceId: string | undefined, deviceName: string, onToolCall: (payload: any) => void): Promise<void> {
@@ -415,8 +369,6 @@ export class RemoteChannel {
         this.deviceCapabilities = capabilities && typeof capabilities === 'object'
             ? capabilities
             : {};
-
-        this.deviceSessionLease = { generation: randomUUID(), acquired_at: new Date().toISOString() };
 
         let existingDevice = null;
 
@@ -449,16 +401,6 @@ export class RemoteChannel {
 
             // Create and subscribe to the channel
             console.debug('[DEBUG] Calling createChannel()');
-
-            if (this.minimalLiveTest) {
-                // A/B benchmark path matching the installed upstream 0.2.47:
-                // one postgres_changes stream carrying the complete row. No
-                // private doorbell, Presence, result wake or transport tier.
-                this.transportCapableWritten = false;
-                await this.createMinimalLiveChannel();
-                this.minimalInboundMode = 'postgres_changes';
-                return;
-            }
 
             // Independent safety net for the doorbell transport.
             this.createLegacyChannel();
@@ -527,10 +469,7 @@ export class RemoteChannel {
                 this.presenceTracked = true;
                 console.log(`Presence tracked (device ${this.deviceId} visible as online)`);
                 captureRemote('remote_channel_presence_tracked', { recoveredAfterAttempts: recovered }).catch(() => { });
-                const broadcastSuppressed = this.broadcastSuppressedGeneration === expectedGeneration;
-                if (!broadcastSuppressed) await this.setTransportCapable(true);
-                if (!broadcastSuppressed && this.transportCapableWritten === true) this.stopDegradedCallPolling();
-                else this.startDegradedCallPolling();
+                await this.setTransportCapable(true);
                 return;
             }
 
@@ -540,7 +479,6 @@ export class RemoteChannel {
 
         if (expectedGeneration !== this.channelGeneration) return;
         this.presenceTracked = false;
-        this.startDegradedCallPolling();
         console.error('Presence track failed after retries - reverting to the legacy transport tier');
         captureRemote('remote_channel_presence_track_error', { attempts }).catch(() => { });
         await this.setTransportCapable(false);
@@ -550,27 +488,11 @@ export class RemoteChannel {
      * The complete `capabilities` JSONB value. One place only: every write
      * replaces the whole column, so a second literal would silently drop keys.
      */
-    private deviceSessionFence(): Record<string, any> {
-        if (!this.deviceSessionLease) {
-            throw new Error('Device session generation has not been acquired yet.');
-        }
-        return { [DEVICE_SESSION_CAPABILITY_KEY]: { generation: this.deviceSessionLease.generation } };
-    }
-
     private capabilitiesPayload(broadcastCapable: boolean): Record<string, any> {
-        // Reserved transport/version fields are owned here even if a malformed
-        // local capability envelope happens to contain the same keys.
-        const {
-            app_version: _ignoredAppVersion,
-            transport_broadcast_v1: _ignoredTransport,
-            [DEVICE_SESSION_CAPABILITY_KEY]: _ignoredDeviceSession,
-            ...registeredCapabilities
-        } = this.deviceCapabilities;
-
+        // Exact upstream v0.2.47 hosted contract. Do not publish fork-private
+        // ownership, tool-catalog or diagnostics fields in capabilities.
         return {
-            ...registeredCapabilities,
             app_version: VERSION,
-            ...(this.deviceSessionLease ? { [DEVICE_SESSION_CAPABILITY_KEY]: this.deviceSessionLease } : {}),
             ...(broadcastCapable ? { transport_broadcast_v1: true } : {})
         };
     }
@@ -592,7 +514,6 @@ export class RemoteChannel {
                     (signal) => this.client!
                         .from('mcp_devices')
                         .update({ capabilities })
-                        .contains('capabilities', this.deviceSessionFence())
                         .eq('id', this.deviceId!)
                         .abortSignal(signal),
                 );
@@ -647,7 +568,6 @@ export class RemoteChannel {
 
     private handlePrivateTransportFailure(error?: unknown): void {
         this.presenceTracked = false;
-        this.startDegradedCallPolling();
         if (!this.hardPrivateTransportFailure(error)) return;
         // Hard hosted authorization-pool failure: stop Phoenix's private-channel
         // auto-rejoin, but leave the legacy channel and shared socket untouched.
@@ -658,195 +578,6 @@ export class RemoteChannel {
         void this.setTransportCapable(false).catch((withdrawError: any) => {
             console.debug('[DEBUG] Immediate broadcast capability withdrawal failed:', withdrawError?.message);
         });
-    }
-
-    private rememberBroadcastCall(callId: string, receivedAtMs: number): void {
-        this.recentBroadcastCalls.delete(callId);
-        this.recentBroadcastCalls.set(callId, receivedAtMs);
-        const cutoff = receivedAtMs - RECENT_BROADCAST_CALL_TTL_MS;
-        for (const [id, seenAt] of this.recentBroadcastCalls) {
-            if (seenAt >= cutoff && this.recentBroadcastCalls.size <= RECENT_BROADCAST_CALLS_MAX) break;
-            this.recentBroadcastCalls.delete(id);
-        }
-    }
-
-    private hasRecentBroadcastCall(callId: string, nowMs: number): boolean {
-        const seenAt = this.recentBroadcastCalls.get(callId);
-        if (seenAt === undefined) return false;
-        if (nowMs - seenAt <= RECENT_BROADCAST_CALL_TTL_MS) return true;
-        this.recentBroadcastCalls.delete(callId);
-        return false;
-    }
-
-    private handleBroadcastDeliveryMiss(row: any, receivedAtMs: number): void {
-        if (row?.metadata?.transport !== 'broadcast_v1') return;
-        if (typeof row?.id === 'string' && this.hasRecentBroadcastCall(row.id, receivedAtMs)) return;
-        const createdAtMs = Date.parse(String(row?.created_at ?? ''));
-        if (!Number.isFinite(createdAtMs)) return;
-        const lagMs = Math.max(0, receivedAtMs - createdAtMs);
-        if (lagMs < BROADCAST_DELIVERY_MISS_MS) return;
-
-        // The server chose Broadcast, but legacy Postgres Changes won only after
-        // a large delay. This invalidates Broadcast delivery for this channel
-        // generation, not its already-established Presence registration.
-        this.broadcastSuppressedGeneration = this.channelGeneration;
-        this.startDegradedCallPolling();
-        if (this.transportCapableWritten === true) {
-            void this.setTransportCapable(false).catch((error: any) => {
-                console.debug('[DEBUG] Broadcast-miss capability withdrawal failed:', error?.message);
-            });
-        }
-
-        const now = Date.now();
-        if (now - this.lastBroadcastMissRecoveryAt < BROADCAST_MISS_RECOVERY_COOLDOWN_MS) return;
-        this.lastBroadcastMissRecoveryAt = now;
-        captureRemote('remote_channel_broadcast_delivery_miss', {
-            call_id: row?.id, lagMs, state: this.channel?.state ?? null,
-        }).catch(() => {});
-        // Degraded mode is authoritative until the next manual process restart.
-        // Do not create another private join from an observed delivery miss.
-    }
-
-    private degradedCallPollDelayMs(): number {
-        return Date.now() < this.degradedCallPollBurstUntil
-            ? DEGRADED_CALL_POLL_FAST_MS
-            : DEGRADED_CALL_POLL_IDLE_MS;
-    }
-
-    private scheduleDegradedCallPoll(delayMs: number): void {
-        if (this.shuttingDown || this.privateTransportReady() || this.degradedCallPollTimer || this.degradedCallPollInFlight) return;
-        this.degradedCallPollTimer = setTimeout(() => {
-            this.degradedCallPollTimer = null;
-            void this.runDegradedCallPollLoop();
-        }, delayMs);
-        this.degradedCallPollTimer.unref?.();
-    }
-
-    private startDegradedCallPolling(): void {
-        if (this.shuttingDown || this.privateTransportReady() || this.degradedCallPollTimer || this.degradedCallPollInFlight) return;
-        this.degradedCallPollBurstUntil = Date.now() + DEGRADED_CALL_POLL_BURST_MS;
-        this.scheduleDegradedCallPoll(0);
-    }
-
-    private stopDegradedCallPolling(): void {
-        if (this.degradedCallPollTimer) clearTimeout(this.degradedCallPollTimer);
-        this.degradedCallPollTimer = null;
-        this.degradedCallPollBurstUntil = 0;
-    }
-
-    private async pollPendingCallsOnce(): Promise<number> {
-        if (!this.client || !this.deviceId || this.shuttingDown) return 0;
-        const startedAt = Date.now();
-        const { data, error } = await this.runDbQuery<any>(
-            'Poll degraded pending calls', DEGRADED_CALL_POLL_TIMEOUT_MS,
-            (signal) => this.client!
-                .from('mcp_remote_calls')
-                .select('*')
-                .eq('device_id', this.deviceId!)
-                .eq('status', 'pending')
-                .order('created_at', { ascending: true })
-                .limit(DEGRADED_CALL_POLL_BATCH)
-                .abortSignal(signal),
-        );
-        if (error) throw error;
-        const rows = Array.isArray(data) ? data : [];
-        const receivedAtMs = Date.now();
-        const rowFetchMs = Math.max(0, receivedAtMs - startedAt);
-        for (const row of rows) {
-            if (!row || row.device_id !== this.deviceId || row.status !== 'pending') continue;
-            this.dispatchToolCall({
-                new: row,
-                _remoteTiming: { inbound: 'degraded_poll', receivedAtMs, rowFetchMs },
-            });
-        }
-        return rows.length;
-    }
-
-    private async runDegradedCallPollLoop(): Promise<void> {
-        if (this.degradedCallPollInFlight || this.shuttingDown || this.privateTransportReady()) return;
-        this.degradedCallPollInFlight = true;
-        let nextDelay = this.degradedCallPollDelayMs();
-        try {
-            const count = await this.pollPendingCallsOnce();
-            if (count > 0) {
-                this.degradedCallPollBurstUntil = Date.now() + DEGRADED_CALL_POLL_BURST_MS;
-                nextDelay = DEGRADED_CALL_POLL_FAST_MS;
-            }
-        } catch (error: any) {
-            nextDelay = DEGRADED_CALL_POLL_IDLE_MS;
-            if (process.env.DEBUG_MODE === 'true') {
-                console.debug('[DEBUG] Degraded pending-call poll failed:', error?.message);
-            }
-        } finally {
-            this.degradedCallPollInFlight = false;
-            if (!this.shuttingDown && !this.privateTransportReady()) {
-                this.scheduleDegradedCallPoll(nextDelay);
-            }
-        }
-    }
-
-    /** Strict minimal transport used only for live A/B latency testing. */
-    private createMinimalLiveChannel(): Promise<void> {
-        return new Promise((resolve, reject) => {
-            if (!this.client || !this.user?.id || !this.onToolCall) {
-                reject(new Error('Minimal live channel missing client/user/handler'));
-                return;
-            }
-            let settled = false;
-            const finish = (error?: unknown) => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                error ? reject(error) : resolve();
-            };
-            const channel = this.client
-                .channel('device_tool_call_queue')
-                .on(
-                    'postgres_changes' as any,
-                    { event: 'INSERT', schema: 'public', table: 'mcp_remote_calls', filter: `user_id=eq.${this.user.id}` },
-                    (payload: any) => this.dispatchToolCall(payload),
-                );
-            this.legacyChannel = channel;
-            const timer = setTimeout(() => finish(new Error('Minimal live channel subscribe timed out')), 15_000);
-            timer.unref?.();
-            channel.subscribe((status: string, error: any) => {
-                this.syncReachabilityStatus();
-                if (status === 'SUBSCRIBED') finish();
-                else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-                    finish(error ?? new Error(`Minimal live channel ${status}`));
-                }
-            });
-        });
-    }
-
-    async setMinimalInboundMode(mode: RemoteInboundMode): Promise<void> {
-        if (!this.minimalLiveTest) return;
-        const run = this.minimalInboundSwitch.then(() => this.applyMinimalInboundMode(mode));
-        this.minimalInboundSwitch = run.catch(() => {});
-        await run;
-    }
-
-    private async applyMinimalInboundMode(mode: RemoteInboundMode): Promise<void> {
-        if (mode === this.minimalInboundMode) return;
-        if (!this.deviceId || !this.user || !this.onToolCall) return;
-
-        if (mode === 'broadcast_doorbell') {
-            await this.createChannel();
-            if (this.channel?.state !== 'joined' || !this.presenceTracked || this.transportCapableWritten !== true) {
-                await this.removePrivateChannelForMinimalTest();
-                throw new Error('Broadcast doorbell transport did not become reachable');
-            }
-            await this.removeLegacyChannel();
-            this.minimalInboundMode = mode;
-            console.log('⚙ INBOUND switched to broadcast_doorbell');
-            return;
-        }
-
-        await this.createMinimalLiveChannel();
-        await this.setTransportCapable(false);
-        await this.removePrivateChannelForMinimalTest();
-        this.minimalInboundMode = mode;
-        console.log('⚙ INBOUND switched to postgres_changes');
     }
 
     private realtimeChannelRegistered(channel: RealtimeChannel): boolean {
@@ -877,15 +608,6 @@ export class RemoteChannel {
         }
     }
 
-    private async removePrivateChannelForMinimalTest(): Promise<void> {
-        const channel = this.channel;
-        if (!channel || !this.client) return;
-        this.channelGeneration += 1;
-        if (this.channel === channel) this.channel = null;
-        this.presenceTracked = false;
-        await this.removeRealtimeChannel(channel, 'private-minimal');
-    }
-
     /**
      * Legacy postgres_changes listener on its own public channel. Best-effort:
      * failures are logged, never thrown. Removed at the flip (009).
@@ -901,12 +623,11 @@ export class RemoteChannel {
                         event: 'INSERT',
                         schema: 'public',
                         table: 'mcp_remote_calls',
-                        filter: `device_id=eq.${this.deviceId}`
+                        filter: `user_id=eq.${this.user.id}`
                     },
                     (payload: any) => {
                         const receivedAtMs = Date.now();
                         console.debug('[DEBUG] Realtime event received, payload:', payload?.new?.id);
-                        this.handleBroadcastDeliveryMiss(payload?.new, receivedAtMs);
                         this.dispatchToolCall({
                             ...payload,
                             _remoteTiming: { inbound: 'postgres_changes', receivedAtMs, rowFetchMs: 0 },
@@ -956,7 +677,6 @@ export class RemoteChannel {
             const channelName = `user:${this.user.id}`;
             console.debug(`[DEBUG] Creating channel: ${channelName}`);
             const generation = ++this.channelGeneration;
-            this.broadcastSuppressedGeneration = null;
             const channel = this.client.channel(channelName, {
                 // ack: true — without it send() resolves 'ok' once the frame hits
                 // the socket, making notifyResult's status check dead code.
@@ -1110,10 +830,6 @@ export class RemoteChannel {
         // Not a telemetry event on purpose: ~126k/day in prod. Transport usage
         // is already segmentable server-side via metadata.transport.
         console.debug('[DEBUG] Doorbell received for call:', callId);
-        // Record the signal before the REST row fetch. A later postgres_changes copy
-        // is normal transition duplication and must never trigger transport repair.
-        this.rememberBroadcastCall(callId, receivedAtMs);
-
         if (!this.client) return;
 
         // Retry on transient failures (a REST blip while the socket stays
@@ -1209,11 +925,7 @@ export class RemoteChannel {
         // 'joined' = healthy. Clear the joining-overstay timer.
         if (state === 'joined') {
             this.joiningSince = null;
-            if (this.privateTransportReady()) {
-                this.stopDegradedCallPolling();
-                return;
-            }
-            this.startDegradedCallPolling();
+            if (this.privateTransportReady()) return;
             // Self-heal a failed presence publish: the channel is up, so nothing
             // else will ever retry (SUBSCRIBED won't fire again), and without
             // presence the server reports this healthy device as offline.
@@ -1226,8 +938,7 @@ export class RemoteChannel {
                 this.trackPresenceWithRetry(0, 1, this.channelGeneration).catch(() => { /* logged inside */ });
             } else if (
                 this.presenceTracked &&
-                this.transportCapableWritten !== true &&
-                this.broadcastSuppressedGeneration !== this.channelGeneration
+                this.transportCapableWritten !== true
             ) {
                 // Presence succeeded but its capability PATCH may have failed. Retry
                 // only when this generation was not intentionally degraded after a
@@ -1242,7 +953,6 @@ export class RemoteChannel {
         // parked private generation is replaced, but never reset the shared socket
         // or sacrifice the legacy fallback from this watchdog.
         if (state === 'joining') {
-            this.startDegradedCallPolling();
             const now = Date.now();
             if (this.joiningSince === null) this.joiningSince = now;
             const stuckMs = now - this.joiningSince;
@@ -1254,7 +964,6 @@ export class RemoteChannel {
             return;
         }
 
-        this.startDegradedCallPolling();
         this.joiningSince = null;
 
         // realtime-js already owns errored-channel recovery via its rejoin timer.
@@ -1334,7 +1043,6 @@ export class RemoteChannel {
         const isCurrentOperation = () =>
             this.recreateOperationGeneration === operationGeneration && !this.shuttingDown;
         this.reconnectAttempt++;
-        this.startDegradedCallPolling();
 
         // Create fresh channel
         console.log(`🔄 Recreating channel... (attempt ${this.reconnectAttempt}) — ${this.connState()}`);
@@ -1420,41 +1128,6 @@ export class RemoteChannel {
         }
     }
 
-    async markCallExecutingMinimal(callId: string): Promise<void> {
-        if (!this.client) throw new Error('Client not initialized');
-        const startedAt = Date.now();
-        const { error } = await this.runDbQuery(
-            `Minimal mark executing ${callId}`, REMOTE_CALL_CLAIM_TIMEOUT_MS,
-            (signal) => this.client!
-                .from('mcp_remote_calls')
-                .update({ status: 'executing' })
-                .eq('id', callId)
-                .abortSignal(signal),
-        );
-        if (error) throw error;
-        console.log(`↗ MINIMAL EXEC ${callId.slice(0, 8)} ${Date.now() - startedAt}ms`);
-    }
-
-    async updateCallResultMinimal(
-        callId: string, status: string, result: unknown | null, errorMessage: string | null,
-    ): Promise<void> {
-        if (!this.client) throw new Error('Client not initialized');
-        const updateData: Record<string, unknown> = { status, completed_at: new Date().toISOString() };
-        if (result !== null) updateData.result = result;
-        if (errorMessage !== null) updateData.error_message = errorMessage;
-        const startedAt = Date.now();
-        const { error } = await this.runDbQuery(
-            `Minimal terminal result ${callId}`, REMOTE_CONTROL_QUERY_TIMEOUT_MS,
-            (signal) => this.client!
-                .from('mcp_remote_calls')
-                .update(updateData)
-                .eq('id', callId)
-                .abortSignal(signal),
-        );
-        if (error) throw error;
-        console.log(`↗ MINIMAL RESULT ${callId.slice(0, 8)} ${Date.now() - startedAt}ms`);
-    }
-
     private async readCallClaimState(
         callId: string,
         timeoutMs = REMOTE_CALL_CLAIM_RECONCILE_TIMEOUT_MS,
@@ -1463,7 +1136,7 @@ export class RemoteChannel {
             `Read call claim state ${callId}`, timeoutMs,
             (signal) => this.client!
                 .from('mcp_remote_calls')
-                .select('status, metadata, result, error_message')
+                .select('status, result, error_message, device_id, user_id, tool_name')
                 .eq('id', callId)
                 .abortSignal(signal)
                 .maybeSingle(),
@@ -1473,63 +1146,46 @@ export class RemoteChannel {
     }
 
     /**
-     * Atomically claim pending -> executing. The claim token is written in the
-     * same UPDATE so a lost HTTP response is recoverable: read-back can tell
-     * whether THIS process won instead of guessing/failing open.
+     * Atomically claim pending -> executing using the same row update as upstream.
+     * Fork-private ownership data must never be written into hosted metadata.
+     * If the HTTP acknowledgement is lost, fail closed: an executing row cannot
+     * be attributed safely without changing the upstream wire contract.
      */
-    async markCallExecuting(callId: string, metadata: any = null): Promise<boolean> {
+    async markCallExecuting(callId: string, target: RemoteCallClaimTarget): Promise<boolean> {
         if (!this.client) throw new Error('Client not initialized');
         const claimToken = randomUUID();
-        const baseMetadata = metadata && typeof metadata === 'object' && !Array.isArray(metadata)
-            ? stripNullBytes(metadata)
-            : {};
-        const claimMetadata = { ...baseMetadata, [CLAIM_METADATA_KEY]: claimToken };
         let lastError: any = null;
 
         for (let attempt = 1; attempt <= REMOTE_CALL_CLAIM_ATTEMPTS; attempt++) {
             try {
                 const { data, error } = await this.runDbQuery(
                     `Mark call executing ${callId}`, REMOTE_CALL_CLAIM_TIMEOUT_MS,
-                    (signal) => this.client!
-                        .from('mcp_remote_calls')
-                        .update({ status: 'executing', metadata: claimMetadata })
-                        .eq('id', callId)
-                        .eq('status', 'pending')
-                        .select('id, metadata')
-                        .abortSignal(signal),
+                    (signal) => {
+                        let query = this.client!
+                            .from('mcp_remote_calls')
+                            .update({ status: 'executing' })
+                            .eq('id', callId)
+                            .eq('status', 'pending')
+                            .eq('device_id', target.deviceId)
+                            .eq('user_id', target.userId)
+                            .eq('tool_name', target.toolName);
+                        return query.select('id').abortSignal(signal);
+                    },
                 );
                 if (error) throw error;
                 if (data && data.length > 0) {
                     this.callClaimTokens.set(callId, claimToken);
-                    this.callClaimMetadata.set(callId, claimMetadata);
                     console.debug('[DEBUG] Call marked executing:', callId);
-                    return true;
-                }
-
-                const row = await this.readCallClaimState(callId);
-                const owner = row?.metadata?.[CLAIM_METADATA_KEY];
-                if (row?.status === 'executing' && owner === claimToken) {
-                    this.callClaimTokens.set(callId, claimToken);
-                    this.callClaimMetadata.set(callId, claimMetadata);
                     return true;
                 }
                 console.debug('[DEBUG] Call already claimed (duplicate delivery), skipping:', callId);
                 return false;
             } catch (claimError: any) {
                 lastError = claimError;
-                // The UPDATE may have committed even if its HTTP response was
-                // lost. Reconcile ownership before retrying or giving up.
                 try {
                     const row = await this.readCallClaimState(callId);
-                    const owner = row?.metadata?.[CLAIM_METADATA_KEY];
-                    if (row?.status === 'executing' && owner === claimToken) {
-                        this.callClaimTokens.set(callId, claimToken);
-                        this.callClaimMetadata.set(callId, claimMetadata);
-                        console.debug('[DEBUG] Reconciled ambiguous claim as ours:', callId);
-                        return true;
-                    }
                     if (row && row.status !== 'pending') {
-                        console.debug('[DEBUG] Reconciled ambiguous claim as owned elsewhere:', callId);
+                        console.debug('[DEBUG] Ambiguous claim is no longer pending; refusing execution:', callId);
                         return false;
                     }
                 } catch (reconcileError: any) {
@@ -1552,14 +1208,134 @@ export class RemoteChannel {
         return this.callClaimTokens.get(callId) ?? null;
     }
 
-    getCallClaimMetadata(callId: string): Record<string, unknown> | null {
-        const metadata = this.callClaimMetadata.get(callId);
-        return metadata ? { ...metadata } : null;
-    }
-
     releaseCallClaim(callId: string): void {
         this.callClaimTokens.delete(callId);
-        this.callClaimMetadata.delete(callId);
+    }
+
+    /** Persist a terminal result through the original Supabase client/path.
+     * The hosted row receives only upstream fields: status, completed_at,
+     * result and error_message. Local hashes are used only for read-back. */
+    async updateCallResult(
+        callId: string, status: 'completed' | 'failed', result: unknown | null, errorMessage: string | null,
+        target: RemoteCallClaimTarget,
+        deliveryMode: RemoteResultDeliveryMode = 'live',
+    ): Promise<RemoteResultCommitDisposition> {
+        if (!this.client) throw new Error('Client not initialized');
+        if (status !== 'completed' && status !== 'failed') {
+            throw new Error(`Refusing to send an invalid remote result status for ${callId}.`);
+        }
+        if (errorMessage !== null && typeof errorMessage !== 'string') {
+            throw new Error(`Refusing to send an invalid remote error message for ${callId}.`);
+        }
+        // This is the sole hosted-result writer. Repeat the parent contract
+        // check here so a future internal caller, replay entry, or test adapter
+        // cannot serialize arbitrary data around MCPDevice's final gate.
+        const outboundResult = result === null
+            ? null
+            : normalizeMcpToolResult(result, `Hosted result for ${target.toolName}`);
+        if (status === 'completed' && outboundResult === null) {
+            throw new Error(`Refusing to send an empty completed result for ${callId}.`);
+        }
+        const expected = createRemoteOutcomeIdentity(status, outboundResult, errorMessage);
+
+        // A replay may survive a lost acknowledgement or a process restart.
+        // Reconcile first so an already-terminal row never receives the same
+        // result payload in a second HTTP PATCH and never produces a new wake.
+        if (deliveryMode === 'replay') {
+            const row = await this.readCallClaimState(callId);
+            if (!row) {
+                const gone = new Error(`Remote call no longer exists: ${callId}`) as NodeJS.ErrnoException;
+                gone.code = 'EREMOTECALLGONE';
+                throw gone;
+            }
+            const targetMatches = row.device_id === target.deviceId
+                && row.user_id === target.userId
+                && row.tool_name === target.toolName;
+            if (!targetMatches) throw new Error(`Remote call target identity changed for ${callId}`);
+            if (row.status === 'completed' || row.status === 'failed') {
+                const actual = createRemoteOutcomeIdentity(
+                    row.status, row.result ?? null, row.error_message ?? null,
+                );
+                if (actual.outcomeHash === expected.outcomeHash) return 'already_committed';
+                throw new Error(`Remote terminal outcome differs for ${callId}`);
+            }
+            if (row.status !== 'executing') throw new Error(`Remote call ${callId} is ${row.status}`);
+        }
+        const updateData: Record<string, unknown> = {
+            status,
+            completed_at: new Date().toISOString(),
+        };
+        if (expected.result !== null) updateData.result = expected.result;
+        if (expected.errorMessage !== null) updateData.error_message = expected.errorMessage;
+
+        let lastError: any = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                const { data, error } = await this.runDbQuery(
+                    `Update call result ${callId}`, REMOTE_CONTROL_QUERY_TIMEOUT_MS,
+                    (signal) => this.client!
+                        .from('mcp_remote_calls')
+                        .update(updateData)
+                        .eq('id', callId)
+                        .eq('status', 'executing')
+                        .eq('device_id', target.deviceId)
+                        .eq('user_id', target.userId)
+                        .eq('tool_name', target.toolName)
+                        .select('id')
+                        .abortSignal(signal),
+                );
+                if (error) throw error;
+                if (data?.length > 0) return 'committed';
+
+                const row = await this.readCallClaimState(callId);
+                const targetMatches = row?.device_id === target.deviceId
+                    && row?.user_id === target.userId
+                    && row?.tool_name === target.toolName;
+                if (!targetMatches) throw new Error(`Remote call target identity changed for ${callId}`);
+                if (row.status === 'completed' || row.status === 'failed') {
+                    const actual = createRemoteOutcomeIdentity(
+                        row.status, row.result ?? null, row.error_message ?? null,
+                    );
+                    if (actual.outcomeHash === expected.outcomeHash) return 'already_committed';
+                    throw new Error(`Remote terminal outcome differs for ${callId}`);
+                }
+                if (row.status !== 'executing') throw new Error(`Remote call ${callId} is ${row.status}`);
+                lastError = new Error(`Terminal write was not confirmed for ${callId}`);
+            } catch (error: any) {
+                lastError = error;
+                try {
+                    const row = await this.readCallClaimState(callId);
+                    if (!row) {
+                        const gone = new Error(`Remote call no longer exists: ${callId}`) as NodeJS.ErrnoException;
+                        gone.code = 'EREMOTECALLGONE';
+                        throw gone;
+                    }
+                    const targetMatches = row.device_id === target.deviceId
+                        && row.user_id === target.userId
+                        && row.tool_name === target.toolName;
+                    if (!targetMatches) throw new Error(`Remote call target identity changed for ${callId}`);
+                    if (row.status === 'completed' || row.status === 'failed') {
+                        const actual = createRemoteOutcomeIdentity(
+                            row.status, row.result ?? null, row.error_message ?? null,
+                        );
+                        if (actual.outcomeHash === expected.outcomeHash) return 'committed';
+                        throw new Error(`Remote terminal outcome differs for ${callId}`);
+                    }
+                    if (row.status !== 'executing') throw new Error(`Remote call ${callId} is ${row.status}`);
+                    // The failed PATCH definitely did not produce a terminal row;
+                    // a bounded retry is now safe and still uses the same fence.
+                } catch (reconcileError: any) {
+                    lastError = new Error(
+                        `${error?.message || error}; result reconcile failed: ${reconcileError?.message || reconcileError}`,
+                    );
+                    // Ambiguous state: do not send the payload again. The durable
+                    // outbox will retry through read-before-replay later.
+                    break;
+                }
+            }
+            if (attempt < 3) await this.sleep(250 * attempt);
+        }
+        throw lastError ?? new Error(`Terminal result persistence failed for ${callId}`);
     }
 
     /**
@@ -1632,7 +1408,6 @@ export class RemoteChannel {
                 (signal) => this.client!
                     .from('mcp_devices')
                     .update({ last_seen: new Date().toISOString() })
-                    .contains('capabilities', this.deviceSessionFence())
                     .eq('id', deviceId)
                     .abortSignal(signal),
             );
@@ -1704,7 +1479,6 @@ export class RemoteChannel {
             (signal) => this.client!
                 .from('mcp_devices')
                 .update({ status: status, last_seen: new Date().toISOString() })
-                .contains('capabilities', this.deviceSessionFence())
                 .eq('id', deviceId)
                 .abortSignal(signal),
         );
@@ -1730,11 +1504,6 @@ export class RemoteChannel {
     async setOffline(deviceId: string | undefined) {
         if (!deviceId || !this.client) {
             console.debug('[DEBUG] setOffline() skipped - no deviceId or client');
-            return;
-        }
-
-        if (!this.deviceSessionLease) {
-            console.error('[DEBUG] setOffline() skipped - no owned device session generation');
             return;
         }
 
@@ -1779,8 +1548,7 @@ export class RemoteChannel {
                 supabaseUrl,
                 supabaseKey,
                 session.access_token,
-                session.refresh_token || '',
-                this.deviceSessionLease.generation
+                session.refresh_token || ''
             ], {
                 timeout: 3000,
                 stdio: 'pipe', // Capture output to prevent blocking
@@ -1825,7 +1593,6 @@ export class RemoteChannel {
         // SIGINT during recreateChannel()'s backoff, where the later join's
         // SUBSCRIBED would queue 'online' after the durable write.
         this.shuttingDown = true;
-        this.stopDegradedCallPolling();
         // Budget against device.ts's 5s force-exit, worst case:
         //   250 drain + 3x300 leave + 500 session + 3000 spawnSync = 4650ms.
         // In practice only the untrack bound binds — removeChannel/unsubscribe

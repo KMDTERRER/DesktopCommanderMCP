@@ -1,6 +1,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import process from "node:process";
 import { inspect } from "node:util";
+import { parseMcpJsonRpcFrame, traceMcpStdio } from "./utils/mcp-stdio-trace.js";
 
 type LogLevel = "emergency" | "alert" | "critical" | "error" | "warning" | "notice" | "info" | "debug";
 const MAX_BUFFERED_LOG_MESSAGES = 128;
@@ -161,18 +162,6 @@ export class FilteredStdioServerTransport extends StdioServerTransport {
     this.messageBuffer.push({ level, args: this.compactLogArgs(args), timestamp: Date.now() });
   }
 
-  private isJsonRpcFrame(text: string): boolean {
-    try {
-      const parsed = JSON.parse(text);
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || parsed.jsonrpc !== '2.0') return false;
-      if (typeof parsed.method === 'string') return true;
-      return Object.prototype.hasOwnProperty.call(parsed, 'id') &&
-        (Object.prototype.hasOwnProperty.call(parsed, 'result') || Object.prototype.hasOwnProperty.call(parsed, 'error'));
-    } catch {
-      return false;
-    }
-  }
-
   private setupConsoleRedirection() {
     console.log = (...args: any[]) => {
       if (this.isInitialized) {
@@ -226,8 +215,25 @@ export class FilteredStdioServerTransport extends StdioServerTransport {
 
         // Only an actually parsed JSON-RPC 2.0 frame may pass to protocol stdout.
         // Debug JSON such as {"id":1} must remain a log, not impersonate a response.
-        if (trimmed.length > 0 && this.isJsonRpcFrame(trimmed)) {
-          return this.originalStdoutWrite.call(process.stdout, buffer, encoding, callback);
+        const frame = trimmed.length > 0 ? parseMcpJsonRpcFrame(trimmed) : null;
+        if (frame) {
+          const startedAt = Date.now();
+          const bytes = Buffer.byteLength(text, 'utf8');
+          try {
+            const accepted = this.originalStdoutWrite.call(process.stdout, buffer, encoding, callback);
+            traceMcpStdio('WRITE', { ...frame, bytes, backpressure: !accepted });
+            if (!accepted) {
+              process.stdout.once('drain', () => {
+                traceMcpStdio('DRAIN', { ...frame, waitMs: Date.now() - startedAt });
+              });
+            }
+            return accepted;
+          } catch (error) {
+            traceMcpStdio('WRITE_THROW', {
+              ...frame, bytes, error: error instanceof Error ? error.message : String(error),
+            });
+            throw error;
+          }
         } else if (trimmed.length > 0) {
           if (this.isInitialized) {
             this.sendLogNotification("info", [text.replace(/\n$/, '')]);

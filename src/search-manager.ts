@@ -1,4 +1,5 @@
 import { spawn, ChildProcess } from 'child_process';
+import { randomUUID } from 'crypto';
 import path from 'path';
 import fs from 'fs/promises';
 import { validatePath } from './tools/filesystem.js';
@@ -19,6 +20,7 @@ import {
   MAX_SEARCH_MATCH_CHARS, MAX_SEARCH_RESULTS, MAX_SEARCH_STORED_CONTEXT_RESULTS,
   MAX_SEARCH_TIMEOUT_MS,
 } from './utils/search-limits.js';
+import { getToolCallContext, getToolCallSessionIdentity } from './utils/client-context.js';
 
 export interface SearchResult {
   file: string;
@@ -29,6 +31,8 @@ export interface SearchResult {
 
 export interface SearchSession {
   id: string;
+  remoteOwner: boolean;
+  ownerSessionIdentity?: string;
   process: ChildProcess;
   results: SearchResult[];
   isComplete: boolean;
@@ -118,7 +122,25 @@ function normalizeSearchOptions(options: SearchSessionOptions): SearchSessionOpt
  * Supports both file search and content search with progressive results
  */export class SearchManager {
   private sessions = new Map<string, SearchSession>();
-  private sessionCounter = 0;
+  private assertSessionAccess(session: SearchSession, sessionId: string): void {
+    const context = getToolCallContext();
+    if (!context.isRemote || !session.remoteOwner) return;
+    const currentIdentity = getToolCallSessionIdentity();
+    if (session.ownerSessionIdentity && currentIdentity !== session.ownerSessionIdentity) {
+      throw new Error(`Search session ${sessionId} is not available to this remote conversation`);
+    }
+    // If the hosted relay omitted conversation identity, the random session id
+    // itself is the bearer capability returned by start_search. Unscoped ids are
+    // deliberately hidden from listSearchSessions().
+  }
+
+  private sessionVisibleToCurrentCaller(session: SearchSession): boolean {
+    const context = getToolCallContext();
+    if (!context.isRemote) return true;
+    const currentIdentity = getToolCallSessionIdentity();
+    return Boolean(session.remoteOwner && session.ownerSessionIdentity &&
+      currentIdentity === session.ownerSessionIdentity);
+  }
 
   /**
    * Start a new search session (like start_process)
@@ -133,7 +155,9 @@ function normalizeSearchOptions(options: SearchSessionOptions): SearchSessionOpt
     totalResults: number;
     runtime: number;
   }> {
-    const sessionId = `search_${++this.sessionCounter}_${Date.now()}`;
+    const sessionId = `search_${randomUUID()}`;
+    const callContext = getToolCallContext();
+    const ownerSessionIdentity = callContext.isRemote ? getToolCallSessionIdentity() : undefined;
     options = normalizeSearchOptions(options);
     const timeoutMs = options.timeout ?? (this.isExactFilename(options.pattern) ? 1500 : DEFAULT_SEARCH_TIMEOUT_MS);
     
@@ -162,6 +186,8 @@ function normalizeSearchOptions(options: SearchSessionOptions): SearchSessionOpt
     // Create session
     const session: SearchSession = {
       id: sessionId,
+      remoteOwner: callContext.isRemote,
+      ...(ownerSessionIdentity ? { ownerSessionIdentity } : {}),
       process: rgProcess,
       results: [],
       isComplete: false,
@@ -325,6 +351,7 @@ function normalizeSearchOptions(options: SearchSessionOptions): SearchSessionOpt
     if (!session) {
       throw new Error(`Search session ${sessionId} not found`);
     }
+    this.assertSessionAccess(session, sessionId);
 
     // Get all results (excluding internal markers)
     const allResults = session.results.filter(r => r.file !== '__LAST_READ_MARKER__');
@@ -378,6 +405,7 @@ function normalizeSearchOptions(options: SearchSessionOptions): SearchSessionOpt
     if (!session) {
       return false;
     }
+    this.assertSessionAccess(session, sessionId);
 
     session.wasIncomplete = true;
     this.stopSearchProcess(session);
@@ -400,7 +428,9 @@ function normalizeSearchOptions(options: SearchSessionOptions): SearchSessionOpt
     runtime: number;
     totalResults: number;
   }> {
-    return Array.from(this.sessions.values()).map(session => ({
+    return Array.from(this.sessions.values())
+      .filter((session) => this.sessionVisibleToCurrentCaller(session))
+      .map(session => ({
       id: session.id,
       searchType: session.options.searchType,
       pattern: session.options.pattern,
@@ -408,7 +438,7 @@ function normalizeSearchOptions(options: SearchSessionOptions): SearchSessionOpt
       isError: session.isError,
       runtime: Date.now() - session.startTime,
       totalResults: session.totalMatches + session.totalContextLines
-    }));
+      }));
   }
 
   /**

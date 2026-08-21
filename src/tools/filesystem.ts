@@ -19,7 +19,7 @@ import { getAllowedDirs, PATH_VALIDATION_TIMEOUT_MS, validatePathAuthority } fro
 import { pathContainsManagedTrashSegment } from '../utils/trash-contract.js';
 import { renameReplacingWithRetry } from '../utils/atomic-rename.js';
 import { readFileBounded } from '../utils/bounded-file-read.js';
-import { decodeTextBuffer } from '../utils/files/text-encoding.js';
+import { decodeTextBuffer, detectUtf16BomFile } from '../utils/files/text-encoding.js';
 import {
     AggregateByteBudget,
     MAX_IMAGE_INPUT_BYTES,
@@ -297,7 +297,7 @@ export async function readFileFromDisk(
     operationTimeoutMs: number = READ_OPERATION_TIMEOUT_MS
 ): Promise<FileResult> {
     const deadlineAt = Date.now() + normalizeReadTimeout(operationTimeoutMs);
-    const { offset = 0, sheet, range } = options ?? {};
+    const { offset = 0, sheet, range, includeStatusMessage = true } = options ?? {};
     let { length } = options ?? {};
 
     // Add validation for required parameters
@@ -370,7 +370,7 @@ export async function readFileFromDisk(
             length,
             sheet,
             range,
-            includeStatusMessage: true,
+            includeStatusMessage,
             signal,
             maxOutputBytes: options?.maxOutputBytes
         });
@@ -432,10 +432,10 @@ export async function readFile(
     options?: ReadOptions,
     operationTimeoutMs: number = READ_OPERATION_TIMEOUT_MS
 ): Promise<FileResult> {
-    const { isUrl, offset, length, sheet, range, maxOutputBytes } = options ?? {};
+    const { isUrl, offset, length, sheet, range, includeStatusMessage, maxOutputBytes } = options ?? {};
     return isUrl
         ? readFileFromUrl(filePath, { ...options, maxOutputBytes })
-        : readFileFromDisk(filePath, { offset, length, sheet, range, maxOutputBytes }, operationTimeoutMs);
+        : readFileFromDisk(filePath, { offset, length, sheet, range, includeStatusMessage, maxOutputBytes }, operationTimeoutMs);
 }
 
 /**
@@ -612,9 +612,12 @@ export async function writeFile(
         // Handler discovery may inspect the current bytes for binary detection; keep it
         // inside the same hard request deadline as staging and publication.
         const handler = await scope.run(() => getFileHandler(validPath), `Select file handler for ${validPath}`);
+        const textEncoding = handler instanceof TextFileHandler
+            ? (await scope.run(() => detectUtf16BomFile(validPath), `Detect text encoding for ${validPath}`) ?? 'utf8')
+            : undefined;
         await writeViaAtomicStage(
             validPath, mode, scope,
-            (stagedPath, signal) => handler.write(stagedPath, content, mode, { signal }),
+            (stagedPath, signal) => handler.write(stagedPath, content, mode, { signal, textEncoding }),
         );
     } finally {
         scope.dispose();

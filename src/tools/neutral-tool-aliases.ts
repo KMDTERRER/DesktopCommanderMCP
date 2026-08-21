@@ -32,12 +32,14 @@ const ProcessRunSchema = z.object({
 
 const ProcessPollSchema = z.object({
     id: z.number(),
+    session: z.string().uuid().optional(),
     wait_ms: z.number().int().min(0).optional(),
     from: z.number().optional(),
     count: z.number().int().positive().optional(),
 }).strict();
 
-const StopSchema = z.object({ id: z.number() }).strict();
+const SessionStopSchema = z.object({ id: z.number(), session: z.string().uuid().optional() }).strict();
+const ProcessStopSchema = z.object({ id: z.number() }).strict();
 
 type AliasResolution = { canonicalName: string; args: Record<string, unknown> };
 
@@ -71,14 +73,14 @@ export function resolveNeutralToolAlias(name: string, rawArgs: unknown): AliasRe
         }
         case 'process_poll': {
             const v = ProcessPollSchema.parse(rawArgs ?? {});
-            return { canonicalName: 'read_process_output', args: { pid: v.id, ...(v.wait_ms !== undefined ? { timeout_ms: v.wait_ms } : {}), ...(v.from !== undefined ? { offset: v.from } : {}), ...(v.count !== undefined ? { length: v.count } : {}) } };
+            return { canonicalName: 'read_process_output', args: { pid: v.id, ...(v.session ? { terminal_session_id: v.session } : {}), ...(v.wait_ms !== undefined ? { timeout_ms: v.wait_ms } : {}), ...(v.from !== undefined ? { offset: v.from } : {}), ...(v.count !== undefined ? { length: v.count } : {}) } };
         }
         case 'session_stop': {
-            const v = StopSchema.parse(rawArgs ?? {});
-            return { canonicalName: 'force_terminate', args: { pid: v.id } };
+            const v = SessionStopSchema.parse(rawArgs ?? {});
+            return { canonicalName: 'force_terminate', args: { pid: v.id, ...(v.session ? { terminal_session_id: v.session } : {}) } };
         }
         case 'process_stop': {
-            const v = StopSchema.parse(rawArgs ?? {});
+            const v = ProcessStopSchema.parse(rawArgs ?? {});
             return { canonicalName: 'kill_process', args: { pid: v.id } };
         }
         default:
@@ -102,7 +104,7 @@ export function listNeutralToolAliases() {
         alias('search_run', 'Start a filesystem/content search with a compact argument shape.', SearchRunSchema, true),
         alias('process_run', 'Run a command or executable with the existing process boundary.', ProcessRunSchema, false, true),
         alias('process_poll', 'Read output from an existing managed process.', ProcessPollSchema, true),
-        alias('session_stop', 'Stop a managed terminal session.', StopSchema, false),
-        alias('process_stop', 'Stop a system process through the existing process handler.', StopSchema, false),
+        alias('session_stop', 'Stop a managed terminal session. Remote callers can pass session from process_run.', SessionStopSchema, false),
+        alias('process_stop', 'Stop a system process through the existing process handler.', ProcessStopSchema, false),
     ];
 }

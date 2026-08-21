@@ -3,18 +3,9 @@ import { createHash } from 'crypto';
 const NUL_CHAR = String.fromCharCode(0);
 const NUL_RE = new RegExp(NUL_CHAR, 'g');
 
-export const CLAIM_METADATA_KEY = '_desktop_commander_claim_token';
-export const OUTCOME_METADATA_REVISION_KEY = '_desktop_commander_outcome_revision';
-export const OUTCOME_METADATA_HASH_KEY = '_desktop_commander_outcome_hash';
 export const REMOTE_OUTCOME_REVISION = 1 as const;
 
 export type RemoteResultDeliveryMode = 'live' | 'replay';
-
-export interface RemoteTerminalIdentityContext {
-    outcomeRevision?: typeof REMOTE_OUTCOME_REVISION;
-    outcomeHash?: string;
-    claimMetadata?: Record<string, unknown> | null;
-}
 
 export interface RemoteOutcomeIdentity {
     outcomeRevision: typeof REMOTE_OUTCOME_REVISION;

@@ -39,7 +39,6 @@ async function main() {
   const outbox = new RemoteResultOutbox(path.join(root, 'result-outbox'));
   const rows = new Map();
   const claimTokens = new Map();
-  const claimMetadata = new Map();
   const remoteResults = new Map();
   const dispatchAt = new Map();
   const remoteCommitAckAt = new Map();
@@ -55,14 +54,14 @@ async function main() {
       const file = path.join(root, `read-${i}.txt`);
       await fs.writeFile(file, `READ_TOKEN_${i}\n`, 'utf8');
       rows.set(`r${i}`, {
-        id: `r${i}`, device_id: DEVICE_ID, status: 'pending', tool_name: 'read_file',
+        id: `r${i}`, device_id: DEVICE_ID, user_id: 'latency-user', status: 'pending', tool_name: 'read_file',
         tool_args: { path: file, offset: 0, length: 10 }, metadata: {},
         created_at: new Date(Date.now() - 120).toISOString(),
       });
     }
     for (let i = 0; i < 4; i++) {
       rows.set(`w${i}`, {
-        id: `w${i}`, device_id: DEVICE_ID, status: 'pending', tool_name: 'write_file',
+        id: `w${i}`, device_id: DEVICE_ID, user_id: 'latency-user', status: 'pending', tool_name: 'write_file',
         tool_args: { path: path.join(root, `write-${i}.txt`), content: `WRITE_TOKEN_${i}\n`, mode: 'rewrite' },
         metadata: {}, created_at: new Date(Date.now() - 120).toISOString(),
       });
@@ -90,14 +89,12 @@ async function main() {
       try {
         await sleep(35);
         claimTokens.set(callId, `claim-${callId}`);
-        claimMetadata.set(callId, { ...metadata, test_claim: callId });
         return true;
       } finally { activeClaim--; }
     };
     remote.getCurrentUserId = () => 'latency-user';
     remote.getCallClaimToken = (callId) => claimTokens.get(callId) ?? null;
-    remote.getCallClaimMetadata = (callId) => claimMetadata.get(callId) ?? null;
-    remote.releaseCallClaim = (callId) => { claimTokens.delete(callId); claimMetadata.delete(callId); };
+    remote.releaseCallClaim = (callId) => { claimTokens.delete(callId); };
     remote.signalResultAvailable = async () => {
       activeWake++; maxWake = Math.max(maxWake, activeWake);
       try { await sleep(30); wakeCount++; return { attempted: true, status: 'ok', durationMs: 30 }; }
@@ -109,15 +106,13 @@ async function main() {
     device.desktop = integration;
     device.callMetrics = metrics;
     device.resultOutbox = outbox;
-    device.resultTransport = {
-      updateCallResult: async (callId, status, result, errorMessage) => {
-        activeCommit++; maxCommit = Math.max(maxCommit, activeCommit);
-        try {
-          await sleep(callId === 'w0' ? 220 : 70);
-          remoteResults.set(callId, { status, result, errorMessage });
-          remoteCommitAckAt.set(callId, Date.now());
-        } finally { activeCommit--; }
-      },
+    remote.updateCallResult = async (callId, status, result, errorMessage) => {
+      activeCommit++; maxCommit = Math.max(maxCommit, activeCommit);
+      try {
+        await sleep(callId === 'w0' ? 220 : 70);
+        remoteResults.set(callId, { status, result, errorMessage });
+        remoteCommitAckAt.set(callId, Date.now());
+      } finally { activeCommit--; }
     };
     remote.onToolCall = (payload) => {
       dispatchAt.set(payload?.new?.id, Date.now());

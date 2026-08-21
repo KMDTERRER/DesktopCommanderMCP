@@ -54,17 +54,21 @@ export class ToolHistory {
     // Store history in same directory as config to keep everything together
     const historyDir = path.join(os.homedir(), '.claude-server-commander');
     
-    // Ensure directory exists
-    if (!fs.existsSync(historyDir)) {
-      fs.mkdirSync(historyDir, { recursive: true });
-    }
-    
     // Use append-only JSONL format (JSON Lines)
     this.historyFile = path.join(historyDir, 'tool-history.jsonl');
-    
-    // Load existing history on startup
-    this.loadFromDisk();
-    
+
+    // A remote-device child is a latency-sensitive tool host. Its MCP handshake
+    // must not wait on diagnostic history I/O from a previous process. The normal
+    // local product keeps historical startup loading; the remote child starts with
+    // an empty in-memory history and persists new records asynchronously after the
+    // bounded config bootstrap has prepared this directory.
+    if (process.env.DC_REMOTE_DEVICE !== 'true') {
+      if (!fs.existsSync(historyDir)) {
+        fs.mkdirSync(historyDir, { recursive: true });
+      }
+      this.loadFromDisk();
+    }
+
     // Start async write processor
     this.startWriteProcessor();
   }
@@ -171,6 +175,29 @@ export class ToolHistory {
     }
   }
 
+  private async trimHistoryFileIfTooLargeAsync(): Promise<void> {
+    let stats: fs.Stats;
+    try {
+      stats = await fs.promises.stat(this.historyFile);
+      if (stats.size <= this.MAX_HISTORY_FILE_SIZE_BYTES) return;
+      const content = await fs.promises.readFile(this.historyFile, 'utf-8');
+      const lines = content.split('\n').filter(line => line.length > 0);
+      if (lines.length === 0) return;
+      const kept: string[] = [];
+      let bytes = 0;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const lineBytes = Buffer.byteLength(lines[i], 'utf-8') + 1;
+        if (kept.length > 0 && bytes + lineBytes > this.HISTORY_FILE_TRIM_TARGET_BYTES) break;
+        kept.push(lines[i]);
+        bytes += lineBytes;
+      }
+      kept.reverse();
+      await fs.promises.writeFile(this.historyFile, kept.join('\n') + '\n', 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
+    }
+  }
+
   /**
    * Trim history file to prevent it from growing indefinitely
    */
@@ -216,11 +243,12 @@ export class ToolHistory {
       // target size (keeping the most recent entries) before appending.
       // The in-memory cache is unaffected — it is already bounded by
       // MAX_ENTRIES via addCall.
-      this.trimHistoryFileIfTooLarge();
+      await this.trimHistoryFileIfTooLargeAsync();
 
-      // Append to file (atomic append operation)
+      // Keep diagnostic persistence off the event loop so a slow history disk
+      // cannot stall unrelated MCP response serialization/delivery.
       const lines = toWrite.map(entry => JSON.stringify(entry)).join('\n') + '\n';
-      fs.appendFileSync(this.historyFile, lines, 'utf-8');
+      await fs.promises.appendFile(this.historyFile, lines, 'utf-8');
     } catch (error) {
       // Put back in queue on failure, but keep diagnostic history bounded even
       // during a persistent disk error. Oldest pending records are expendable.

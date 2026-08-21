@@ -9,6 +9,7 @@ import { requireConfiguredExecutable } from '../utils/configured-executable.js';
 
 const MAX_OPERATION_TIMEOUT_MS = 45_000;
 const MAX_CHANGED_FILES = 100;
+const PATH_NORMALIZATION_CONCURRENCY = 8;
 const MAX_METADATA_ENTRIES = 500;
 const MAX_METADATA_TARGETS = 500;
 const MAX_RETURNED_TARGETS = 250;
@@ -83,6 +84,22 @@ function positiveInteger(value: unknown, fallback: number, maximum: number, labe
     throw new Error(`${label} must be an integer from 1 to ${maximum}.`);
   }
   return value as number;
+}
+
+async function mapConcurrent<T, R>(
+  values: T[], concurrency: number, mapper: (value: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= values.length) return;
+      results[index] = await mapper(values[index], index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, worker));
+  return results;
 }
 async function normalizeChangedFile(root: string, value: unknown, deadlineAt: number, index: number): Promise<string> {
   if (typeof value !== 'string' || !value.trim() || value.includes('\0') || /[\r\n]/.test(value)) {
@@ -434,9 +451,10 @@ export async function callCppBuildChangeClassification(
   }, remaining(deadlineAt, MAX_OPERATION_TIMEOUT_MS))) as JsonRecord;
   const repositoryRoot = path.resolve(String(metadata.repositoryRoot));
   const buildDir = path.resolve(String(metadata.buildDir));
-  const changedFiles = await Promise.all((args.changedFiles as unknown[]).map(
+  const changedFiles = await mapConcurrent(
+    args.changedFiles as unknown[], PATH_NORMALIZATION_CONCURRENCY,
     (value, index) => normalizeChangedFile(repositoryRoot, value, deadlineAt, index),
-  ));
+  );
   const classified = await classifyChangedFiles(changedFiles, metadata, repositoryRoot, buildDir, deadlineAt);
   const classifications = classified.classifications;
   const buildSystemChanged = classifications.filter((item) =>
@@ -476,9 +494,10 @@ export async function callCppBuildImpactAcceleratorTool(
   }, remaining(deadlineAt, MAX_OPERATION_TIMEOUT_MS))) as JsonRecord;
   const repositoryRoot = path.resolve(String(metadata.repositoryRoot));
   const buildDir = path.resolve(String(metadata.buildDir));
-  const changedFiles = await Promise.all((args.changedFiles as unknown[]).map(
+  const changedFiles = await mapConcurrent(
+    args.changedFiles as unknown[], PATH_NORMALIZATION_CONCURRENCY,
     (value, index) => normalizeChangedFile(repositoryRoot, value, deadlineAt, index),
-  ));
+  );
   const classified = await classifyChangedFiles(changedFiles, metadata, repositoryRoot, buildDir, deadlineAt);
   const classifications = classified.classifications;
   const sourceChangedFiles = classifications.filter((item) => item.kind === 'source').map((item) => item.path);

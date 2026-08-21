@@ -53,6 +53,17 @@ async function compatMutation(client, tool, payload, conversationId, timeout = 3
     _meta: { conversation_id: conversationId },
   }, undefined, { timeout });
 }
+
+async function compatRead(client, tool, payload, timeout = 35_000) {
+  return client.callTool({
+    name: 'read_file',
+    arguments: {
+      path: `mcp://desktop-accelerators/${tool}?timeout_ms=30000`,
+      options: payload,
+    },
+  }, undefined, { timeout });
+}
+
 async function main() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dc-write-e2e-'));
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'dc-write-e2e-home-'));
@@ -100,6 +111,55 @@ async function main() {
         const reread = await call(client, 'read_file', { path: file, offset: 0, length: 10 });
         assert.match(textOf(reread), /OMEGA/);
         assert.match(textOf(reread), /БЕТА/);
+        const rawAfter = await fs.readFile(file);
+        assert.deepEqual(
+          rawAfter, encode('OMEGA\r\nБЕТА\r\n'),
+          `edit_block changed UTF-16 ${label} encoding, BOM, or byte order`,
+        );
+      }
+    });
+
+    await check('write_file append preserves UTF-16 encoding and byte order', async () => {
+      for (const [label, encode] of [['le', utf16Le], ['be', utf16Be]]) {
+        const file = path.join(root, `utf16-append-${label}.txt`);
+        await fs.writeFile(file, encode('ALPHA\r\n'));
+        const appended = await call(client, 'write_file', {
+          path: file, content: 'БЕТА\r\n', mode: 'append',
+        });
+        assert.notEqual(appended.isError, true, textOf(appended));
+        assert.deepEqual(
+          await fs.readFile(file), encode('ALPHA\r\nБЕТА\r\n'),
+          `write_file append mixed encodings or changed UTF-16 ${label} BOM/byte order`,
+        );
+      }
+    });
+
+    await check('nested mcp mutation never silently materializes control escapes', async () => {
+      const file = path.join(root, 'compat-control-escape.txt');
+      await fs.writeFile(file, 'TOKEN', 'utf8');
+      const intendedLiteral = String.raw`C:\temp\foo|\u0007`;
+      const rawPayload = [
+        '{"path":', JSON.stringify(file.replace(/\\/g, '/')),
+        ',"edits":[{"oldText":"TOKEN","newText":"', intendedLiteral,
+        '","expectedReplacements":1}],"dryRun":false}',
+      ].join('');
+      const result = await client.callTool({
+        name: 'write_file',
+        arguments: {
+          path: 'mcp://desktop-accelerators/edit_file?timeout_ms=30000',
+          content: rawPayload,
+          mode: 'rewrite',
+        },
+        _meta: { conversation_id: 'compat-control-escape' },
+      }, undefined, { timeout: 35_000 });
+      const after = await fs.readFile(file, 'utf8');
+      if (result.isError === true) {
+        assert.equal(after, 'TOKEN', `rejected nested payload still changed bytes: ${textOf(result)}`);
+      } else {
+        assert.equal(
+          after, intendedLiteral,
+          `nested compatibility JSON reinterpreted literal backslash escapes as control characters: ${JSON.stringify(after)}`,
+        );
       }
     });
 
@@ -312,6 +372,73 @@ async function main() {
         'sibling patch did not report expected-hash rebase');
     });
 
+    await check('mcp read_ranges decodes UTF-16 without leaking control bytes', async () => {
+      const original = 'UTF16_SENTINEL_ALPHA\r\nКОНТРОЛЬ_БЕТА\r\n';
+      const fixtures = [
+        ['le', utf16Le],
+        ['be', utf16Be],
+      ];
+      const requests = [];
+      for (const [label, encode] of fixtures) {
+        const file = path.join(root, `accelerator-read-ranges-${label}.txt`);
+        await fs.writeFile(file, encode(original));
+        requests.push({ path: file, offset: 0, length: 10 });
+      }
+      const result = await compatRead(client, 'read_ranges', { requests, maxTotalChars: 20_000 });
+      assert.notEqual(result.isError, true, textOf(result));
+      const payload = JSON.parse(textOf(result));
+      assert.equal(payload.results.length, fixtures.length, JSON.stringify(payload));
+      for (const entry of payload.results) {
+        assert.equal(entry.content, original, `read_ranges decoded UTF-16 incorrectly: ${JSON.stringify(entry.content)}`);
+        assert(!/[\u0000\ufffd]/u.test(entry.content), `read_ranges leaked NUL/replacement characters: ${JSON.stringify(entry.content)}`);
+      }
+    });
+
+    await check('mcp context_pack decodes seeded UTF-16 source as text', async () => {
+      const original = 'UTF16_PACK_SENTINEL_ALPHA\r\nКОНТРОЛЬ_БЕТА\r\n';
+      const seedFiles = [];
+      for (const [label, encode] of [['le', utf16Le], ['be', utf16Be]]) {
+        const relative = `accelerator-context-pack-${label}.txt`;
+        await fs.writeFile(path.join(root, relative), encode(original));
+        seedFiles.push(relative);
+      }
+      execFileSync('git', ['-C', root, 'add', '--', ...seedFiles], { stdio: 'ignore' });
+      execFileSync('git', [
+        '-C', root, '-c', 'user.name=E2E', '-c', 'user.email=e2e@example.invalid',
+        'commit', '-q', '-m', 'seed UTF-16 context fixtures',
+      ], { stdio: 'ignore' });
+      const result = await compatRead(client, 'context_pack', {
+        root, query: 'UTF16_PACK_SENTINEL_ALPHA', seedFiles, maxFiles: 8,
+        contextLines: 1, maxLinesPerFile: 20, maxTotalChars: 20_000,
+      });
+      assert.notEqual(result.isError, true, textOf(result));
+      const payload = JSON.parse(textOf(result));
+      for (const relative of seedFiles) {
+        const entry = payload.files.find((item) => item.path.replace(/\\/g, '/') === relative);
+        assert(entry, `context_pack omitted seeded UTF-16 file ${relative}: ${JSON.stringify(payload.files)}`);
+        assert(entry.content.includes('UTF16_PACK_SENTINEL_ALPHA'), JSON.stringify(entry));
+        assert(entry.content.includes('КОНТРОЛЬ_БЕТА'), JSON.stringify(entry));
+        assert(!/[\u0000\ufffd]/u.test(entry.content), `context_pack leaked UTF-16 control/replacement bytes: ${JSON.stringify(entry.content)}`);
+      }
+    });
+
+    await check('mcp edit_file preserves UTF-16 BOM, byte order, and text', async () => {
+      for (const [label, encode] of [['le', utf16Le], ['be', utf16Be]]) {
+        const file = path.join(root, `accelerator-edit-${label}.txt`);
+        const original = 'ALPHA\r\nБЕТА\r\n';
+        await fs.writeFile(file, encode(original));
+        const result = await compatMutation(client, 'edit_file', {
+          path: file, dryRun: false,
+          edits: [{ oldText: 'ALPHA', newText: 'OMEGA', expectedReplacements: 1 }],
+        }, `utf16-edit-${label}`);
+        assert.notEqual(result.isError, true, `edit_file rejected UTF-16 ${label}: ${textOf(result)}`);
+        assert.deepEqual(
+          await fs.readFile(file), encode('OMEGA\r\nБЕТА\r\n'),
+          `edit_file changed UTF-16 ${label} encoding, BOM, byte order, or inserted control bytes`,
+        );
+      }
+    });
+
     await check('parallel XLSX range edits survive full MCP round trip', async () => {
       const excelFile = path.join(root, 'parallel.xlsx');
       const initial = [['c1', 'c2', 'c3', 'c4', 'c5', 'c6'], [0, 0, 0, 0, 0, 0]];
@@ -363,6 +490,126 @@ async function main() {
       const result = await call(client, 'write_file', { path: binaryFile, content: 'text', mode: 'rewrite' });
       assert.equal(result.isError, true, `binary overwrite looked successful: ${textOf(result)}`);
       assert.deepEqual(await fs.readFile(binaryFile), original);
+    });
+
+    await check('read_ranges metadata preflight keeps filesystem fan-out bounded', async () => {
+      const oldHome = process.env.HOME;
+      const oldUserProfile = process.env.USERPROFILE;
+      process.env.HOME = home;
+      process.env.USERPROFILE = home;
+      const { callBuiltinAcceleratorTool } = await import('../dist/tools/workspace-accelerators.js');
+      const { configManager } = await import('../dist/config-manager.js');
+      await configManager.setValue('allowedDirectories', [root]);
+      const files = Array.from({ length: 24 }, (_, index) => path.join(root, `fanout-${index}.txt`));
+      await Promise.all(files.map((file, index) => fs.writeFile(file, `value-${index}\n`, 'utf8')));
+      const originalRealpath = fs.realpath;
+      const originalStat = fs.stat;
+      const normalizedRoot = path.resolve(root).toLowerCase();
+      const isTracked = (target) => {
+        const normalized = path.resolve(String(target)).toLowerCase();
+        return normalized === normalizedRoot || normalized.startsWith(`${normalizedRoot}${path.sep}`);
+      };
+      let active = 0;
+      let maxActive = 0;
+      const wrap = (original) => async (target, ...args) => {
+        if (!isTracked(target)) return original(target, ...args);
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          return await original(target, ...args);
+        } finally {
+          active -= 1;
+        }
+      };
+      try {
+        fs.realpath = wrap(originalRealpath);
+        fs.stat = wrap(originalStat);
+        const result = await callBuiltinAcceleratorTool('read_ranges', {
+          requests: files.map((file) => ({ path: file, offset: 0, length: 2 })),
+          maxTotalChars: 20_000,
+        }, 5_000);
+        assert.equal(result.results.length, files.length);
+        assert(maxActive <= 8, `read_ranges launched ${maxActive} concurrent filesystem metadata operations for ${files.length} files`);
+      } finally {
+        fs.realpath = originalRealpath;
+        fs.stat = originalStat;
+        if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
+        if (oldUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = oldUserProfile;
+      }
+    });
+
+    await check('read_ranges deadline stops launching new path validations', async () => {
+      const { callBuiltinAcceleratorTool } = await import('../dist/tools/workspace-accelerators.js');
+      const files = Array.from({ length: 24 }, (_, index) => path.join(root, `deadline-fanout-${index}.txt`));
+      await Promise.all(files.map((file, index) => fs.writeFile(file, `deadline-${index}\n`, 'utf8')));
+      const originalRealpath = fs.realpath;
+      const normalizedRoot = path.resolve(root).toLowerCase();
+      const requested = new Set(files.map((file) => path.resolve(file).toLowerCase()));
+      const startedRequested = new Set();
+      let active = 0;
+      try {
+        fs.realpath = async (target, ...args) => {
+          const normalized = path.resolve(String(target)).toLowerCase();
+          if (normalized === normalizedRoot || normalized.startsWith(`${normalizedRoot}${path.sep}`)) {
+            active += 1;
+            if (requested.has(normalized)) startedRequested.add(normalized);
+            try {
+              await new Promise((resolve) => setTimeout(resolve, 180));
+              return await originalRealpath(target, ...args);
+            } finally {
+              active -= 1;
+            }
+          }
+          return originalRealpath(target, ...args);
+        };
+        const startedAt = Date.now();
+        await assert.rejects(
+          () => callBuiltinAcceleratorTool('read_ranges', {
+            requests: files.map((file) => ({ path: file, offset: 0, length: 2 })),
+            maxTotalChars: 20_000,
+          }, 100),
+          (error) => error?.code === 'ETIMEDOUT' || /deadline|timed out|validation failed/i.test(String(error?.message ?? error)),
+        );
+        const elapsedMs = Date.now() - startedAt;
+        assert(elapsedMs < 600, `read_ranges deadline did not release the caller promptly: ${elapsedMs}ms`);
+        assert(startedRequested.size <= 8, `read_ranges started ${startedRequested.size} path validations before a 100ms deadline could stop fan-out`);
+        assert(active <= 8, `read_ranges left ${active} metadata operations active after timeout`);
+      } finally {
+        fs.realpath = originalRealpath;
+      }
+    });
+
+    await check('cpp build changed-file canonicalization keeps filesystem fan-out bounded', async () => {
+      const { callCppBuildChangeClassification } = await import('../dist/tools/cpp-build-impact-accelerator.js');
+      const relativeFiles = Array.from({ length: 24 }, (_, index) => `cpp-fanout-${index}.cpp`);
+      await Promise.all(relativeFiles.map((relative, index) =>
+        fs.writeFile(path.join(root, relative), `int value_${index} = ${index};\n`, 'utf8')));
+      const requested = new Set(relativeFiles.map((relative) => path.resolve(root, relative).toLowerCase()));
+      const originalRealpath = fs.realpath;
+      let active = 0;
+      let maxActive = 0;
+      try {
+        fs.realpath = async (target, ...args) => {
+          const normalized = path.resolve(String(target)).toLowerCase();
+          if (!requested.has(normalized)) return originalRealpath(target, ...args);
+          active += 1;
+          maxActive = Math.max(maxActive, active);
+          try {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            return await originalRealpath(target, ...args);
+          } finally {
+            active -= 1;
+          }
+        };
+        const result = await callCppBuildChangeClassification({ root, changedFiles: relativeFiles }, 5_000, {
+          repositoryRoot: root, buildDir: root, cmake: {}, cmakeCache: { values: {} }, compileDatabase: { entries: [] },
+        });
+        assert.equal(result.changedFiles.length, relativeFiles.length);
+        assert(maxActive <= 8, `cpp build classification launched ${maxActive} concurrent realpath operations`);
+      } finally {
+        fs.realpath = originalRealpath;
+      }
     });
 
     await check('path authority blocks writes outside configured roots', async () => {

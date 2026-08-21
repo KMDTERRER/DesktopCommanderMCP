@@ -1,7 +1,6 @@
 import { MCPDevice } from '../remote-device/device.js';
 import os from 'os';
 import { installRemoteLifecycleDiagnostics, recordRemoteLifecycle } from '../remote-device/remote-lifecycle.js';
-import { resolveMinimalLiveTestMode } from '../remote-device/remote-live-test-guard.js';
 import {
     isRemoteBackgroundWorker,
     launchRemoteBackground,
@@ -18,12 +17,6 @@ export async function runRemote() {
 
     const lifecycleLog = installRemoteLifecycleDiagnostics();
     const persistSession = process.argv.includes('--persist-session');
-    const minimalLiveTest = resolveMinimalLiveTestMode(process.argv, process.env);
-    if (minimalLiveTest) {
-        // Test mode isolates the live transport from analytics/background network
-        // traffic so latency measurements cover only the remote call protocol.
-        process.env.DESKTOP_COMMANDER_DISABLE_TELEMETRY = 'true';
-    }
     const disableNoSleep = process.argv.includes('--disable-no-sleep');
     const verbose = process.argv.includes('--debug');
     console.debug('[DEBUG] Verbose mode: ', verbose);
@@ -48,11 +41,10 @@ export async function runRemote() {
         }
     }
 
-    const device = new MCPDevice({ persistSession, minimalLiveTest });
+    const device = new MCPDevice({ persistSession });
     await device.start();
     recordRemoteLifecycle('ready', {
         persistSession,
-        minimalLiveTest,
         background: isRemoteBackgroundWorker(),
         lifecycleLog,
     });

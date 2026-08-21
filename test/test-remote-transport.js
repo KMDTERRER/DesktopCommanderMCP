@@ -18,12 +18,9 @@
 import { formatRemoteToolTrace, MCPDevice } from '../dist/remote-device/device.js';
 import { RemoteChannel } from '../dist/remote-device/remote-channel.js';
 import { createRemoteOutcomeIdentity } from '../dist/remote-device/remote-result-contract.js';
-import { RemoteResultTransport } from '../dist/remote-device/remote-result-transport.js';
 import { RemoteCallMetrics } from '../dist/remote-device/remote-call-metrics.js';
 import { listNeutralToolAliases, resolveNeutralToolAlias } from '../dist/tools/neutral-tool-aliases.js';
-import { REMOTE_LATENCY_BASELINE_CONFIG, REMOTE_LATENCY_BASELINE_PROFILE } from '../dist/remote-device/remote-runtime-config.js';
 import { SessionTokenOwner } from '../dist/remote-device/session-token-owner.js';
-import { resolveMinimalLiveTestMode } from '../dist/remote-device/remote-live-test-guard.js';
 import { DesktopCommanderIntegration } from '../dist/remote-device/desktop-commander-integration.js';
 import fs from 'fs/promises';
 import os from 'os';
@@ -37,6 +34,7 @@ const SERVER_CAPABLE_OFFLINE_TIMEOUT_MS = 15 * 60 * 1000;
 
 const DEVICE_ID = 'device-1';
 const OTHER_DEVICE = 'device-2';
+const TARGET_IDENTITY = Object.freeze({ deviceId: DEVICE_ID, userId: 'user-1', toolName: 'start_process' });
 
 process.env.DESKTOP_COMMANDER_DISABLE_TELEMETRY = '1';
 process.env.DESKTOP_COMMANDER_REMOTE_TOOL_TRACE = 'false';
@@ -115,7 +113,7 @@ await test('production remote path emits phase metrics around claim, tool, local
     return true;
   };
   device.resultOutbox.put = async () => { await new Promise((resolve) => setTimeout(resolve, 15)); };
-  device.resultTransport.updateCallResult = async () => { await new Promise((resolve) => setTimeout(resolve, 35)); };
+  device.remoteChannel.updateCallResult = async () => { await new Promise((resolve) => setTimeout(resolve, 35)); };
   device.remoteChannel.signalResultAvailable = async () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     return { attempted: true, status: 'ok', durationMs: 20 };
@@ -124,7 +122,7 @@ await test('production remote path emits phase metrics around claim, tool, local
   await device.handleNewToolCall({
     new: {
       id: 'phase-metrics', tool_name: 'read_file', tool_args: { path: 'C:/tmp/phase.txt' },
-      device_id: DEVICE_ID, metadata: {}, created_at: new Date(Date.now() - 80).toISOString(),
+      device_id: DEVICE_ID, user_id: 'user-1', metadata: {}, created_at: new Date(Date.now() - 80).toISOString(),
     },
     _remoteTiming: { inbound: 'broadcast_doorbell', receivedAtMs: Date.now() - 40, rowFetchMs: 18 },
   });
@@ -142,60 +140,6 @@ await test('production remote path emits phase metrics around claim, tool, local
   assert(claim.rowFetchMs === 18 && claim.claimMs >= 20 && claim.preToolMs >= 40, `pre-tool phases not separated: ${JSON.stringify(claim)}`);
   assert(commit.remoteCommitMs >= 30 && commit.postToolToRemoteCommitMs >= commit.remoteCommitMs, `remote commit latency missing: ${JSON.stringify(commit)}`);
   assert(wake.wakeMs >= 15 && wake.wakeStatus === 'ok', `wake ACK latency missing: ${JSON.stringify(wake)}`);
-});
-
-await test('minimal live transport requires a separate explicit opt-in', async () => {
-  assert(resolveMinimalLiveTestMode(['node', 'remote'], {}) === false, 'production argv unexpectedly enabled minimal transport');
-  let rejected = false;
-  try { resolveMinimalLiveTestMode(['node', 'remote', '--minimal-live-test'], {}); }
-  catch (error) { rejected = /test-only/.test(String(error?.message)); }
-  assert(rejected, 'minimal-live-test flag did not fail closed without explicit opt-in');
-  assert(
-    resolveMinimalLiveTestMode(
-      ['node', 'remote', '--minimal-live-test'],
-      { DC_ALLOW_MINIMAL_LIVE_TEST: 'true' },
-    ) === true,
-    'explicit benchmark opt-in did not enable minimal transport',
-  );
-});
-
-await test('latency baseline contract stays minimal and parallel', async () => {
-  assert(REMOTE_LATENCY_BASELINE_CONFIG.profile === REMOTE_LATENCY_BASELINE_PROFILE, 'baseline profile name drifted');
-  assert(REMOTE_LATENCY_BASELINE_CONFIG.inbound === 'broadcast_doorbell', 'baseline inbound drifted');
-  assert(REMOTE_LATENCY_BASELINE_CONFIG.executingWrite === 'none', 'baseline added an executing write');
-  assert(REMOTE_LATENCY_BASELINE_CONFIG.terminalWrite === 'simple', 'baseline terminal write drifted');
-  assert(REMOTE_LATENCY_BASELINE_CONFIG.outbox === false, 'baseline reintroduced outbox');
-  assert(REMOTE_LATENCY_BASELINE_CONFIG.resultWake === false, 'baseline reintroduced result wake');
-  assert(REMOTE_LATENCY_BASELINE_CONFIG.heartbeatMs === 15_000, 'baseline heartbeat drifted');
-  assert(REMOTE_LATENCY_BASELINE_CONFIG.maxParallelCalls === 8, 'baseline parallel lane count drifted');
-});
-
-await test('minimal live admission executes independent calls in parallel up to its configured bound', async () => {
-  const device = new MCPDevice({ minimalLiveTest: true });
-  const policy = { ...REMOTE_LATENCY_BASELINE_CONFIG, profile: 'parallel-test', maxParallelCalls: 2, diagnostics: false };
-  device.deviceId = DEVICE_ID;
-  device.runtimeConfig = { current: () => policy };
-  device.callMetrics = { record: () => {} };
-  let active = 0;
-  let maxActive = 0;
-  let completed = 0;
-  device.desktop = {
-    callClientTool: async () => {
-      active += 1;
-      maxActive = Math.max(maxActive, active);
-      await new Promise((resolve) => setTimeout(resolve, 30));
-      active -= 1;
-      completed += 1;
-      return { content: [{ type: 'text', text: 'ok' }] };
-    },
-  };
-  device.resultTransport = { updateCallResultSimple: async () => {} };
-  const payload = (id) => ({ new: { id, tool_name: 'read_file', tool_args: {}, device_id: DEVICE_ID } });
-  await Promise.all(['p1', 'p2', 'p3', 'p4'].map((id) => device.handleNewToolCall(payload(id))));
-  assert(completed === 4, `expected all parallel calls to complete, got ${completed}`);
-  assert(maxActive === 2, `expected two concurrent calls, observed ${maxActive}`);
-  assert(device.minimalCallActive === 0, 'parallel admission leaked an active lane');
-  assert(device.minimalCallWaiters.length === 0, 'parallel admission leaked queued waiters');
 });
 
 await test('remote tool trace formatter keeps plain logs clean and color changes presentation only', async () => {
@@ -241,6 +185,9 @@ const realSetTimeout = globalThis.setTimeout;
 /** MCPDevice with the network and desktop edges stubbed. */
 function makeDevice({ claimResults = [] } = {}) {
   const device = new MCPDevice();
+  // Unit fixtures must not append synthetic call ids to the user's live
+  // forensic metrics file.
+  device.callMetrics = { record: () => {} };
   const executed = [];
   const claims = [...claimResults];
 
@@ -264,11 +211,8 @@ function makeDevice({ claimResults = [] } = {}) {
     markCallExecuting: async () => (claims.length ? claims.shift() : true),
     getCurrentUserId: () => 'user-1',
     getCallClaimToken: () => 'test-claim-token',
-    getCallClaimMetadata: () => ({ _desktop_commander_claim_token: 'test-claim-token' }),
     releaseCallClaim: () => {},
     signalResultAvailable: () => {},
-  };
-  device.resultTransport = {
     updateCallResult: async () => {},
   };
   return { device, executed, outboxEntries };
@@ -398,17 +342,7 @@ function makeRemoteChannel(opts = {}) {
   rc.deviceId = DEVICE_ID;
   rc.deviceName = 'test-device';
   rc.onToolCall = () => {};
-  rc.deviceSessionLease = { generation: 'test-session-generation', acquired_at: '2026-08-17T00:00:00.000Z' };
   return { rc, client };
-}
-
-function makeResultTransport(opts = {}) {
-  const tokens = new SessionTokenOwner();
-  tokens.replace({ access_token: 'test-access', refresh_token: 'test-refresh' });
-  const rt = new RemoteResultTransport(tokens);
-  const client = makeFakeClient(opts);
-  rt.client = client;
-  return { rt, client, tokens };
 }
 
 const payloadFor = (id, deviceId = DEVICE_ID) => ({
@@ -417,8 +351,48 @@ const payloadFor = (id, deviceId = DEVICE_ID) => ({
     tool_name: 'start_process',
     tool_args: { command: 'echo hi' },
     device_id: deviceId,
+    user_id: 'user-1',
     metadata: {},
   },
+});
+
+await test('RemoteChannel is the sole hosted call-row transport owner', async () => {
+  const sourceDirectory = new URL('../src/remote-device/', import.meta.url);
+  const names = (await fs.readdir(sourceDirectory)).filter((name) => name.endsWith('.ts'));
+  const owners = [];
+  for (const name of names) {
+    const source = await fs.readFile(new URL(name, sourceDirectory), 'utf8');
+    if (source.includes('mcp_remote_calls')) owners.push(name);
+  }
+  assert(owners.length === 1 && owners[0] === 'remote-channel.ts',
+    `hosted call-row access escaped RemoteChannel: ${JSON.stringify(owners)}`);
+  for (const removed of ['remote-result-transport.ts', 'remote-runtime-config.ts', 'remote-live-test-guard.ts']) {
+    assert(!names.includes(removed), `removed alternate transport returned: ${removed}`);
+  }
+});
+
+await test('the parent device gate converts a nested malformed result before delivery', async () => {
+  const { device } = makeDevice();
+  const delivered = [];
+  device.desktop.callClientTool = async () => [];
+  device.remoteChannel.updateCallResult = async (callId, status, result, errorMessage) => {
+    delivered.push({ callId, status, result, errorMessage });
+  };
+  await device.handleNewToolCall({
+    new: {
+      id: 'malformed-child', tool_name: 'read_file', tool_args: { path: 'C:/example.txt' },
+      device_id: DEVICE_ID, user_id: 'user-1', metadata: {},
+    },
+  });
+  for (let attempt = 0; attempt < 100 && delivered.length < 1; attempt++) {
+    await new Promise((resolve) => realSetTimeout(resolve, 5));
+  }
+  assert(delivered.length === 1, 'parent did not deliver the normalized terminal outcome');
+  assert(delivered[0].status === 'completed' && delivered[0].errorMessage === null,
+    'native tool error leaked into the hosted error channel');
+  assert(delivered[0].result?.isError === true, 'malformed nested result was not marked as a tool error');
+  assert(/^Error: Remote result for read_file/.test(delivered[0].result?.content?.[0]?.text ?? ''),
+    `wrong frozen error envelope: ${JSON.stringify(delivered[0].result)}`);
 });
 
 await test('remote call_id correlation survives out-of-order tool completion', async () => {
@@ -428,11 +402,11 @@ await test('remote call_id correlation survives out-of-order tool completion', a
     await new Promise((resolve) => realSetTimeout(resolve, args.label === 'slow' ? 120 : 10));
     return { content: [{ type: 'text', text: args.label }] };
   };
-  device.resultTransport.updateCallResult = async (callId, status, result, errorMessage) => {
+  device.remoteChannel.updateCallResult = async (callId, status, result, errorMessage) => {
     delivered.push({ callId, status, text: result?.content?.[0]?.text ?? null, errorMessage });
   };
   const routedPayload = (id, label) => ({
-    new: { id, tool_name: 'route_test', tool_args: { label }, device_id: DEVICE_ID, metadata: {} },
+    new: { id, tool_name: 'route_test', tool_args: { label }, device_id: DEVICE_ID, user_id: 'user-1', metadata: {} },
   });
   const slow = device.handleNewToolCall(routedPayload('call-slow', 'slow'));
   await new Promise((resolve) => realSetTimeout(resolve, 5));
@@ -448,6 +422,47 @@ await test('remote call_id correlation survives out-of-order tool completion', a
   assert(byId.get('call-slow')?.text === 'slow', `slow result routed to wrong call: ${JSON.stringify(delivered)}`);
   assert([...byId.values()].every((entry) => entry.status === 'completed' && entry.errorMessage === null),
     `terminal status/error was cross-routed: ${JSON.stringify(delivered)}`);
+});
+
+await test('concurrent chats keep a timeout error and a success on their own call ids', async () => {
+  const { device } = makeDevice();
+  const delivered = [];
+  device.desktop.callClientTool = async (_toolName, args) => {
+    if (args.label === 'timeout-chat') {
+      await new Promise((resolve) => realSetTimeout(resolve, 35));
+      const error = new Error('Operation timed out after 25ms');
+      error.code = 'ETIMEDOUT';
+      throw error;
+    }
+    await new Promise((resolve) => realSetTimeout(resolve, 5));
+    return { content: [{ type: 'text', text: 'success-chat-result' }] };
+  };
+  device.remoteChannel.updateCallResult = async (callId, status, result, errorMessage) => {
+    delivered.push({ callId, status, result, errorMessage });
+  };
+  const payload = (id, label, conversationId) => ({ new: {
+    id, tool_name: 'read_file', tool_args: { label }, device_id: DEVICE_ID, user_id: 'user-1',
+    metadata: { conversation_id: conversationId },
+  } });
+
+  await Promise.all([
+    device.handleNewToolCall(payload('timeout-call', 'timeout-chat', 'chat-timeout')),
+    device.handleNewToolCall(payload('success-call', 'success-chat', 'chat-success')),
+  ]);
+  for (let attempt = 0; attempt < 100 && delivered.length < 2; attempt++) {
+    await new Promise((resolve) => realSetTimeout(resolve, 5));
+  }
+
+  const byId = new Map(delivered.map((entry) => [entry.callId, entry]));
+  const timeout = byId.get('timeout-call');
+  const success = byId.get('success-call');
+  assert(timeout?.status === 'completed' && timeout?.result?.isError === true,
+    `timeout did not retain the native tool error result: ${JSON.stringify(timeout)}`);
+  assert(/timed out/i.test(timeout?.result?.content?.[0]?.text || ''), 'timeout message was lost or cross-routed');
+  assert(timeout?.errorMessage === null, 'timeout escaped through the hosted error_message channel');
+  assert(success?.status === 'completed' && success?.result?.isError !== true,
+    `success was contaminated by the other chat timeout: ${JSON.stringify(success)}`);
+  assert(success?.result?.content?.[0]?.text === 'success-chat-result', 'success result was routed to the wrong call');
 });
 
 await test('non-persistent run preserves an existing persisted auth session', async () => {
@@ -573,6 +588,7 @@ await test('Remote parent operator trace identifies mcp:// tools without leaking
           options: { secret: 'MUST_NOT_REACH_OPERATOR_TRACE' },
         },
         device_id: DEVICE_ID,
+        user_id: 'user-1',
         metadata: {},
       },
     });
@@ -632,6 +648,69 @@ await test('calls for another device are ignored and do not poison the dedupe se
   assert(executed.length === 1, 'a mismatched delivery must not suppress our own');
 });
 
+await test('missing device or wrong user targets fail closed before claim and execution', async () => {
+  const { device, executed, outboxEntries } = makeDevice();
+  let claims = 0;
+  let terminalWrites = 0;
+  let wakes = 0;
+  device.remoteChannel.markCallExecuting = async () => { claims++; return true; };
+  device.remoteChannel.updateCallResult = async () => { terminalWrites++; };
+  device.remoteChannel.signalResultAvailable = () => { wakes++; };
+  const missingDevice = payloadFor('missing-device');
+  delete missingDevice.new.device_id;
+  const wrongUser = payloadFor('wrong-user');
+  wrongUser.new.user_id = 'user-2';
+  await device.handleNewToolCall(missingDevice);
+  await device.handleNewToolCall(wrongUser);
+  assert(claims === 0, `foreign calls reached DB claim: ${claims}`);
+  assert(executed.length === 0, `foreign calls executed: ${executed.length}`);
+  assert(outboxEntries.size === 0, 'foreign calls created a result outbox entry');
+  assert(terminalWrites === 0, `foreign calls wrote ${terminalWrites} terminal responses`);
+  assert(wakes === 0, `foreign calls emitted ${wakes} result wakes`);
+});
+
+await test('claim errors never manufacture a terminal response for an unowned call', async () => {
+  const { device, executed, outboxEntries } = makeDevice();
+  let terminalWrites = 0;
+  let wakes = 0;
+  device.remoteChannel.markCallExecuting = async () => { throw new Error('claim transport failed'); };
+  device.remoteChannel.updateCallResult = async () => { terminalWrites++; };
+  device.remoteChannel.signalResultAvailable = () => { wakes++; };
+
+  await device.handleNewToolCall(payloadFor('claim-error'));
+
+  assert(executed.length === 0, 'tool executed without claim ownership');
+  assert(outboxEntries.size === 0, 'claim error created a result outbox entry');
+  assert(terminalWrites === 0, `claim error wrote ${terminalWrites} terminal responses`);
+  assert(wakes === 0, `claim error emitted ${wakes} result wakes`);
+});
+
+await test('a local tool error stays in the native tool result after ownership is established', async () => {
+  const { device, executed, outboxEntries } = makeDevice();
+  let releaseDelivery;
+  const deliveryGate = new Promise((resolve) => { releaseDelivery = resolve; });
+  device.desktop.callClientTool = async (toolName, args) => {
+    executed.push({ toolName, args });
+    throw new Error('intentional local failure');
+  };
+  device.remoteChannel.updateCallResult = async () => { await deliveryGate; };
+
+  await device.handleNewToolCall(payloadFor('owned-tool-error'));
+
+  const entry = outboxEntries.get('owned-tool-error');
+  assert(executed.length === 1, 'owned failing tool did not execute exactly once');
+  assert(entry?.version === 2, 'error outcome did not use identity-bound outbox format');
+  assert(entry?.callId === 'owned-tool-error' && entry?.deviceId === DEVICE_ID && entry?.userId === 'user-1'
+    && entry?.toolName === 'start_process', `error outcome target drifted: ${JSON.stringify(entry)}`);
+  assert(entry?.status === 'completed', `tool error escaped through remote failed status: ${JSON.stringify(entry)}`);
+  assert(entry?.result?.isError === true, `tool error was returned as successful text: ${JSON.stringify(entry)}`);
+  assert(entry?.result?.content?.[0]?.text === 'Error: intentional local failure',
+    `native tool error text drifted: ${JSON.stringify(entry)}`);
+  assert(entry?.errorMessage === null, 'tool error escaped through the proxy error_message channel');
+
+  releaseDelivery();
+});
+
 await test('the seen-call-id set stays bounded', async () => {
   const { device } = makeDevice();
   for (let i = 0; i < 250; i++) await device.handleNewToolCall(payloadFor(`bulk-${i}`));
@@ -641,7 +720,7 @@ await test('the seen-call-id set stays bounded', async () => {
 await test('a completed tool result stays in the durable outbox until remote persistence succeeds', async () => {
   const { device, executed, outboxEntries } = makeDevice();
   let writes = 0;
-  device.resultTransport.updateCallResult = async () => {
+  device.remoteChannel.updateCallResult = async () => {
     writes++;
     if (writes === 1) throw new TypeError('fetch failed');
   };
@@ -657,13 +736,51 @@ await test('a completed tool result stays in the durable outbox until remote per
   assert(outboxEntries.size === 0, 'confirmed replay must remove the durable outbox entry');
 });
 
+await test('a duplicate doorbell cannot resend a committed result while outbox cleanup is pending', async () => {
+  const { device, executed, outboxEntries } = makeDevice();
+  let terminalWrites = 0;
+  let wakes = 0;
+  let releaseCleanup;
+  const cleanupGate = new Promise((resolve) => { releaseCleanup = resolve; });
+  device.remoteChannel.updateCallResult = async () => { terminalWrites++; };
+  device.remoteChannel.signalResultAvailable = () => {
+    wakes++;
+    return { attempted: true, status: 'ok', durationMs: 0 };
+  };
+  device.resultOutbox.remove = async (callId) => {
+    await cleanupGate;
+    outboxEntries.delete(callId);
+  };
+
+  await device.handleNewToolCall(payloadFor('cleanup-race'));
+  const firstDeliveryDeadline = Date.now() + 500;
+  while (terminalWrites < 1 && Date.now() < firstDeliveryDeadline) {
+    await new Promise((resolve) => realSetTimeout(resolve, 5));
+  }
+  assert(terminalWrites === 1, 'initial terminal result did not reach the hosted writer');
+
+  const duplicate = device.handleNewToolCall(payloadFor('cleanup-race'));
+  await new Promise((resolve) => realSetTimeout(resolve, 20));
+  assert(terminalWrites === 1, 'duplicate resent the payload before cleanup completed');
+  releaseCleanup();
+  await duplicate;
+  const wakeDeadline = Date.now() + 500;
+  while (wakes < 1 && Date.now() < wakeDeadline) {
+    await new Promise((resolve) => realSetTimeout(resolve, 5));
+  }
+
+  assert(executed.length === 1, 'duplicate doorbell re-executed the tool');
+  assert(terminalWrites === 1, `duplicate doorbell resent the terminal payload ${terminalWrites} times`);
+  assert(wakes === 1, `duplicate doorbell emitted ${wakes} result wakes`);
+});
+
 await test('slow remote persistence cannot block completed handlers under parallel load', async () => {
   const { device, executed, outboxEntries } = makeDevice();
   let releaseWrites;
   const writeGate = new Promise((resolve) => { releaseWrites = resolve; });
-  const deliveryModes = [];
-  device.resultTransport.updateCallResult = async (_callId, _status, _result, _error, _claim, mode) => {
-    deliveryModes.push(mode);
+  let deliveryCalls = 0;
+  device.remoteChannel.updateCallResult = async (_callId, _status, _result, _error) => {
+    deliveryCalls++;
     await writeGate;
   };
 
@@ -678,8 +795,7 @@ await test('slow remote persistence cannot block completed handlers under parall
   assert(handlerState === 'done', 'completed tool handlers waited for slow remote result persistence');
   assert(executed.length === 6, `expected 6 completed tools, got ${executed.length}`);
   assert(outboxEntries.size === 6, 'each completed tool must be durable before detached delivery');
-  assert(deliveryModes.length > 0 && deliveryModes.every((mode) => mode === 'live'),
-    `initial result delivery must use the short live policy, got ${JSON.stringify(deliveryModes)}`);
+  assert(deliveryCalls > 0, 'initial result delivery did not use the upstream RemoteChannel path');
 
   releaseWrites();
   const deadline = Date.now() + 1000;
@@ -689,35 +805,12 @@ await test('slow remote persistence cannot block completed handlers under parall
   assert(outboxEntries.size === 0, 'released live deliveries did not retire their outbox entries');
 });
 
-await test('live result persistence uses one short bounded attempt before durable replay takes over', async () => {
-  const { rt } = makeResultTransport();
-  const client = makeNeverSettlingClient();
-  rt.client = client;
-
-  let error;
-  try {
-    await withAcceleratedRemoteDeadlines(() =>
-      rt.updateCallResult(
-        'live-never-result', 'completed', { content: [{ type: 'text', text: 'ok' }] },
-        null, 'test-claim-token', 'live'
-      )
-    );
-  } catch (caught) {
-    error = caught;
-  }
-
-  assert(error, 'unconfirmed live persistence must defer to the durable outbox');
-  assert(client.updates.length === 1, `expected exactly one bounded live write, got ${client.updates.length}`);
-  assert(client.signals.length >= 1 && client.signals.every((signal) => signal.aborted),
-    'live timeout must abort its in-flight remote requests');
-});
-
 await test('a stale non-transient outbox entry does not block later deliverable results', async () => {
   const { device, outboxEntries } = makeDevice();
-  outboxEntries.set('poison', { version: 1, callId: 'poison', userId: 'user-1', claimToken: 'claim-poison', status: 'completed', result: { content: [] }, errorMessage: null, createdAt: new Date().toISOString() });
-  outboxEntries.set('good', { version: 1, callId: 'good', userId: 'user-1', claimToken: 'claim-good', status: 'completed', result: { content: [] }, errorMessage: null, createdAt: new Date().toISOString() });
+  outboxEntries.set('poison', { version: 2, callId: 'poison', ...TARGET_IDENTITY, claimToken: 'claim-poison', status: 'completed', result: { content: [] }, errorMessage: null, createdAt: new Date().toISOString() });
+  outboxEntries.set('good', { version: 2, callId: 'good', ...TARGET_IDENTITY, claimToken: 'claim-good', status: 'completed', result: { content: [] }, errorMessage: null, createdAt: new Date().toISOString() });
   const writes = [];
-  device.resultTransport.updateCallResult = async (callId) => {
+  device.remoteChannel.updateCallResult = async (callId) => {
     writes.push(callId);
     if (callId === 'poison') throw new Error('claim ownership changed');
   };
@@ -729,11 +822,28 @@ await test('a stale non-transient outbox entry does not block later deliverable 
   assert(!outboxEntries.has('good'), 'deliverable later entry should be removed after acknowledgement');
 });
 
+await test('an already-committed replay is retired without a second result wake', async () => {
+  const { device, outboxEntries } = makeDevice();
+  outboxEntries.set('already-terminal', {
+    version: 2, callId: 'already-terminal', ...TARGET_IDENTITY, claimToken: 'claim-already-terminal',
+    status: 'completed', result: { content: [{ type: 'text', text: 'stored' }] },
+    errorMessage: null, createdAt: new Date().toISOString(),
+  });
+  let wakes = 0;
+  device.remoteChannel.updateCallResult = async () => 'already_committed';
+  device.remoteChannel.signalResultAvailable = () => { wakes++; };
+
+  await device.flushResultOutbox();
+
+  assert(!outboxEntries.has('already-terminal'), 'already-terminal replay remained in the outbox');
+  assert(wakes === 0, `already-terminal replay emitted ${wakes} duplicate wake(s)`);
+});
+
 await test('an outbox entry whose remote call is confirmed gone is discarded instead of retried forever', async () => {
   const { device, outboxEntries } = makeDevice();
-  outboxEntries.set('gone', { version: 1, callId: 'gone', userId: 'user-1', claimToken: 'claim-gone', status: 'completed', result: { content: [] }, errorMessage: null, createdAt: new Date().toISOString() });
+  outboxEntries.set('gone', { version: 2, callId: 'gone', ...TARGET_IDENTITY, claimToken: 'claim-gone', status: 'completed', result: { content: [] }, errorMessage: null, createdAt: new Date().toISOString() });
   const error = Object.assign(new Error('remote call no longer exists'), { code: 'EREMOTECALLGONE' });
-  device.resultTransport.updateCallResult = async () => { throw error; };
+  device.remoteChannel.updateCallResult = async () => { throw error; };
 
   await device.flushResultOutbox();
 
@@ -744,7 +854,7 @@ await test('a slow result for one call does not block another call delivery', as
   let releaseSlow;
   const slowGate = new Promise((resolve) => { releaseSlow = resolve; });
   const order = [];
-  device.resultTransport.updateCallResult = async (callId) => {
+  device.remoteChannel.updateCallResult = async (callId) => {
     if (callId === 'slow-call') await slowGate;
     order.push(`write:${callId}`);
   };
@@ -775,7 +885,7 @@ await test('background outbox replay cannot reserve the delivery pool ahead of t
   for (let index = 0; index < 8; index++) {
     const callId = `old-${index}`;
     outboxEntries.set(callId, {
-      version: 1, callId, userId: 'user-1', claimToken: `claim-${callId}`,
+      version: 2, callId, ...TARGET_IDENTITY, claimToken: `claim-${callId}`,
       status: 'completed', result: { content: [{ type: 'text', text: callId }] },
       errorMessage: null, createdAt: new Date().toISOString(),
     });
@@ -787,7 +897,7 @@ await test('background outbox replay cannot reserve the delivery pool ahead of t
   const delivered = [];
   let activeWrites = 0;
   let maxActiveWrites = 0;
-  device.resultTransport.updateCallResult = async (callId) => {
+  device.remoteChannel.updateCallResult = async (callId) => {
     activeWrites++;
     maxActiveWrites = Math.max(maxActiveWrites, activeWrites);
     try {
@@ -867,7 +977,7 @@ await test('heartbeat startup is idempotent for the same device', async () => {
   }
 });
 
-await test('legacy production subscription is scoped to this device', async () => {
+await test('legacy production subscription matches the upstream user-scoped channel', async () => {
   const rc = new RemoteChannel(new SessionTokenOwner());
   rc._user = { id: 'user-1', email: 'tester@example.com' };
   rc.deviceId = DEVICE_ID;
@@ -875,95 +985,36 @@ await test('legacy production subscription is scoped to this device', async () =
   const channel = { state: 'joined', on: (_kind, options) => { subscriptionFilter = options?.filter ?? null; return channel; }, subscribe: () => channel };
   rc.client = { channel: () => channel };
   rc.createLegacyChannel();
-  assert(subscriptionFilter === `device_id=eq.${DEVICE_ID}`, `legacy subscription is not device-scoped: ${subscriptionFilter}`);
+  assert(subscriptionFilter === 'user_id=eq.user-1', `legacy subscription drifted from upstream: ${subscriptionFilter}`);
 });
 
-await test('slow legacy delivery of a broadcast-selected call degrades without channel churn', async () => {
-  const { rc, client } = makeRemoteChannel();
-  rc.transportCapableWritten = true; rc.presenceTracked = true; rc.channel = makeChannelState('joined');
-  let legacyCallback = null; let forcedRecreate = null;
-  const legacy = {
-    state: 'joined',
-    on: (_kind, _options, callback) => { legacyCallback = callback; return legacy; },
-    subscribe: () => legacy,
-  };
-  client.channel = () => legacy;
-  rc.recreateChannel = async (force) => { forcedRecreate = force; };
-  rc.createLegacyChannel();
-  legacyCallback({ new: {
-    id: 'broadcast-miss', device_id: DEVICE_ID, status: 'pending', tool_name: 'read_file', tool_args: {},
-    created_at: new Date(Date.now() - 2000).toISOString(), metadata: { transport: 'broadcast_v1' },
-  } });
-  await rc.capabilityWriteChain; rc.stopDegradedCallPolling();
-  assert(forcedRecreate === null, `broadcast miss unexpectedly recreated the channel: ${forcedRecreate}`);
-  assert(rc.transportCapableWritten === false, 'broadcast miss left broadcast capability advertised');
-});
-
-await test('broadcast miss does not retrack Presence or re-enable capability on the same channel', async () => {
+await test('fork-only degraded polling transport is absent', async () => {
   const { rc } = makeRemoteChannel();
-  rc.transportCapableWritten = true;
-  rc.presenceTracked = true;
-  rc.channel = makeChannelState('joined');
-  let trackRetries = 0;
-  let enabledWrites = 0;
-  rc.trackPresenceWithRetry = async () => { trackRetries++; };
-  const realSetTransportCapable = rc.setTransportCapable.bind(rc);
-  rc.setTransportCapable = async (capable) => { if (capable) enabledWrites++; return realSetTransportCapable(capable); };
-
-  rc.handleBroadcastDeliveryMiss({
-    id: 'broadcast-health-miss', created_at: new Date(Date.now() - 2000).toISOString(),
-    metadata: { transport: 'broadcast_v1' },
-  }, Date.now());
-  await rc.capabilityWriteChain;
-  rc.checkConnectionHealth();
-  await rc.capabilityWriteChain;
-  rc.stopDegradedCallPolling();
-
-  assert(rc.presenceTracked === true, 'broadcast delivery miss invalidated an unrelated Presence registration');
-  assert(trackRetries === 0, `health check retracked Presence after broadcast miss: ${trackRetries}`);
-  assert(enabledWrites === 0, `health check re-enabled broadcast without delivery evidence: ${enabledWrites}`);
-  assert(rc.transportCapableWritten === false, 'broadcast capability oscillated back to true on the same channel');
+  assert(rc.pollPendingCallsOnce === undefined, 'production still exposes degraded REST polling');
+  assert(rc.startDegradedCallPolling === undefined, 'production still exposes a degraded poll scheduler');
+  assert(rc.handleBroadcastDeliveryMiss === undefined, 'production still exposes fork-only broadcast suppression');
 });
 
-await test('degraded REST poll dispatches a pending device call without waiting for postgres_changes', async () => {
-  const rc = new RemoteChannel(new SessionTokenOwner());
-  rc._user = { id: 'user-1', email: 'tester@example.com' };
-  rc.deviceId = DEVICE_ID; rc.channel = makeChannelState('errored'); rc.legacyChannel = makeChannelState('joined');
-  const delivered = []; const filters = [];
-  const row = { id: 'poll-call', status: 'pending', device_id: DEVICE_ID, tool_name: 'read_file', tool_args: { path: 'C:/tmp/x' }, created_at: new Date().toISOString() };
-  const chain = {
-    select: () => chain, eq: (field, value) => { filters.push([field, value]); return chain; }, order: () => chain, limit: () => chain,
-    abortSignal: async () => ({ data: [row], error: null }),
+await test('late broadcast doorbell remains on the upstream channel contract', async () => {
+  const row = {
+    id: 'late-doorbell', device_id: DEVICE_ID, status: 'pending', tool_name: 'read_file', tool_args: {},
+    created_at: new Date(Date.now() - 2000).toISOString(), metadata: { transport: 'broadcast_v1' },
   };
-  rc.client = { from: () => chain }; rc.onToolCall = (payload) => delivered.push(payload);
-  const count = await rc.pollPendingCallsOnce();
-  assert(count === 1 && delivered.length === 1, `degraded poll did not dispatch exactly one row: ${count}/${delivered.length}`);
-  assert(delivered[0].new === row && delivered[0]._remoteTiming?.inbound === 'degraded_poll', 'degraded poll lost row/timing provenance');
-  assert(filters.some(([field, value]) => field === 'device_id' && value === DEVICE_ID), 'degraded poll did not fence by device_id');
-  assert(filters.some(([field, value]) => field === 'status' && value === 'pending'), 'degraded poll did not fence by pending status');
-});
+  const { rc } = makeRemoteChannel({ row });
+  rc.transportCapableWritten = true; rc.presenceTracked = true; rc.channel = makeChannelState('joined');
+  const delivered = [];
+  rc.onToolCall = (payload) => delivered.push(payload);
 
-await test('degraded poll scheduler never overlaps its own REST requests', async () => {
-  const rc = new RemoteChannel(new SessionTokenOwner());
-  rc._user = { id: 'user-1', email: 'tester@example.com' }; rc.deviceId = DEVICE_ID;
-  rc.channel = makeChannelState('errored'); rc.legacyChannel = makeChannelState('joined'); rc.onToolCall = () => {};
-  let active = 0; let maxActive = 0; let releaseFirst; const gate = new Promise((resolve) => { releaseFirst = resolve; });
-  const chain = {
-    select: () => chain, eq: () => chain, order: () => chain, limit: () => chain,
-    abortSignal: async () => { active++; maxActive = Math.max(maxActive, active); await gate; active--; return { data: [], error: null }; },
-  };
-  rc.client = { from: () => chain };
-  rc.startDegradedCallPolling(); rc.startDegradedCallPolling();
-  await new Promise((resolve) => realSetTimeout(resolve, 20));
-  assert(maxActive === 1, `degraded poll overlapped requests: ${maxActive}`);
-  releaseFirst(); await new Promise((resolve) => realSetTimeout(resolve, 20)); rc.stopDegradedCallPolling();
+  await rc.onDoorbell({ call_id: row.id, device_id: DEVICE_ID });
+  assert(delivered.length === 1, 'late broadcast doorbell did not deliver its pending row');
+  assert(rc.transportCapableWritten === true, 'doorbell timing unexpectedly rewrote hosted capabilities');
 });
 
 await test('IncreaseConnectionPool immediately withdraws a stale broadcast capability', async () => {
   const { rc, client } = makeRemoteChannel();
   rc.transportCapableWritten = true; rc.channel = makeChannelState('errored'); rc.legacyChannel = makeChannelState('joined');
   rc.handlePrivateTransportFailure(new Error('IncreaseConnectionPool: Please increase your connection pool size'));
-  await rc.capabilityWriteChain; rc.stopDegradedCallPolling();
+  await rc.capabilityWriteChain;
   assert(rc.transportCapableWritten === false, 'hard private authorization failure left broadcast capability advertised');
   const capabilityWrites = client.writes.filter((value) => value?.capabilities);
   assert(capabilityWrites.length >= 1, 'hard private failure did not publish a capability withdrawal');
@@ -1037,7 +1088,7 @@ await test('markCallExecuting fails closed when DB ownership cannot be establish
 
   let error;
   try {
-    await withAcceleratedRemoteDeadlines(() => rc.markCallExecuting('never-claim'));
+    await withAcceleratedRemoteDeadlines(() => rc.markCallExecuting('never-claim', TARGET_IDENTITY));
   } catch (caught) {
     error = caught;
   }
@@ -1045,52 +1096,6 @@ await test('markCallExecuting fails closed when DB ownership cannot be establish
   assert(error, 'an ambiguous claim must reject rather than execute fail-open');
   assert(client.signals.length >= 6, `expected bounded claim + reconcile attempts, got ${client.signals.length}`);
   assert(client.signals.every((signal) => signal.aborted), 'every timed-out ownership probe must abort its request signal');
-});
-
-await test('transient result persistence failure retries without discarding a successful tool result', async () => {
-  const { rt } = makeResultTransport();
-  const claimToken = 'transient-result-claim';
-  let updateAttempts = 0;
-  let reconcileAttempts = 0;
-  let fallbackWrites = 0;
-
-  const updateChain = (payload) => {
-    const chain = {
-      eq: () => chain,
-      contains: () => chain,
-      select: () => chain,
-      abortSignal: async () => {
-        updateAttempts++;
-        if (payload.status === 'failed') fallbackWrites++;
-        if (updateAttempts === 1) throw new TypeError('fetch failed');
-        return { data: [{ id: 'transient-result', status: payload.status, metadata: { _desktop_commander_claim_token: claimToken } }], error: null };
-      },
-    };
-    return chain;
-  };
-  const selectChain = {
-    eq: () => selectChain,
-    abortSignal: () => selectChain,
-    maybeSingle: async () => {
-      reconcileAttempts++;
-      if (reconcileAttempts === 1) throw new TypeError('fetch failed');
-      return { data: { status: 'executing', metadata: { _desktop_commander_claim_token: claimToken } }, error: null };
-    },
-  };
-  rt.client = {
-    from: () => ({
-      update: (payload) => updateChain(payload),
-      select: () => selectChain,
-    }),
-  };
-
-  await rt.updateCallResult(
-    'transient-result', 'completed', { content: [{ type: 'text', text: 'valuable result' }] },
-    null, claimToken,
-  );
-
-  assert(updateAttempts === 2, `expected one transient retry, got ${updateAttempts} updates`);
-  assert(fallbackWrites === 0, 'a transient transport failure must not replace the successful result with fallback');
 });
 
 await test('remote outcome hash is canonical and includes terminal status', async () => {
@@ -1102,111 +1107,54 @@ await test('remote outcome hash is canonical and includes terminal status', asyn
   assert(left.outcomeHash !== failed.outcomeHash, 'terminal status must participate in outcome identity');
 });
 
-await test('ambiguous terminal write rejects a different remote outcome for the same claim', async () => {
-  const { rt } = makeResultTransport();
-  const claimToken = 'identity-mismatch-claim';
-  const expectedResult = { content: [{ type: 'text', text: 'expected' }] };
-  const remoteResult = { content: [{ type: 'text', text: 'different' }] };
-  const updateChain = {
-    eq: () => updateChain,
-    contains: () => updateChain,
-    select: () => updateChain,
-    abortSignal: async () => ({ data: [], error: null }),
-  };
-  const selectChain = {
-    eq: () => selectChain,
-    abortSignal: () => selectChain,
-    maybeSingle: async () => ({
-      data: { status: 'completed', result: remoteResult, error_message: null, metadata: { _desktop_commander_claim_token: claimToken } },
-      error: null,
-    }),
-  };
-  rt.client = { from: () => ({ update: () => updateChain, select: () => selectChain }) };
-
-  let error;
-  try {
-    await rt.updateCallResult('identity-mismatch', 'completed', expectedResult, null, claimToken);
-  } catch (caught) {
-    error = caught;
+await test('sole hosted-result writer rejects malformed results before any network write', async () => {
+  const { rc, client } = makeRemoteChannel();
+  for (const invalid of [[], null, { content: 'not-an-array' }, { content: [{ type: 'text' }] }]) {
+    let error;
+    try {
+      await rc.updateCallResult('invalid-final', 'completed', invalid, null, TARGET_IDENTITY);
+    } catch (caught) {
+      error = caught;
+    }
+    assert(error, `hosted writer accepted malformed result ${JSON.stringify(invalid)}`);
   }
-
-  assert(/outcome identity mismatch/i.test(error?.message || ''), `expected identity mismatch, got ${error?.message}`);
+  assert(client.writes.length === 0, 'a malformed result reached the hosted update path');
 });
 
-await test('ambiguous terminal write accepts the exact legacy remote outcome without identity metadata', async () => {
-  const { rt } = makeResultTransport();
-  const claimToken = 'identity-match-claim';
-  const expectedResult = { content: [{ type: 'text', text: 'same' }], structuredContent: { z: 1, a: 2 } };
-  const remoteResult = { structuredContent: { a: 2, z: 1 }, content: [{ text: 'same', type: 'text' }] };
-  const updateChain = {
-    eq: () => updateChain,
-    contains: () => updateChain,
-    select: () => updateChain,
-    abortSignal: async () => ({ data: [], error: null }),
-  };
-  const selectChain = {
-    eq: () => selectChain,
-    abortSignal: () => selectChain,
-    maybeSingle: async () => ({
-      data: { status: 'completed', result: remoteResult, error_message: null, metadata: { _desktop_commander_claim_token: claimToken } },
-      error: null,
-    }),
-  };
-  rt.client = { from: () => ({ update: () => updateChain, select: () => selectChain }) };
+await test('replay reconciles an identical terminal row without resending its payload', async () => {
+  const result = { content: [{ type: 'text', text: 'already stored' }] };
+  const { rc, client } = makeRemoteChannel({
+    row: {
+      id: 'replay-complete', status: 'completed', result, error_message: null,
+      device_id: DEVICE_ID, user_id: 'user-1', tool_name: 'start_process',
+    },
+  });
 
-  await rt.updateCallResult('identity-match', 'completed', expectedResult, null, claimToken);
+  const disposition = await rc.updateCallResult(
+    'replay-complete', 'completed', result, null, TARGET_IDENTITY, 'replay',
+  );
+
+  assert(disposition === 'already_committed', `unexpected replay disposition ${disposition}`);
+  assert(client.writes.length === 0, 'identical replay issued a second hosted result PATCH');
 });
 
-await test('terminal result classifies a confirmed missing remote row as gone', async () => {
-  const { rt } = makeResultTransport();
-  const claimToken = 'gone-result-claim';
-  const updateChain = {
-    eq: () => updateChain,
-    contains: () => updateChain,
-    select: () => updateChain,
-    abortSignal: async () => ({ data: [], error: null }),
-  };
-  const selectChain = {
-    eq: () => selectChain,
-    abortSignal: () => selectChain,
-    maybeSingle: async () => ({ data: null, error: null }),
-  };
-  rt.client = { from: () => ({ update: () => updateChain, select: () => selectChain }) };
+await test('a lost terminal PATCH acknowledgement reconciles before any retry payload', async () => {
+  const result = { content: [{ type: 'text', text: 'stored despite lost ack' }] };
+  const { rc, client } = makeRemoteChannel({
+    row: {
+      id: 'lost-result-ack', status: 'completed', result, error_message: null,
+      device_id: DEVICE_ID, user_id: 'user-1', tool_name: 'start_process',
+    },
+    writeErrors: [{ message: 'response lost' }],
+  });
+  rc.sleep = () => Promise.resolve();
 
-  let error;
-  try {
-    await rt.updateCallResult(
-      'gone-result', 'completed', { content: [{ type: 'text', text: 'ok' }] }, null, claimToken,
-    );
-  } catch (caught) {
-    error = caught;
-  }
+  const disposition = await rc.updateCallResult(
+    'lost-result-ack', 'completed', result, null, TARGET_IDENTITY, 'live',
+  );
 
-  assert(error?.code === 'EREMOTECALLGONE', `expected EREMOTECALLGONE, got ${error?.code || error?.message}`);
-});
-
-await test('result write stays bounded, claim-fenced, and replayable when DB I/O never settles', async () => {
-  const { rt } = makeResultTransport();
-  const client = makeNeverSettlingClient();
-  rt.client = client;
-
-  let error;
-  try {
-    await withAcceleratedRemoteDeadlines(() =>
-      rt.updateCallResult(
-        'never-result', 'completed', { content: [{ type: 'text', text: 'ok' }] },
-        null, 'test-claim-token',
-      )
-    );
-  } catch (caught) {
-    error = caught;
-  }
-
-  assert(error, 'an unconfirmed terminal write must reject rather than ring a false result doorbell');
-  assert(client.updates.length === 3, `expected 3 original-result attempts, got ${client.updates.length}`);
-  assert(client.updates.every((value) => value.status === 'completed'), 'persistence retries must never synthesize a failed outcome');
-  assert(client.signals.length >= 4, `expected bounded writes + reconciliation reads, got ${client.signals.length}`);
-  assert(client.signals.every((signal) => signal.aborted), 'every timed-out terminal/reconcile query must be aborted');
+  assert(disposition === 'committed', `lost ACK was not reconciled: ${disposition}`);
+  assert(client.writes.length === 1, `lost ACK resent the result payload ${client.writes.length} times`);
 });
 
 // --- 2b. Handler rejections are observed -------------------------------------
@@ -1242,7 +1190,7 @@ await test('a synchronously throwing handler is contained too', async () => {
 await test('the result row is written BEFORE the doorbell is rung', async () => {
   const order = [];
   const { device, executed } = makeDevice();
-  device.resultTransport.updateCallResult = async () => { order.push('write'); };
+  device.remoteChannel.updateCallResult = async () => { order.push('write'); };
   device.remoteChannel.signalResultAvailable = () => { order.push('doorbell'); };
   await device.handleNewToolCall(payloadFor('call-order'));
   assert(executed.length === 1, 'tool should have run');
@@ -1531,7 +1479,90 @@ await test('desktop integration forwards MCP server instructions with the tool c
   assert(capabilities.instructions?.includes('semantic MCP tools'), 'integration dropped MCP server instructions');
 });
 
-await test('device registration publishes the local MCP tool catalog and instructions', async () => {
+await test('remote row metadata cannot downgrade the trusted remote call marker', async () => {
+  const integration = new DesktopCommanderIntegration();
+  let forwarded;
+  integration.isReady = true;
+  integration.mcpTransport = {};
+  integration.mcpClient = {
+    callTool: async (request) => { forwarded = request; return { content: [] }; },
+  };
+
+  await integration.callClientTool('get_config', {}, {
+    remote: false,
+    conversation_id: 'trusted-boundary-test',
+  });
+
+  assert(forwarded?._meta?.remote === true, 'untrusted metadata downgraded a remote call to local');
+  assert(forwarded?._meta?.conversation_id === 'trusted-boundary-test', 'non-authority metadata was not preserved');
+});
+
+await test('transient tools/list failure preserves the last validated capability catalog', async () => {
+  const integration = new DesktopCommanderIntegration();
+  let fail = false;
+  integration.mcpClient = {
+    listTools: async () => {
+      if (fail) throw new Error('temporary tools/list failure');
+      return { tools: [{ name: 'stable-tool' }] };
+    },
+    getInstructions: () => 'stable instructions',
+  };
+
+  const initial = await integration.listClientTools();
+  fail = true;
+  const fallback = await integration.listClientTools();
+
+  assert(fallback === initial, 'transient discovery failure did not reuse the last validated catalog');
+  assert(fallback.tools[0]?.name === 'stable-tool', 'transient discovery failure erased the tool catalog');
+});
+
+await test('initial tools/list failure is surfaced instead of advertising an empty catalog', async () => {
+  const integration = new DesktopCommanderIntegration();
+  integration.mcpClient = {
+    listTools: async () => { throw new Error('initial discovery failed'); },
+    getInstructions: () => undefined,
+  };
+  let error;
+  try { await integration.listClientTools(); } catch (caught) { error = caught; }
+  assert(/initial discovery failed/.test(error?.message || ''), 'initial discovery failure was swallowed');
+});
+
+await test('overlapping tools/list refreshes are serialized so an older response cannot win last', async () => {
+  const integration = new DesktopCommanderIntegration();
+  let releaseFirst;
+  let calls = 0;
+  integration.mcpClient = {
+    listTools: async () => {
+      calls += 1;
+      if (calls === 1) await new Promise((resolve) => { releaseFirst = resolve; });
+      return { tools: [{ name: calls === 1 ? 'old-tool' : 'new-tool' }] };
+    },
+    getInstructions: () => undefined,
+  };
+
+  const first = integration.listClientTools();
+  const second = integration.listClientTools();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert(calls === 1, 'overlapping capability discovery was not serialized');
+  releaseFirst();
+  const [oldCatalog, newCatalog] = await Promise.all([first, second]);
+  assert(oldCatalog.tools[0]?.name === 'old-tool', 'first capability response changed unexpectedly');
+  assert(newCatalog.tools[0]?.name === 'new-tool', 'queued capability response did not observe the newer catalog');
+  integration.mcpClient = null;
+  const cached = await integration.listClientTools();
+  assert(cached.tools[0]?.name === 'new-tool', 'older discovery response replaced the latest cache');
+});
+
+await test('capability refresh rejects malformed envelopes before replacing the catalog', async () => {
+  const { rc } = makeRemoteChannel();
+  rc.deviceCapabilities = { tools: [{ name: 'stable-tool' }] };
+  let error;
+  try { await rc.refreshDeviceCapabilities({}); } catch (caught) { error = caught; }
+  assert(/invalid tools\/list envelope/.test(error?.message || ''), 'malformed capability refresh was accepted');
+  assert(rc.deviceCapabilities.tools[0]?.name === 'stable-tool', 'malformed refresh erased the previous catalog');
+});
+
+await test('device registration keeps the local MCP catalog out of hosted capabilities', async () => {
   const { rc } = makeRemoteChannel();
   const catalog = {
     tools: [
@@ -1552,44 +1583,27 @@ await test('device registration publishes the local MCP tool catalog and instruc
   await rc.registerDevice(catalog, DEVICE_ID, 'test-device', () => {});
 
   assert(registrationWrite, 'registration must update the device record');
-  assert(registrationWrite.capabilities.tools?.length === 2, 'registration dropped the MCP tool catalog');
-  assert(registrationWrite.capabilities.tools[0].name === 'mcp_list_tools', 'proxy list tool missing');
-  assert(registrationWrite.capabilities.tools[1].name === 'mcp_call_tool', 'proxy call tool missing');
-  assert(registrationWrite.capabilities.instructions?.includes('semantic MCP tools'), 'registration dropped MCP instructions');
+  assert(registrationWrite.capabilities.tools === undefined, 'registration leaked the child tool catalog into the hosted contract');
+  assert(registrationWrite.capabilities.instructions === undefined, 'registration leaked child instructions into the hosted contract');
   assert(registrationWrite.capabilities.app_version !== undefined, 'app_version must be composed');
-  assert(typeof registrationWrite.capabilities.device_session_v1?.generation === 'string', 'registration must acquire a device session generation');
-  assert(registrationWrite.capabilities.device_session_v1.generation.length >= 32, 'device session generation must be non-trivial');
+  assert(registrationWrite.capabilities.device_session_v1 === undefined, 'registration leaked a fork-private session field');
   assert(registrationWrite.capabilities.transport_broadcast_v1 === undefined, 'transport flag must wait for proven presence');
 });
 
-await test('stale device-process status writes are fenced by their acquired generation', async () => {
+await test('device status writes keep the upstream hosted shape', async () => {
   const old = makeRemoteChannel();
-  old.rc.deviceSessionLease = { generation: 'old-session-generation', acquired_at: '2026-08-17T00:00:00.000Z' };
-
-  const fresh = makeRemoteChannel();
-  let registrationWrite = null;
-  fresh.rc.findDevice = async () => ({ id: DEVICE_ID, device_name: 'old-name' });
-  fresh.rc.updateDevice = async (_id, payload) => { registrationWrite = payload; return { data: null, error: null }; };
-  fresh.rc.createLegacyChannel = () => {};
-  fresh.rc.createChannel = async () => {};
-  await fresh.rc.registerDevice({ tools: [] }, DEVICE_ID, 'fresh-device', () => {});
-  const freshGeneration = registrationWrite.capabilities.device_session_v1.generation;
-  assert(freshGeneration !== 'old-session-generation', 'new registration must acquire a new generation');
-
   await old.rc.setOnlineStatus(DEVICE_ID, 'offline');
-  assert(old.client.containsFilters.length === 1, 'stale writer must carry one generation fence');
-  assert(old.client.containsFilters[0].value.device_session_v1?.generation === 'old-session-generation', 'stale writer must not adopt the new generation');
-  assert(old.client.containsFilters[0].value.device_session_v1.generation !== freshGeneration, 'stale writer predicate unexpectedly matches the new session');
+  assert(old.client.containsFilters.length === 0, 'status write emitted a fork-private capability predicate');
 });
 
-await test('blocking offline shutdown is generation-fenced', async () => {
+await test('blocking offline shutdown keeps the upstream argument and update shape', async () => {
   const script = await fs.readFile(new URL('../src/remote-device/scripts/blocking-offline-update.js', import.meta.url), 'utf8');
-  assert(script.includes('sessionGeneration'), 'blocking shutdown script does not accept the session generation');
-  assert(script.includes(".contains('capabilities', { device_session_v1: { generation: sessionGeneration } })"), 'blocking shutdown write is not generation-fenced');
-  assert(script.includes('Offline write skipped: device session was superseded'), 'superseded shutdown is not classified explicitly');
+  assert(!script.includes('sessionGeneration'), 'blocking shutdown still accepts a fork-private session generation');
+  assert(!script.includes(".contains('capabilities'"), 'blocking shutdown still emits a fork-private capability predicate');
+  assert(script.includes(".update({ status: 'offline', last_seen: new Date().toISOString() })"), 'blocking shutdown lost the upstream status update');
 });
 
-await test('transport capability writes preserve the registered MCP tool catalog', async () => {
+await test('transport capability writes remain compatible with the compact hosted contract', async () => {
   const { rc, client } = makeRemoteChannel();
   rc.deviceCapabilities = {
     tools: [
@@ -1605,20 +1619,16 @@ await test('transport capability writes preserve the registered MCP tool catalog
   const capabilityWrites = client.writes.filter((w) => w.capabilities).map((w) => w.capabilities);
   assert(capabilityWrites.length === 2, `expected 2 capability writes, got ${capabilityWrites.length}`);
   for (const payload of capabilityWrites) {
-    assert(payload.tools?.length === 2, 'transport update erased the registered tool catalog');
-    assert(payload.tools[0].name === 'mcp_list_tools', 'first proxy tool must survive');
-    assert(payload.tools[1].name === 'mcp_call_tool', 'second proxy tool must survive');
-    assert(payload.instructions?.includes('semantic MCP tools'), 'transport update erased MCP instructions');
+    assert(payload.tools === undefined, 'transport update leaked the child tool catalog');
+    assert(payload.instructions === undefined, 'transport update leaked child instructions');
     assert(payload.app_version !== undefined, 'app_version must survive');
   }
   assert(capabilityWrites[0].transport_broadcast_v1 === true, 'enable write must advertise broadcast');
   assert(capabilityWrites[1].transport_broadcast_v1 === undefined, 'withdraw write must remove broadcast only');
-  assert(client.containsFilters.length === 2, 'every post-registration capability write must carry a generation fence');
-  assert(client.containsFilters.every((filter) => filter.column === 'capabilities'), 'generation fence must target capabilities JSONB');
-  assert(client.containsFilters.every((filter) => filter.value.device_session_v1?.generation === 'test-session-generation'), 'capability write used the wrong device generation');
+  assert(client.containsFilters.length === 0, 'transport capability write emitted fork-private predicates');
 });
 
-await test('capability catalog and transport flag writes are serialized', async () => {
+await test('local catalog refresh does not race or rewrite hosted transport capabilities', async () => {
   const { rc, client } = makeRemoteChannel({ writeLatencies: [20, 0] });
   rc.transportCapableWritten = false;
   const refresh = rc.refreshDeviceCapabilities({ tools: [{ name: 'new-tool' }] });
@@ -1626,10 +1636,11 @@ await test('capability catalog and transport flag writes are serialized', async 
   await Promise.all([refresh, enable]);
 
   const writes = client.completions.filter((entry) => entry.capabilities);
-  assert(writes.length === 2, `expected 2 capability completions, got ${writes.length}`);
+  assert(writes.length === 1, `expected only the transport capability write, got ${writes.length}`);
   const final = writes[writes.length - 1].capabilities;
   assert(final.transport_broadcast_v1 === true, 'late catalog refresh removed the proven transport flag');
-  assert(final.tools?.[0]?.name === 'new-tool', 'transport write lost the refreshed tool catalog');
+  assert(final.tools === undefined, 'local catalog refresh was published to the hosted contract');
+  assert(rc.deviceCapabilities.tools?.[0]?.name === 'new-tool', 'local catalog refresh was not retained in process');
 });
 
 await test('stale presence completion cannot mutate a newer channel generation', async () => {

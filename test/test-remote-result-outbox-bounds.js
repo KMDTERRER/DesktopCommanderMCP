@@ -7,8 +7,8 @@ import { RemoteResultOutbox } from '../dist/remote-device/result-outbox.js';
 
 function entry(callId, userId, payload = 'ok') {
   return {
-    version: 1, callId, userId, claimToken: `claim-${callId}`,
-    status: 'completed', result: { payload }, errorMessage: null,
+    version: 2, callId, deviceId: 'device-a', userId, toolName: 'read_file', claimToken: `claim-${callId}`,
+    status: 'completed', result: { content: [{ type: 'text', text: payload }] }, errorMessage: null,
     createdAt: new Date().toISOString(),
   };
 }
@@ -36,14 +36,47 @@ async function main() {
     );
     await fs.writeFile(path.join(root, 'corrupt.json'), '{not-json', 'utf8');
     await fs.writeFile(path.join(root, 'oversized-manual.json'), 'q'.repeat(1500), 'utf8');
+    await fs.writeFile(path.join(root, 'legacy-unbound.json'), JSON.stringify({
+      version: 1, callId: 'legacy', userId: 'user-a', claimToken: 'claim-legacy',
+      status: 'completed', result: { payload: 'must-not-replay' }, errorMessage: null,
+      createdAt: new Date().toISOString(),
+    }), 'utf8');
+    await fs.writeFile(path.join(root, 'invalid-result.json'), JSON.stringify({
+      version: 2, callId: 'invalid-result', deviceId: 'device-a', userId: 'user-a',
+      toolName: 'read_file', claimToken: 'claim-invalid-result', status: 'completed',
+      result: [], errorMessage: null, createdAt: new Date().toISOString(),
+    }), 'utf8');
+    await fs.writeFile(path.join(root, 'invalid-time.json'), JSON.stringify({
+      version: 2, callId: 'invalid-time', deviceId: 'device-a', userId: 'user-a',
+      toolName: 'read_file', claimToken: 'claim-invalid-time', status: 'completed',
+      result: { content: [] }, errorMessage: null, createdAt: 'not-a-time',
+    }), 'utf8');
+    await fs.writeFile(path.join(root, 'invalid-hash.json'), JSON.stringify({
+      version: 2, callId: 'invalid-hash', deviceId: 'device-a', userId: 'user-a',
+      toolName: 'read_file', claimToken: 'claim-invalid-hash', outcomeRevision: 1,
+      outcomeHash: '0'.repeat(64), status: 'completed', result: { content: [] },
+      errorMessage: null, createdAt: new Date().toISOString(),
+    }), 'utf8');
     await outbox.list('nobody');
     const names = await fs.readdir(root);
     assert(!names.includes('corrupt.json'), 'malformed entry remained in the active replay set');
     assert(!names.includes('oversized-manual.json'), 'oversized entry remained in the active replay set');
+    assert(!names.includes('legacy-unbound.json'), 'identity-unbound v1 entry remained in the active replay set');
+    assert(!names.includes('invalid-result.json'), 'invalid MCP result remained in the active replay set');
+    assert(!names.includes('invalid-time.json'), 'invalid replay timestamp remained in the active replay set');
+    assert(!names.includes('invalid-hash.json'), 'mismatched replay outcome hash remained active');
     assert(names.some((name) => name.startsWith('corrupt.json.invalid-')),
       'malformed entry was not preserved for forensic recovery');
     assert(names.some((name) => name.startsWith('oversized-manual.json.invalid-')),
       'oversized entry was not preserved for forensic recovery');
+    assert(names.some((name) => name.startsWith('legacy-unbound.json.invalid-')),
+      'identity-unbound v1 entry was not quarantined for forensic recovery');
+    assert(names.some((name) => name.startsWith('invalid-result.json.invalid-')),
+      'invalid MCP result was not quarantined for forensic recovery');
+    assert(names.some((name) => name.startsWith('invalid-time.json.invalid-')),
+      'invalid replay timestamp was not quarantined for forensic recovery');
+    assert(names.some((name) => name.startsWith('invalid-hash.json.invalid-')),
+      'mismatched replay outcome hash was not quarantined for forensic recovery');
 
     const timeoutRoot = path.join(root, 'io-timeout');
     const timeoutOutbox = new RemoteResultOutbox(timeoutRoot, {

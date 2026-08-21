@@ -162,6 +162,11 @@ async function testReadOptionsInterface() {
   assert.ok(content2.includes('Line 1'), 'Should include Line 1');
   assert.ok(content2.includes('Line 2'), 'Should include Line 2');
 
+  const result3 = await readFile(TEXT_FILE, { offset: 0, length: 2, includeStatusMessage: false });
+  const content3 = result3.content.toString();
+  assert.ok(content3.includes('Line 1') && content3.includes('Line 2'), 'Status-free read should preserve requested content');
+  assert.equal(/^\[Reading /.test(content3), false, 'includeStatusMessage=false was dropped before the text handler');
+
   console.log('✓ ReadOptions work correctly');
 }
 

@@ -63,7 +63,12 @@ async function main() {
     const blocked = integration.callClientTool('block', { ms: 60_000 });
     await sleep(100);
     process.kill(firstPid, 'SIGKILL');
-    await assert.rejects(blocked);
+    const blockedResult = await blocked;
+    assert.equal(blockedResult.isError, true, 'in-flight transport failure looked like successful tool text');
+    assert(/connection closed/i.test(textOf(blockedResult)),
+      `in-flight transport failure lost its native error text: ${textOf(blockedResult)}`);
+    assert(!/MCP error|-32000/i.test(textOf(blockedResult)),
+      `SDK protocol error marker escaped into the tool result: ${textOf(blockedResult)}`);
     assert(Date.now() - startedAt < 5_000, 'in-flight MCP call waited for its long request timeout after child death');
 
     await waitFor(() => statusWrites.includes('offline'), 3_000, 'offline status after child death');
@@ -74,6 +79,17 @@ async function main() {
     const secondPid = Number(textOf(secondPing).split(':')[1]);
     assert(Number.isInteger(secondPid) && secondPid > 0 && secondPid !== firstPid, 'supervision did not replace the dead MCP child');
     assert.deepEqual(statusWrites, ['online', 'offline', 'online'], `status oscillated during one recovery: ${statusWrites.join(',')}`);
+
+    process.kill(secondPid, 'SIGKILL');
+    await waitFor(() => statusWrites.length >= 4 && statusWrites.at(-1) === 'offline', 3_000, 'offline status after between-call child death');
+    await waitFor(() => integration.ready === true && statusWrites.length >= 5 && statusWrites.at(-1) === 'online', 5_000, 'second supervised restart');
+    assert.equal(capabilityRefreshes, 2, `expected two capability refreshes after two restarts, got ${capabilityRefreshes}`);
+
+    const thirdPing = await integration.callClientTool('ping', {});
+    const thirdPid = Number(textOf(thirdPing).split(':')[1]);
+    assert(Number.isInteger(thirdPid) && thirdPid > 0 && thirdPid !== secondPid, 'second supervision cycle did not replace the dead MCP child');
+    assert.deepEqual(statusWrites, ['online', 'offline', 'online', 'offline', 'online'],
+      `status oscillated across two recoveries: ${statusWrites.join(',')}`);
     console.log('remote supervision e2e: PASS');
   } finally {
     await integration.shutdown().catch(() => {});

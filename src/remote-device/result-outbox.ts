@@ -5,6 +5,8 @@ import { renameReplacingWithRetry } from '../utils/atomic-rename.js';
 import { readFileBounded } from '../utils/bounded-file-read.js';
 import { resourceLimitError } from '../utils/read-resource-limits.js';
 import { runWithAbortableTimeout } from '../utils/withTimeout.js';
+import { normalizeMcpToolResult } from '../utils/mcp-tool-error.js';
+import { createRemoteOutcomeIdentity } from './remote-result-contract.js';
 
 const MiB = 1024 * 1024;
 const DEFAULT_MAX_ENTRY_BYTES = 64 * MiB;
@@ -22,11 +24,12 @@ export interface RemoteResultOutboxOptions {
 export type RemoteResultStatus = 'completed' | 'failed';
 
 export interface RemoteResultOutboxEntry {
-    version: 1;
+    version: 2;
     callId: string;
+    deviceId: string;
     userId: string;
+    toolName: string;
     claimToken: string;
-    claimMetadata?: Record<string, unknown>;
     outcomeRevision?: 1;
     outcomeHash?: string;
     status: RemoteResultStatus;
@@ -65,11 +68,38 @@ export class RemoteResultOutbox {
 
     private validEntry(value: unknown, expectedCallId?: string): value is RemoteResultOutboxEntry {
         const entry = value as Partial<RemoteResultOutboxEntry> | null;
-        return Boolean(entry && entry.version === 1 && entry.callId && entry.userId && entry.claimToken
-            && (entry.claimMetadata === undefined || (typeof entry.claimMetadata === 'object' && entry.claimMetadata !== null && !Array.isArray(entry.claimMetadata)))
+        const structurallyValid = Boolean(entry && entry.version === 2
+            && typeof entry.callId === 'string' && entry.callId
+            && typeof entry.deviceId === 'string' && entry.deviceId
+            && typeof entry.userId === 'string' && entry.userId
+            && typeof entry.toolName === 'string' && entry.toolName
+            && typeof entry.claimToken === 'string' && entry.claimToken
             && (entry.outcomeRevision === undefined || entry.outcomeRevision === 1)
             && (entry.outcomeHash === undefined || /^[0-9a-f]{64}$/.test(entry.outcomeHash))
+            && (entry.status === 'completed' || entry.status === 'failed')
+            && (entry.errorMessage === null || typeof entry.errorMessage === 'string')
+            && typeof entry.createdAt === 'string'
+            && Number.isFinite(Date.parse(entry.createdAt))
             && (!expectedCallId || entry.callId === expectedCallId));
+        if (!structurallyValid) return false;
+        let normalizedResult: unknown | null = null;
+        try {
+            if (!(entry!.status === 'failed' && entry!.result === null)) {
+                normalizedResult = normalizeMcpToolResult(entry!.result, `Outbox result for ${entry!.toolName}`);
+            }
+        } catch {
+            return false;
+        }
+        try {
+            const identity = createRemoteOutcomeIdentity(
+                entry!.status!, normalizedResult, entry!.errorMessage!,
+            );
+            if (entry!.outcomeRevision !== undefined && entry!.outcomeRevision !== identity.outcomeRevision) return false;
+            if (entry!.outcomeHash !== undefined && entry!.outcomeHash !== identity.outcomeHash) return false;
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     private async quarantine(filePath: string): Promise<void> {
@@ -99,6 +129,10 @@ export class RemoteResultOutbox {
     }
 
     async put(entry: RemoteResultOutboxEntry): Promise<void> {
+        const toolName = entry.toolName;
+        if (!this.validEntry(entry, entry.callId)) {
+            throw new Error(`Refusing to persist an invalid remote result for ${toolName}.`);
+        }
         await this.runIo(`Create remote result outbox directory ${this.directory}`, async (_signal) => {
             await fs.mkdir(this.directory, { recursive: true, mode: 0o700 });
         });

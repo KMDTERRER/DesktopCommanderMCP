@@ -7,6 +7,8 @@ import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotoc
 import { fileURLToPath } from 'url';
 import { captureRemote } from '../utils/capture.js';
 import { normalizeMcpArgumentsObject } from '../utils/mcp-arguments.js';
+import { describeMcpJsonRpcFrame, traceMcpStdio } from '../utils/mcp-stdio-trace.js';
+import { createMcpToolErrorResult, normalizeMcpToolResult } from '../utils/mcp-tool-error.js';
 import {
     PROCESS_CLIENT_RESPONSE_RESERVE_MS, PROCESS_CLIENT_TIMEOUT_MAX_MS,
     PROCESS_TRANSPORT_RESERVE_MS, processToolWaitMs,
@@ -15,13 +17,18 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const LOCAL_MCP_CONNECT_TIMEOUT_MS = 15_000;
+// Server startup owns bounded configuration I/O before server.connect(). Two
+// consecutive 10s startup I/O phases are valid under that contract, so the
+// parent handshake deadline must leave headroom instead of killing a healthy
+// child at the old 15s boundary.
+export const LOCAL_MCP_CONNECT_TIMEOUT_MS = 30_000;
 const COMMAND_DISCOVERY_TIMEOUT_MS = 3_000;
 const LOCAL_MCP_CLOSE_TIMEOUT_MS = 3_500;
 const LOCAL_MCP_TRANSPORT_FALLBACK_TIMEOUT_MS = 500;
 const LOCAL_MCP_FORCE_KILL_WAIT_MS = 500;
 
 type LocalProcessRequest = { tool: string; args: Record<string, unknown>; transportTimeoutMs?: number };
+type LocalMcpCapabilities = { tools: any[]; instructions?: string };
 
 function parseCompatProcessRequest(toolName: string, args: Record<string, unknown>): LocalProcessRequest | null {
     if (toolName !== 'read_file' && toolName !== 'write_file') return null;
@@ -121,10 +128,19 @@ interface McpConfig {
 const LOCAL_MCP_INHERITED_ENV_VARS = [
     'DESKTOP_COMMANDER_MCP_CONFIG',
     'DESKTOP_COMMANDER_MCP_READ_ONLY_POLICY',
+    'DESKTOP_COMMANDER_SERENA_PROJECT',
+    'DESKTOP_COMMANDER_SERENA_HOME',
+    'DESKTOP_COMMANDER_SERENA_PROJECT_DATA_ROOT',
+    'DESKTOP_COMMANDER_SERENA_UV_CACHE_DIR',
+    'DESKTOP_COMMANDER_SERENA_UV_PROJECT_ENVIRONMENT',
+    'DESKTOP_COMMANDER_SERENA_PYTHONPYCACHEPREFIX',
+    'DESKTOP_COMMANDER_SERENA_UV_COMMAND',
+    'DESKTOP_COMMANDER_SERENA_CPP_PROFILE_JSON',
     'RUFF_BIN',
     'RUFF_BIN_ARGS',
     'AST_GREP_BIN',
     'DESKTOP_COMMANDER_DISABLE_TELEMETRY',
+    'DC_MCP_STDIO_TRACE',
 ] as const;
 
 export function buildLocalMcpChildEnvironment(configEnv?: Record<string, string>): Record<string, string> {
@@ -156,6 +172,8 @@ export class DesktopCommanderIntegration {
     private reinitPromise: Promise<void> | null = null;
     private transportGeneration = 0;
     private toolsChangedHandler: (() => void | Promise<void>) | null = null;
+    private lastKnownCapabilities: LocalMcpCapabilities | null = null;
+    private capabilityDiscoveryTail: Promise<void> = Promise.resolve();
 
     get ready(): boolean { return this.isReady && this.mcpClient !== null && this.mcpTransport !== null; }
 
@@ -193,7 +211,12 @@ export class DesktopCommanderIntegration {
         }
 
         console.log(` - ⏳ Connecting to Local Desktop Commander MCP using: ${config.command} ${config.args.join(' ')}`);
-        console.debug('[DEBUG] MCP config:', JSON.stringify(config, null, 2));
+        console.debug('[DEBUG] MCP config:', JSON.stringify({
+            command: config.command,
+            args: config.args,
+            ...(config.cwd ? { cwd: config.cwd } : {}),
+            envKeys: Object.keys(config.env ?? {}).sort(),
+        }, null, 2));
 
         try {
             console.debug('[DEBUG] Creating StdioClientTransport');
@@ -201,12 +224,27 @@ export class DesktopCommanderIntegration {
             // environment. Forward only the small set of Desktop Commander
             // runtime controls that the local child actually consumes; never
             // leak the foreground process environment wholesale.
+            const childEnv = buildLocalMcpChildEnvironment(config.env);
+            const traceLocalFrames = ['1', 'true', 'yes', 'on'].includes(
+                (childEnv.DC_MCP_STDIO_TRACE ?? '').trim().toLowerCase(),
+            );
             const transport = new StdioClientTransport({
                 ...config,
-                env: buildLocalMcpChildEnvironment(config.env)
+                env: childEnv,
+                // Never let nested server diagnostics inherit an arbitrary VS
+                // Code/host terminal. The pipe is deliberately drained below;
+                // frame summaries remain available through explicit tracing.
+                stderr: 'pipe',
             });
+            transport.stderr?.on('data', () => undefined);
             const generation = ++this.transportGeneration;
             this.mcpTransport = transport;
+            transport.onmessage = (message) => {
+                const frame = describeMcpJsonRpcFrame(message);
+                if (frame?.kind === 'response') {
+                    traceMcpStdio('CLIENT_RECV', { generation, ...frame }, traceLocalFrames);
+                }
+            };
             // Install before connect(): the MCP SDK chains handlers already present
             // when it attaches its own close/error handling for in-flight calls.
             transport.onclose = () => this.handleLocalDisconnect('stdio transport closed', generation, transport);
@@ -339,54 +377,77 @@ export class DesktopCommanderIntegration {
     }
 
     async callClientTool(toolName: string, args: any, metadata?: any) {
-        await this.ensureReady();
-        const client = this.mcpClient;
-        if (!client) throw new Error('Local Desktop Commander MCP connection was lost while dispatching');
-
-        // Proxy other tools to MCP server
         try {
+            await this.ensureReady();
+            const client = this.mcpClient;
+            if (!client) throw new Error('Local Desktop Commander MCP connection was lost while dispatching');
+
+            // Proxy other tools to MCP server.
             const toolArguments = normalizeMcpArgumentsObject(args, `Remote MCP arguments for ${toolName}`);
             console.debug('[DEBUG] Calling MCP tool:', toolName, 'args:', JSON.stringify(toolArguments).substring(0, 100));
             const requestTimeoutMs = localMcpRequestTimeoutMs(toolName, toolArguments);
             const result = await client.callTool({
                 name: toolName,
                 arguments: toolArguments,
-                _meta: { remote: true, ...metadata || {} }
+                // `remote` is transport-owned authority metadata. Untrusted row
+                // metadata must never downgrade the call to local and bypass
+                // process/session ownership checks in the child MCP server.
+                _meta: { ...metadata || {}, remote: true }
             } as any, undefined, requestTimeoutMs === undefined ? undefined : {
                 timeout: requestTimeoutMs,
                 maxTotalTimeout: requestTimeoutMs,
                 resetTimeoutOnProgress: false,
             });
+            const normalizedResult = normalizeMcpToolResult(result, `Local MCP result for ${toolName}`);
             console.debug('[DEBUG] Tool call successful:', toolName);
-            return result;
+            return normalizedResult;
         } catch (error) {
             console.error(`Error executing tool ${toolName}:`, error);
             console.debug('[DEBUG] Tool call error details:', error);
-            await captureRemote('desktop_integration_tool_call_failed', { error, toolName });
-            throw error;
+            // Telemetry is best-effort and must never replace the tool's native
+            // error envelope with a rejected promise / MCP server error.
+            void captureRemote('desktop_integration_tool_call_failed', { error, toolName }).catch(() => {});
+            return createMcpToolErrorResult(error, toolName);
         }
     }
 
-    async listClientTools() {
-        if (!this.mcpClient) return { tools: [] };
+    async listClientTools(): Promise<LocalMcpCapabilities> {
+        const operation = this.capabilityDiscoveryTail.then(
+            () => this.fetchClientTools(),
+            () => this.fetchClientTools(),
+        );
+        this.capabilityDiscoveryTail = operation.then(() => undefined, () => undefined);
+        return operation;
+    }
+
+    private async fetchClientTools(): Promise<LocalMcpCapabilities> {
+        if (!this.mcpClient) {
+            if (this.lastKnownCapabilities) return this.lastKnownCapabilities;
+            throw new Error('Local Desktop Commander MCP is not connected; no validated tool catalog is available');
+        }
 
         try {
             // List tools from MCP server
             const mcpTools = await this.mcpClient.listTools();
+            if (!Array.isArray(mcpTools.tools)) {
+                throw new Error('Local Desktop Commander MCP returned an invalid tools/list envelope');
+            }
 
             // Merge tools
             const instructions = this.mcpClient.getInstructions();
-            return {
-                tools: mcpTools.tools || [],
+            const capabilities: LocalMcpCapabilities = {
+                tools: mcpTools.tools,
                 ...(instructions ? { instructions } : {})
             };
+            this.lastKnownCapabilities = capabilities;
+            return capabilities;
         } catch (error) {
             console.error('Error fetching capabilities:', error);
             await captureRemote('desktop_integration_list_tools_failed', { error });
-            // Fallback to local tools
-            return {
-                tools: []
-            };
+            // A transient tools/list failure must not erase the device's catalog
+            // and make a healthy integration disappear from the remote client.
+            if (this.lastKnownCapabilities) return this.lastKnownCapabilities;
+            throw error;
         }
     }
 

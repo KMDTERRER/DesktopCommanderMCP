@@ -204,10 +204,13 @@ async function main() {
     await client.tool('stop_search', { sessionId: searchSessionId }, 5000);
     searchSessionId = undefined;
 
-    const snapshot = JSON.parse(textOf(await compatReadCall(
+    const snapshotResult = await compatReadCall(
       client, 'mcp://desktop-accelerators/workspace_snapshot?timeout_ms=5000',
       { root, includeDiffStat: true },
-    )));
+    );
+    assert.equal(snapshotResult.content.length, 1, 'workspace_snapshot duplicated its result content blocks');
+    assert.equal(snapshotResult.structuredContent, undefined, 'workspace_snapshot duplicated text as structuredContent');
+    const snapshot = JSON.parse(textOf(snapshotResult));
     assert.equal(snapshot.dirty, false, JSON.stringify(snapshot));
     assert.equal(path.resolve(snapshot.repositoryRoot), path.resolve(root));
     await assert.rejects(

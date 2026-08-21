@@ -184,14 +184,7 @@ process.stdin.on('end', () => process.exit(0));
     },
     'fake-serena': {
       command: process.execPath,
-      args: [fakeServer, 'start-mcp-server', '--project', REPO_ROOT],
-      env: { DC_CONTEXT_ROLE: 'semantic' },
-      protocolVersion: 'legacy', lifecycle: 'keep-alive',
-      allowedTools: ['find_symbol', 'find_referencing_symbols', 'find_implementations'],
-    },
-    'serena-fake': {
-      command: process.execPath,
-      args: [fakeServer, 'start-mcp-server', '--project', REPO_ROOT],
+      args: [fakeServer, '--repo', REPO_ROOT],
       env: { DC_CONTEXT_ROLE: 'semantic' },
       protocolVersion: 'legacy', lifecycle: 'keep-alive',
       allowedTools: ['find_symbol', 'find_referencing_symbols', 'find_implementations'],
@@ -235,10 +228,11 @@ try {
     schema.tool.inputSchema.properties.symbolQueries.items.properties.include_info.description,
     /bulk or multi-symbol context/,
   );
-  assert.match(schema.routing_guidance, /keep include_info=false/);
-  assert.match(schema.routing_guidance, /serena_read_batch/);
-  assert.match(schema.routing_guidance, /semanticSession/);
-  assert.match(schema.routing_guidance, /start_search -> get_more_search_results -> read_file/);
+  assert.equal(schema.routing_guidance, undefined, 'tool schema repeated root discovery guidance');
+  assert.match(servers.routing_guidance, /keep include_info=false/);
+  assert.match(servers.routing_guidance, /serena_read_batch/);
+  assert.match(servers.routing_guidance, /semanticSession/);
+  assert.match(servers.routing_guidance, /start_search -> get_more_search_results -> read_file/);
   assert.match(schema.tool.inputSchema.properties.semanticSession.description, /workspaceSession/);
   assert.match(schema.tool.inputSchema.properties.graphServer.description, /workspace_delta contract/);
   const batchSchema = JSON.parse((await readExternalMcpCompatUri('mcp://desktop-context/serena_read_batch?timeout_ms=5000')).content[0].text);
@@ -387,34 +381,6 @@ try {
   assert.equal(sessionCalls.filter((call) => call.tool === 'find_symbol').length, 1);
   assert.equal(sessionCalls.filter((call) => call.tool === 'find_referencing_symbols').length, 1);
   assert(sessionContext.contextPack.seedFilesAccepted.includes('src/server.ts'));
-
-  const boundSession = JSON.parse((await callExternalMcpTool({
-    server: 'desktop-context', tool: 'serena_workspace', timeout_ms: 5000,
-    arguments: { operation: 'bind', root: REPO_ROOT, templateServer: 'serena-fake', warm: true },
-  })).content[0].text);
-  assert.equal(typeof boundSession.workspaceSession, 'string');
-  const sessionIntegrated = JSON.parse((await readExternalMcpCompatUri(
-    'mcp://desktop-context/code_context?timeout_ms=15000',
-    {
-      root: REPO_ROOT, query: 'session Serena integrated fanout',
-      semanticSession: boundSession.workspaceSession,
-      symbolQueries: [{
-        name_path_pattern: 'callExternalMcpTool', relative_path: 'src/tools/external-mcp.ts', max_matches: 2,
-      }],
-      maxFiles: 4, maxTotalChars: 20000,
-    },
-  )).content[0].text);
-  assert.equal(sessionIntegrated.semantic.provider, 'session');
-  assert.equal(sessionIntegrated.semantic.workspaceSession, boundSession.workspaceSession);
-  assert.deepEqual(sessionIntegrated.semantic.expansion.files, [
-    'src/tools/external-mcp.ts', 'src/tools/code-context-orchestrator.ts', 'src/server.ts',
-  ]);
-  assert(sessionIntegrated.contextPack.seedFilesAccepted.includes('src/server.ts'));
-  assert.equal(sessionIntegrated.orchestration.semanticExpansionCalls, 1);
-  await callExternalMcpTool({
-    server: 'desktop-context', tool: 'serena_workspace', timeout_ms: 5000,
-    arguments: { operation: 'release', session: boundSession.workspaceSession },
-  });
 
   const result = JSON.parse((await readExternalMcpCompatUri(
     'mcp://desktop-context/code_context?timeout_ms=15000',

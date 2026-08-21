@@ -90,6 +90,7 @@ import {
 } from './utils/client-context.js';
 import { classifyRequestAbortReason, setCancellationState, type CancellationState } from './utils/cancellation.js';
 import { normalizeMcpArgumentsObject } from './utils/mcp-arguments.js';
+import { traceMcpStdio } from './utils/mcp-stdio-trace.js';
 
 // Store startup messages to send after initialization
 const deferredMessages: Array<{ level: string, message: string }> = [];
@@ -617,6 +618,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
                         Entries expire after 20 minutes and are purged only by the autonomous TrashManager.
                         There is no public purge/delete action. put/restore never fall back to copy+delete across filesystems.
+                        Independent calls may be issued concurrently; conflicting filesystem mutations are coordinated and fail closed.
                         workspace is optional; when supplied it must be the absolute exact Git working-tree root and cannot widen access.
                         Generic filesystem/search tools cannot access the manager-owned trash storage.
 
@@ -888,6 +890,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         - Set execution_kind=interactive with pty=auto for shells, REPLs, SSH, and terminal-native programs.
                           Desktop Commander uses the optional node-pty/ConPTY backend when available and falls back to the pipe backend when pty=auto.
                         - start_process and read_process_output return structuredContent with backend/state/exit information; prefer it over parsing status prose.
+                        - Preserve terminalSessionId from start_process. Remote follow-up calls may need it as terminal_session_id, and a PID alone never authorizes access across conversations.
                         
                         PRIMARY TOOL FOR FILE ANALYSIS AND DATA PROCESSING
                         This is the ONLY correct tool for analyzing local files (CSV, JSON, logs, etc.).
@@ -989,6 +992,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         SMART FEATURES:
                         - For offset=0, waits up to timeout_ms for new output to arrive
                         - When multiple chats/consumers share one PID, give each a stable unique reader_id for independent new-output cursors
+                        - For a remote session created outside the current conversation, terminal_session_id from start_process is required; PID alone is not an ownership credential
                         - stall_timeout_ms (default 15000) reports a still-running process that has produced no stdout/stderr for that interval; 0 disables the warning
                         - Detects REPL prompts and process completion
                         - Shows process state (waiting for input, finished, etc.)
@@ -1010,6 +1014,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 name: "interact_with_process",
                 description: `
                         Send input to a running process and automatically receive the response.
+                        Remote safety: pass terminal_session_id returned by start_process when continuing a session outside its originating conversation. A PID alone cannot select another conversation's terminal.
                         
                         CRITICAL: THIS IS THE PRIMARY TOOL FOR ALL LOCAL FILE ANALYSIS
                         For ANY local file analysis (CSV, JSON, data processing), ALWAYS use this instead of the analysis tool.
@@ -1095,6 +1100,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 name: "list_sessions",
                 description: `
                         List all active terminal sessions.
+                        Remote callers see only sessions owned by their conversation; unscoped remote callers must retain terminal_session_id from start_process instead.
                         
                         Shows session status including:
                         - PID: Process identifier  
@@ -1289,6 +1295,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 import * as handlers from './handlers/index.js';
 import { ServerResult } from './types.js';
+import { createMcpToolErrorResult, normalizeMcpToolResult } from './utils/mcp-tool-error.js';
 
 server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest, extra): Promise<ServerResult> => {
     const args = request.params.arguments;
@@ -1331,7 +1338,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest,
     // actions, so they must produce zero telemetry. Both contexts are async-local
     // so overlapping requests cannot overwrite each other's attribution.
     const isUiOriginCall = !!(args && typeof args === 'object' && (args as any).origin === 'ui');
-    return isUiOriginCall ? runInUiOriginCallContext(runCall) : runCall();
+    traceMcpStdio('HANDLER_START', { id: extra?.requestId, tool: request.params.name, remote: isRemote });
+    try {
+        const response = normalizeMcpToolResult(
+            await (isUiOriginCall ? runInUiOriginCallContext(runCall) : runCall()),
+            `Tool '${request.params.name}' result`,
+        );
+        traceMcpStdio('HANDLER_DONE', {
+            id: extra?.requestId, tool: request.params.name, isError: response?.isError === true,
+        });
+        return response;
+    } catch (error) {
+        traceMcpStdio('HANDLER_THROW', {
+            id: extra?.requestId, tool: request.params.name,
+            error: error instanceof Error ? error.message : String(error),
+        });
+        // CallToolRequestSchema has already established that this is a tool
+        // invocation. Never let dispatcher/adapter/telemetry exceptions escape
+        // as a JSON-RPC "MCP server error"; registered tools report failures in
+        // the same CallToolResult shape as the original wrappers.
+        return createMcpToolErrorResult(error, request.params.name);
+    }
 });
 
 async function handleCallToolRequest(request: CallToolRequest): Promise<ServerResult> {
@@ -1470,7 +1497,7 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
                 } catch (error) {
                     const message = error instanceof Error ? error.message : String(error);
                     capture('server_request_error', { message: `Error in mcp_list_tools handler: ${message}` });
-                    result = { content: [{ type: "text", text: message }], isError: true };
+                    result = createMcpToolErrorResult(error, name);
                 }
                 break;
 
@@ -1480,7 +1507,7 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
                 } catch (error) {
                     const message = error instanceof Error ? error.message : String(error);
                     capture('server_request_error', { message: `Error in mcp_call_tool handler: ${message}` });
-                    result = { content: [{ type: "text", text: message }], isError: true };
+                    result = createMcpToolErrorResult(error, name);
                 }
                 break;
 
@@ -1784,10 +1811,7 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
         capture('server_request_error', {
             error: errorMessage
         });
-        return {
-            content: [{ type: "text", text: `Error: ${errorMessage}` }],
-            isError: true,
-        };
+        return createMcpToolErrorResult(error, requestedName);
     } finally {
         // Single tool-call telemetry event, fired AFTER execution so it can carry
         // timing. In a finally so it still fires on the hard-crash path (the catch

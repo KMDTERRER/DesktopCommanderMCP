@@ -40,13 +40,7 @@ function configuredRootValue(args: unknown, env: unknown, cwd: string): string |
 }
 
 function configuredWorkspaceRootValue(args: unknown, env: unknown, cwd: string): string | undefined {
-  const repositoryRoot = configuredRootValue(args, env, cwd);
-  if (repositoryRoot) return repositoryRoot;
-  if (!Array.isArray(args)) return undefined;
-  const serverStart = args.lastIndexOf('start-mcp-server');
-  if (serverStart < 0) return undefined;
-  const rawProject = optionValue(args.slice(serverStart + 1), '--project');
-  return rawProject ? resolveConfiguredRoot(rawProject, cwd) : undefined;
+  return configuredRootValue(args, env, cwd);
 }
 
 function remainingTimeout(deadlineAt: number): number {

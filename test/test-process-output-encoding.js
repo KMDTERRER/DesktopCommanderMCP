@@ -34,6 +34,7 @@ if (process.platform === 'win32') {
   for (const [executable, args] of cases) {
     const { started, waited } = await runFinite(executable, args);
     assert(started.content?.[0]?.text?.includes('Привет'), `${executable}: ${started.content?.[0]?.text}`);
+    assert(started.structuredContent?.initialOutput?.includes('Привет'), JSON.stringify(started.structuredContent));
     assert.equal(started.structuredContent?.outputDecoding?.mode, 'windows-adaptive', JSON.stringify(started));
     assert(waited.tail.includes('Привет'), `${executable}: ${waited.tail}`);
     assert.equal(waited.outputDecoding?.mode, 'windows-adaptive', JSON.stringify(waited));
@@ -65,9 +66,25 @@ const splitRead = await readProcessOutput({
   pid: splitPid, timeout_ms: 1000, stall_timeout_ms: 0, offset: 0, length: 20,
 });
 assert(splitRead.content?.[0]?.text?.includes('Привет'), JSON.stringify(splitRead));
+assert(splitRead.structuredContent?.output?.includes('Привет'), JSON.stringify(splitRead.structuredContent));
 assert(splitRead.structuredContent?.outputDecoding, JSON.stringify(splitRead));
 await callBuiltinAcceleratorTool('wait_process', {
   pid: splitPid, timeout_ms: 5000, stall_timeout_ms: 0, tail_lines: 20,
 }, 6000);
+
+const largeScript = [
+  `setTimeout(() => {`,
+  `  process.stdout.write('x'.repeat(80 * 1024) + 'STRUCTURED_OUTPUT_END' + String.fromCharCode(10));`,
+  `  process.exit(0);`,
+  `}, 30);`,
+].join('\n');
+const largeStart = await startProcess({ executable: process.execPath, args: ['-e', largeScript], execution_kind: 'finite', pty: 'never', timeout_ms: 5 });
+const largePid = largeStart.structuredContent?.pid;
+assert(Number.isInteger(largePid) && largePid > 0, JSON.stringify(largeStart));
+await new Promise((resolve) => setTimeout(resolve, 100));
+const largeRead = await readProcessOutput({ pid: largePid, timeout_ms: 1000, stall_timeout_ms: 0, offset: -5, length: 5 });
+assert.equal(largeRead.structuredContent?.outputTruncated, true, JSON.stringify(largeRead.structuredContent));
+assert(largeRead.structuredContent.output.length <= 64 * 1024, `structured output too large: ${largeRead.structuredContent.output.length}`);
+assert(largeRead.structuredContent.output.includes('STRUCTURED_OUTPUT_END'), 'structured output tail lost terminal end marker');
 
 console.log('process output encoding: PASS');

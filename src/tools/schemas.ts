@@ -58,6 +58,7 @@ export const StartProcessArgsSchema = z.object({
 
 export const ReadProcessOutputArgsSchema = z.object({
   pid: z.number(),
+  terminal_session_id: z.string().uuid().optional(),
   timeout_ms: z.number().int().min(0).max(PROCESS_WAIT_MAX_MS).optional().default(PROCESS_WAIT_DEFAULT_MS),
   stall_timeout_ms: z.number().int().min(0).max(PROCESS_WAIT_MAX_MS).optional().default(PROCESS_STALL_DEFAULT_MS),
   offset: z.number().optional(),   // Line offset: 0=from last read, positive=absolute, negative=tail
@@ -68,6 +69,7 @@ export const ReadProcessOutputArgsSchema = z.object({
 
 export const ForceTerminateArgsSchema = z.object({
   pid: z.number(),
+  terminal_session_id: z.string().uuid().optional(),
 });
 
 export const ListSessionsArgsSchema = z.object({});
@@ -212,6 +214,7 @@ export const EditBlockArgsSchema = z.object({
 // Send input to process schema
 export const InteractWithProcessArgsSchema = z.object({
   pid: z.number(),
+  terminal_session_id: z.string().uuid().optional(),
   input: z.string(),
   timeout_ms: z.number().int().min(0).max(PROCESS_WAIT_MAX_MS).optional().default(PROCESS_INTERACTION_DEFAULT_MS),
   wait_for_prompt: z.boolean().optional(),

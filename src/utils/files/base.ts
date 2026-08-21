@@ -72,6 +72,8 @@ export interface FileHandler {
 export interface WriteOptions {
     /** Abort staged I/O or suppress a late commit after the request deadline. */
     signal?: AbortSignal;
+    /** Preserve an existing text file's byte encoding across staged writes. */
+    textEncoding?: 'utf8' | 'utf16le' | 'utf16be';
 }
 
 /**

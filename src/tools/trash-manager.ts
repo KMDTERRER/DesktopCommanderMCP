@@ -3,7 +3,9 @@ import fs from 'fs/promises';
 import path from 'path';
 import { isBinaryFile } from 'isbinaryfile';
 import { configManager } from '../config-manager.js';
+import { CONFIG_FILE } from '../config.js';
 import { getToolCallSessionIdentity } from '../utils/client-context.js';
+import { renameReplacingWithRetry } from '../utils/atomic-rename.js';
 import { readFileBounded } from '../utils/bounded-file-read.js';
 import { runBoundedSubprocess } from '../utils/bounded-subprocess.js';
 import { acquireMutationResourceLocks } from '../utils/mutation-resource-lock.js';
@@ -12,6 +14,7 @@ import { runWithAbortableTimeout } from '../utils/withTimeout.js';
 import {
   MANAGED_TRASH_DIRECTORY_NAME, MANAGED_TRASH_ENTRIES_DIRECTORY_NAME,
   MANAGED_TRASH_ENTRY_NAME, MANAGED_TRASH_RETENTION_MS, MANAGED_TRASH_SWEEP_INTERVAL_MS,
+  MANAGED_TRASH_WORKSPACE_REGISTRY_FILE_NAME, MANAGED_TRASH_WORKSPACE_REGISTRY_TEMP_PREFIX,
   isManagedTrashRelativePath, pathContainsManagedTrashSegment,
 } from '../utils/trash-contract.js';
 import { validatePathAuthority } from './path-security.js';
@@ -28,7 +31,11 @@ const TRASH_PURGE_MAX_DEPTH = 128;
 const TRASH_MAX_WORKSPACES = 128;
 const TRASH_MAX_SESSION_BINDINGS = 256;
 const TRASH_WORKSPACE_REGISTRY_KEY = 'trashWorkspaceRootsV1';
+const TRASH_WORKSPACE_REGISTRY_FILE = path.join(path.dirname(CONFIG_FILE), MANAGED_TRASH_WORKSPACE_REGISTRY_FILE_NAME);
+const TRASH_WORKSPACE_REGISTRY_GATE = `${TRASH_WORKSPACE_REGISTRY_FILE}.gate`;
+const TRASH_WORKSPACE_REGISTRY_MAX_BYTES = 1024 * 1024;
 const TRASH_GITIGNORE_CONTENT = '*\n';
+const TRASH_PENDING_ENTRY_PREFIX = '.pending-';
 
 type TrashKind = 'file' | 'directory' | 'symlink' | 'other';
 type TrashManifest = {
@@ -73,7 +80,7 @@ function requireCommitReserve(deadlineAt: number, label: string): void {
 }
 
 function slash(value: string): string {
-  return value.replace(/\\/g, '/');
+  return path.sep === '\\' ? value.replace(/\\/g, '/') : value;
 }
 
 function pathIdentity(value: string): string {
@@ -149,16 +156,45 @@ async function realpathBounded(filePath: string, deadlineAt: number, label: stri
   );
 }
 
-async function readJsonBounded(filePath: string, deadlineAt: number): Promise<unknown> {
-  const bytes = await runWithAbortableTimeout(
-    (signal) => readFileBounded(filePath, TRASH_MANIFEST_MAX_BYTES, signal, 'trash metadata'),
-    remaining(deadlineAt, `Read trash metadata ${filePath}`),
-    `Read trash metadata ${filePath}`,
+async function readOwnedJsonBounded(
+  filePath: string, fenceRoot: string, deadlineAt: number, label: string,
+  maxBytes = TRASH_MANIFEST_MAX_BYTES,
+): Promise<unknown> {
+  const before = await lstatBounded(filePath, deadlineAt, `Stat ${label}`);
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
+    throw new Error(`${label} must be a private real file with exactly one link.`);
+  }
+  const real = await realpathBounded(filePath, deadlineAt, `Resolve ${label}`);
+  if (!samePath(filePath, real) || !isInside(fenceRoot, real)) {
+    throw new Error(`${label} escaped its manager-owned storage fence.`);
+  }
+  const handle = await runWithAbortableTimeout(
+    (_signal) => fs.open(filePath, 'r'), remaining(deadlineAt, `Open ${label}`), `Open ${label}`,
   );
   try {
-    return JSON.parse(bytes.toString('utf8'));
-  } catch {
-    throw new Error(`Managed trash metadata is invalid JSON: ${filePath}`);
+    const opened = await runWithAbortableTimeout(
+      (_signal) => handle.stat(), remaining(deadlineAt, `Stat opened ${label}`), `Stat opened ${label}`,
+    );
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino
+        || opened.mode !== before.mode || kindOf(opened) !== kindOf(before)) {
+      throw new Error(`${label} changed identity while it was being opened.`);
+    }
+    if (opened.size > maxBytes) {
+      throw new Error(`${label} exceeds the ${maxBytes}-byte metadata limit.`);
+    }
+    const bytes = await runWithAbortableTimeout(
+      (_signal) => handle.readFile(), remaining(deadlineAt, `Read ${label}`), `Read ${label}`,
+    );
+    if (bytes.length > maxBytes) {
+      throw new Error(`${label} exceeds the ${maxBytes}-byte metadata limit.`);
+    }
+    try {
+      return JSON.parse(bytes.toString('utf8'));
+    } catch {
+      throw new Error(`${label} is invalid JSON.`);
+    }
+  } finally {
+    await handle.close().catch(() => undefined);
   }
 }
 
@@ -175,8 +211,8 @@ async function ensureTrashGitIgnore(storage: TrashStorage, deadlineAt: number): 
     if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw error;
   }
   const stats = await lstatBounded(ignorePath, deadlineAt, 'Stat managed trash Git exclude');
-  if (!stats.isFile() || stats.isSymbolicLink()) {
-    throw new Error('Managed trash .gitignore must be a real file.');
+  if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1) {
+    throw new Error('Managed trash .gitignore must be a private real file with exactly one link.');
   }
   const bytes = await runWithAbortableTimeout(
     (signal) => readFileBounded(ignorePath, 128, signal, 'managed trash Git exclude'),
@@ -289,7 +325,7 @@ async function ensureTrashStorage(workspaceRoot: string, deadlineAt: number, cre
 
   let marker: unknown;
   try {
-    marker = await readJsonBounded(storage.marker, deadlineAt);
+    marker = await readOwnedJsonBounded(storage.marker, storage.root, deadlineAt, 'Managed trash ownership marker');
   } catch (error) {
     if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT' && !(error instanceof Error && error.message.includes('ENOENT'))) {
       throw error;
@@ -308,7 +344,7 @@ async function ensureTrashStorage(workspaceRoot: string, deadlineAt: number, cre
     } catch (error) {
       if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw error;
     }
-    marker = await readJsonBounded(storage.marker, deadlineAt);
+    marker = await readOwnedJsonBounded(storage.marker, storage.root, deadlineAt, 'Managed trash ownership marker');
   }
   if (!marker || typeof marker !== 'object' || Array.isArray(marker)) {
     throw new Error('Managed trash marker has an invalid shape.');
@@ -369,7 +405,12 @@ async function readManifest(storage: TrashStorage, workspaceRoot: string, name: 
   }
   const entryReal = await realpathBounded(entryDir, deadlineAt, `Resolve trash entry ${name}`);
   if (!isInside(storage.entries, entryReal)) throw new Error(`Managed trash entry escaped storage: ${name}`);
-  return validateManifest(await readJsonBounded(path.join(entryDir, 'manifest.json'), deadlineAt), workspaceRoot, name);
+  return validateManifest(
+    await readOwnedJsonBounded(
+      path.join(entryDir, 'manifest.json'), entryDir, deadlineAt, `Managed trash manifest ${name}`,
+    ),
+    workspaceRoot, name,
+  );
 }
 function sessionKey(): string | undefined {
   const identity = getToolCallSessionIdentity();
@@ -392,6 +433,42 @@ function entryPaths(storage: TrashStorage, name: string) {
   };
 }
 
+function pendingEntryPath(storage: TrashStorage, name: string): string {
+  return path.join(storage.entries, `${TRASH_PENDING_ENTRY_PREFIX}${name}`);
+}
+
+function isPendingEntryName(name: string): boolean {
+  return name.startsWith(TRASH_PENDING_ENTRY_PREFIX)
+    && MANAGED_TRASH_ENTRY_NAME.test(name.slice(TRASH_PENDING_ENTRY_PREFIX.length));
+}
+
+function assertPayloadKind(manifest: TrashManifest, stats: Awaited<ReturnType<typeof fs.lstat>>): void {
+  const actual = kindOf(stats);
+  if (actual !== manifest.kind) {
+    throw new Error(`Managed trash payload kind mismatch for ${manifest.name}: expected ${manifest.kind}, found ${actual}.`);
+  }
+}
+
+async function countManagedEntryDirectories(storage: TrashStorage, deadlineAt: number): Promise<number> {
+  const directory = await runWithAbortableTimeout(
+    (_signal) => fs.opendir(storage.entries),
+    remaining(deadlineAt, 'Open managed trash entries for capacity check'),
+    'Open managed trash entries for capacity check',
+  );
+  let count = 0;
+  try {
+    for await (const dirent of directory) {
+      remaining(deadlineAt, 'Count managed trash entries');
+      if (!dirent.isDirectory() || !MANAGED_TRASH_ENTRY_NAME.test(dirent.name)) continue;
+      count += 1;
+      if (count >= TRASH_MAX_ENTRIES) return count;
+    }
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
+  return count;
+}
+
 async function pathExists(filePath: string, deadlineAt: number): Promise<boolean> {
   try {
     await lstatBounded(filePath, deadlineAt, `Check path ${filePath}`);
@@ -401,6 +478,122 @@ async function pathExists(filePath: string, deadlineAt: number): Promise<boolean
     throw error;
   }
 }
+
+async function workspaceHasManagedEntryNames(root: string, deadlineAt: number): Promise<boolean> {
+  const entries = storagePaths(root).entries;
+  let stats: Awaited<ReturnType<typeof fs.lstat>>;
+  try {
+    stats = await lstatBounded(entries, deadlineAt, `Stat trash registry entries ${entries}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
+    throw error;
+  }
+  if (!stats.isDirectory() || stats.isSymbolicLink()) {
+    throw new Error(`Trash registry entries path is not a real directory: ${entries}`);
+  }
+  const real = await realpathBounded(entries, deadlineAt, `Resolve trash registry entries ${entries}`);
+  if (!isInside(root, real)) throw new Error(`Trash registry entries escaped workspace: ${entries}`);
+  const directory = await runWithAbortableTimeout(
+    (_signal) => fs.opendir(entries), remaining(deadlineAt, `Open trash registry entries ${entries}`),
+    `Open trash registry entries ${entries}`,
+  );
+  try {
+    for await (const dirent of directory) {
+      remaining(deadlineAt, `Scan trash registry entries ${entries}`);
+      if (MANAGED_TRASH_ENTRY_NAME.test(dirent.name) || isPendingEntryName(dirent.name)) return true;
+    }
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
+  return false;
+}
+function normalizedWorkspaceRegistryRoots(raw: unknown): string[] {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('Managed trash workspace registry has an invalid shape.');
+  }
+  const value = raw as Record<string, unknown>;
+  if (value.version !== 1 || !Array.isArray(value.roots) || value.roots.length > TRASH_MAX_WORKSPACES) {
+    throw new Error('Managed trash workspace registry exceeds its bounded contract.');
+  }
+  const roots = new Map<string, string>();
+  for (const root of value.roots) {
+    if (typeof root !== 'string' || !root || root.length > 4096 || !path.isAbsolute(root)
+        || /[\0\r\n]/.test(root) || pathContainsManagedTrashSegment(root)) {
+      throw new Error('Managed trash workspace registry contains an invalid root.');
+    }
+    roots.set(pathIdentity(root), root);
+  }
+  return [...roots.values()];
+}
+
+async function readDurableWorkspaceRegistry(deadlineAt: number): Promise<string[] | undefined> {
+  let parsed: unknown;
+  try {
+    parsed = await readOwnedJsonBounded(
+      TRASH_WORKSPACE_REGISTRY_FILE, path.dirname(CONFIG_FILE), deadlineAt,
+      'Managed trash workspace registry', TRASH_WORKSPACE_REGISTRY_MAX_BYTES,
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return undefined;
+    throw error;
+  }
+  return normalizedWorkspaceRegistryRoots(parsed);
+}
+
+async function writeDurableWorkspaceRegistry(roots: string[], deadlineAt: number): Promise<void> {
+  const normalized = normalizedWorkspaceRegistryRoots({ version: 1, roots });
+  const directory = path.dirname(TRASH_WORKSPACE_REGISTRY_FILE);
+  const tempPath = path.join(directory, `${MANAGED_TRASH_WORKSPACE_REGISTRY_TEMP_PREFIX}${process.pid}.${crypto.randomUUID()}.tmp`);
+  let published = false;
+  await runWithAbortableTimeout(
+    (_signal) => fs.mkdir(directory, { recursive: true, mode: 0o700 }),
+    remaining(deadlineAt, 'Create managed trash registry directory'), 'Create managed trash registry directory',
+  );
+  try {
+    await runWithAbortableTimeout(
+      (signal) => fs.writeFile(tempPath, JSON.stringify({ version: 1, roots: normalized }, null, 2), {
+        encoding: 'utf8', flag: 'wx', mode: 0o600, flush: true, signal,
+      }),
+      remaining(deadlineAt, 'Stage managed trash workspace registry'), 'Stage managed trash workspace registry',
+    );
+    await renameReplacingWithRetry(tempPath, TRASH_WORKSPACE_REGISTRY_FILE, { deadlineAt });
+    published = true;
+  } finally {
+    if (!published) await fs.rm(tempPath, { force: true }).catch(() => undefined);
+  }
+}
+
+async function acquireTrashWorkspaceRegistryGate(deadlineAt: number): Promise<() => Promise<void>> {
+  return acquireMutationResourceLocks(
+    [TRASH_WORKSPACE_REGISTRY_GATE], deadlineAt, { topologyMode: 'none' },
+  );
+}
+
+async function legacyWorkspaceRegistryRoots(): Promise<string[]> {
+  let configured: unknown;
+  try { configured = await configManager.getValue(TRASH_WORKSPACE_REGISTRY_KEY); }
+  catch { configured = undefined; }
+  const legacy = Array.isArray(configured) ? configured.slice(-TRASH_MAX_WORKSPACES) : [];
+  const migrated: string[] = [];
+  for (const raw of legacy) {
+    try {
+      const [candidate] = normalizedWorkspaceRegistryRoots({ version: 1, roots: [raw] });
+      if (candidate) migrated.push(candidate);
+    } catch {
+      // Invalid legacy roots are never promoted into the owner-controlled registry.
+    }
+  }
+  return normalizedWorkspaceRegistryRoots({ version: 1, roots: migrated });
+}
+
+async function readOrMigrateDurableWorkspaceRegistry(deadlineAt: number): Promise<string[]> {
+  const current = await readDurableWorkspaceRegistry(deadlineAt);
+  if (current) return current;
+  const migrated = await legacyWorkspaceRegistryRoots();
+  await writeDurableWorkspaceRegistry(migrated, deadlineAt);
+  return migrated;
+}
+
 async function removeTreeNoFollow(
   target: string, fenceRoot: string, rootDevice: number, deadlineAt: number,
   state: { nodes: number }, depth = 0,
@@ -419,12 +612,17 @@ async function removeTreeNoFollow(
   if (stats.dev !== rootDevice) throw new Error(`Managed trash purge refuses to cross filesystem devices: ${target}`);
   const canonical = await realpathBounded(target, deadlineAt, `Resolve trash purge directory ${target}`);
   if (!isInside(fenceRoot, canonical)) throw new Error(`Managed trash purge escaped storage: ${target}`);
-  const children = await runWithAbortableTimeout(
-    (_signal) => fs.readdir(target), remaining(deadlineAt, `Read trash purge directory ${target}`),
-    `Read trash purge directory ${target}`,
+  const directory = await runWithAbortableTimeout(
+    (_signal) => fs.opendir(target), remaining(deadlineAt, `Open trash purge directory ${target}`),
+    `Open trash purge directory ${target}`,
   );
-  for (const child of children) {
-    await removeTreeNoFollow(path.join(target, child), fenceRoot, rootDevice, deadlineAt, state, depth + 1);
+  try {
+    for await (const child of directory) {
+      remaining(deadlineAt, `Read trash purge directory ${target}`);
+      await removeTreeNoFollow(path.join(target, child.name), fenceRoot, rootDevice, deadlineAt, state, depth + 1);
+    }
+  } finally {
+    await directory.close().catch(() => undefined);
   }
   await runWithAbortableTimeout(
     (_signal) => fs.rmdir(target), remaining(deadlineAt, `Remove trash purge directory ${target}`),
@@ -445,6 +643,11 @@ export class TrashManager {
     return this.startPromise;
   }
 
+  private syncTrackedWorkspaces(roots: string[]): void {
+    this.workspaces.clear();
+    for (const root of roots) setBoundedMap(this.workspaces, pathIdentity(root), root, TRASH_MAX_WORKSPACES);
+  }
+
   private async initialize(): Promise<void> {
     if (this.started) return;
     this.started = true;
@@ -453,36 +656,120 @@ export class TrashManager {
     }, MANAGED_TRASH_SWEEP_INTERVAL_MS);
     this.timer.unref?.();
 
-    let configured: unknown;
-    try { configured = await configManager.getValue(TRASH_WORKSPACE_REGISTRY_KEY); }
-    catch { configured = undefined; }
-    const roots = Array.isArray(configured) ? configured.filter((item): item is string => typeof item === 'string') : [];
-    for (const raw of roots.slice(-TRASH_MAX_WORKSPACES)) {
-      try {
-        const root = await validateWorkspaceRoot(raw, Date.now() + 10_000);
-        setBoundedMap(this.workspaces, pathIdentity(root), root, TRASH_MAX_WORKSPACES);
-      } catch {
-        // Stale or no-longer-authorized roots are ignored fail-closed.
+    const startupDeadline = Date.now() + 10_000;
+    let roots: string[] = [];
+    try {
+      const current = await readDurableWorkspaceRegistry(startupDeadline);
+      if (current) {
+        roots = current;
+      } else {
+        const releaseGate = await acquireTrashWorkspaceRegistryGate(startupDeadline);
+        try { roots = await readOrMigrateDurableWorkspaceRegistry(startupDeadline); }
+        finally { await releaseGate(); }
       }
+    } catch {
+      // Registry corruption or a transient gate/I/O failure must not brick recovery actions.
+      // New puts re-read the durable registry under the gate and fail closed there.
+      roots = await legacyWorkspaceRegistryRoots();
     }
-    void this.persistWorkspaceRegistry();
+    this.syncTrackedWorkspaces(roots);
     void this.sweepAll().catch(() => undefined);
   }
 
-  private registerWorkspace(root: string): void {
-    setBoundedMap(this.workspaces, pathIdentity(root), root, TRASH_MAX_WORKSPACES);
+  private registerWorkspace(root: string): boolean {
+    const identity = pathIdentity(root);
+    const alreadyTracked = this.workspaces.has(identity);
+    if (alreadyTracked) {
+      this.workspaces.delete(identity);
+      this.workspaces.set(identity, root);
+    } else if (this.workspaces.size < TRASH_MAX_WORKSPACES) {
+      this.workspaces.set(identity, root);
+    }
     const key = sessionKey();
     if (key) setBoundedMap(this.sessionWorkspaces, key, root, TRASH_MAX_SESSION_BINDINGS);
-    void this.persistWorkspaceRegistry();
+    return this.workspaces.has(identity);
   }
 
-  private async persistWorkspaceRegistry(): Promise<void> {
+  private async ensurePutWorkspaceTracked(
+    root: string, deadlineAt: number,
+  ): Promise<(keepReservation: boolean) => Promise<void>> {
+    const identity = pathIdentity(root);
+    const releaseGate = await acquireTrashWorkspaceRegistryGate(deadlineAt);
     try {
-      await configManager.setValueNonBlocking(
-        TRASH_WORKSPACE_REGISTRY_KEY, [...this.workspaces.values()],
-      );
-    } catch {
-      // Persistence is recovery metadata; it must never gate a trash operation.
+      const durableRoots = await readOrMigrateDurableWorkspaceRegistry(deadlineAt);
+      const authoritative = new Map(durableRoots.map((candidate) => [pathIdentity(candidate), candidate]));
+      if (authoritative.has(identity)) {
+        this.syncTrackedWorkspaces([...authoritative.values()]);
+        this.registerWorkspace(root);
+        let activeOrUnknown = true;
+        try { activeOrUnknown = await workspaceHasManagedEntryNames(root, deadlineAt); }
+        catch { activeOrUnknown = true; }
+        if (activeOrUnknown) {
+          await releaseGate();
+          return async () => undefined;
+        }
+        // A tracked-but-empty root is currently evictable. Hold the registry gate
+        // until this put either creates a managed entry or fails, so a competing
+        // process cannot consume the root's recovery slot during the commit window.
+        let finalized = false;
+        return async () => {
+          if (finalized) return;
+          finalized = true;
+          await releaseGate();
+        };
+      }
+
+      if (authoritative.size >= TRASH_MAX_WORKSPACES) {
+        for (const [candidateIdentity, candidateRoot] of [...authoritative.entries()]) {
+          let validatedCandidate: string;
+          try { validatedCandidate = await validateWorkspaceRoot(candidateRoot, deadlineAt); }
+          catch {
+            // Validation failure may be transient (timeout, permission change, slow Git).
+            // Never convert uncertainty into lost recovery tracking.
+            continue;
+          }
+          let activeOrUnknown = true;
+          try { activeOrUnknown = await workspaceHasManagedEntryNames(validatedCandidate, deadlineAt); }
+          catch { activeOrUnknown = true; }
+          if (activeOrUnknown) continue;
+          authoritative.delete(candidateIdentity);
+          break;
+        }
+      }
+      if (authoritative.size >= TRASH_MAX_WORKSPACES) {
+        throw new Error(
+          `Managed trash tracks at most ${TRASH_MAX_WORKSPACES} active workspaces. Restore or expire trash in an existing workspace before adding another; no item was moved.`,
+        );
+      }
+
+      authoritative.set(identity, root);
+      await writeDurableWorkspaceRegistry([...authoritative.values()], deadlineAt);
+      this.syncTrackedWorkspaces([...authoritative.values()]);
+      this.registerWorkspace(root);
+
+      let finalized = false;
+      return async (keepReservation: boolean) => {
+        if (finalized) return;
+        finalized = true;
+        try {
+          if (!keepReservation) {
+            const cleanupDeadline = Date.now() + 5_000;
+            let activeOrUnknown = true;
+            try { activeOrUnknown = await workspaceHasManagedEntryNames(root, cleanupDeadline); }
+            catch { activeOrUnknown = true; }
+            if (!activeOrUnknown) {
+              authoritative.delete(identity);
+              await writeDurableWorkspaceRegistry([...authoritative.values()], cleanupDeadline).catch(() => undefined);
+              this.syncTrackedWorkspaces([...authoritative.values()]);
+            }
+          }
+        } finally {
+          await releaseGate();
+        }
+      };
+    } catch (error) {
+      await releaseGate();
+      throw error;
     }
   }
 
@@ -495,7 +782,7 @@ export class TrashManager {
     const key = sessionKey();
     const root = key ? this.sessionWorkspaces.get(key) : undefined;
     if (!root) {
-      throw new Error('No trash workspace is bound for this chat/session. Use put first or provide workspace with the exact Git root.');
+      throw new Error('No trash workspace is bound for this chat/session. Use put first in the same identified chat/session, or provide workspace with the exact Git root.');
     }
     const validated = await validateWorkspaceRoot(root, deadlineAt);
     this.registerWorkspace(validated);
@@ -503,8 +790,8 @@ export class TrashManager {
   }
 
   async action(args: { action: 'put' | 'list' | 'read' | 'restore'; path?: string; name?: string; workspace?: string }) {
-    void this.start().catch(() => undefined);
     const deadlineAt = Date.now() + TRASH_OPERATION_TIMEOUT_MS;
+    await this.start();
     switch (args.action) {
       case 'put':
         return this.put(args.path!, args.workspace, deadlineAt);
@@ -519,32 +806,25 @@ export class TrashManager {
   private async put(rawPath: string, workspace: string | undefined, deadlineAt: number) {
     const expectedWorkspace = workspace ? await validateWorkspaceRoot(workspace, deadlineAt) : undefined;
     const initial = await resolvePutTarget(rawPath, deadlineAt, expectedWorkspace);
-    this.registerWorkspace(initial.workspaceRoot);
-    const storage = await ensureTrashStorage(initial.workspaceRoot, deadlineAt, true);
+    const finalizeWorkspaceReservation = await this.ensurePutWorkspaceTracked(initial.workspaceRoot, deadlineAt);
+    let moved = false;
+    try {
+      const storage = await ensureTrashStorage(initial.workspaceRoot, deadlineAt, true);
     if (!storage) throw new Error('Failed to initialize managed trash storage.');
 
     const name = `tr_${crypto.randomUUID().replace(/-/g, '')}`;
     const entry = entryPaths(storage, name);
-    await runWithAbortableTimeout(
-      (_signal) => fs.mkdir(entry.entry, { mode: 0o700 }),
-      remaining(deadlineAt, `Create trash entry ${name}`), `Create trash entry ${name}`,
-    );
+    const pendingEntry = pendingEntryPath(storage, name);
     const createdAt = Date.now();
     const manifest: TrashManifest = {
       version: 1, name, workspaceRoot: initial.workspaceRoot,
       originalRelativePath: initial.relativePath, displayName: path.basename(initial.relativePath),
       kind: kindOf(initial.stats), createdAt, expiresAt: createdAt + MANAGED_TRASH_RETENTION_MS,
     };
-    await runWithAbortableTimeout(
-      (signal) => fs.writeFile(entry.manifest, JSON.stringify(manifest, null, 2), {
-        encoding: 'utf8', flag: 'wx', mode: 0o600, signal, flush: true,
-      }),
-      remaining(deadlineAt, `Write trash manifest ${name}`), `Write trash manifest ${name}`,
-    );
 
-    let moved = false;
+      let entryCommitted = false;
     const release = await acquireCoordinatedMutationOwnership(
-      [initial.targetPath, storage.root, entry.payload], deadlineAt,
+      [initial.targetPath, storage.root, pendingEntry, entry.payload], deadlineAt,
       { topologyMode: 'exclusive', label: 'trash_action.put' },
     );
     try {
@@ -552,6 +832,22 @@ export class TrashManager {
       if (!samePath(current.targetPath, initial.targetPath) || !sameLstatIdentity(current.stats, initial.stats)) {
         throw new Error('trash_action target changed before mutation ownership was acquired. No item was moved.');
       }
+      const entryCount = await countManagedEntryDirectories(storage, deadlineAt);
+      if (entryCount >= TRASH_MAX_ENTRIES) {
+        throw new Error(`Managed trash reached its ${TRASH_MAX_ENTRIES}-entry safety limit. Restore entries or wait for expiry before adding more.`);
+      }
+      await runWithAbortableTimeout(
+        (_signal) => fs.mkdir(pendingEntry, { mode: 0o700 }),
+        remaining(deadlineAt, `Create pending trash entry ${name}`), `Create pending trash entry ${name}`,
+      );
+      await runWithAbortableTimeout(
+        (signal) => fs.writeFile(path.join(pendingEntry, 'manifest.json'), JSON.stringify(manifest, null, 2), {
+          encoding: 'utf8', flag: 'wx', mode: 0o600, signal, flush: true,
+        }),
+        remaining(deadlineAt, `Write pending trash manifest ${name}`), `Write pending trash manifest ${name}`,
+      );
+      await fs.rename(pendingEntry, entry.entry);
+      entryCommitted = true;
       if (await pathExists(entry.payload, deadlineAt)) {
         throw new Error('Managed trash payload path unexpectedly already exists.');
       }
@@ -568,10 +864,14 @@ export class TrashManager {
       }
       moved = true;
     } finally {
-      await release();
-      if (!moved) {
-        await fs.unlink(entry.manifest).catch(() => undefined);
-        await fs.rmdir(entry.entry).catch(() => undefined);
+      try {
+        if (!moved) {
+          const cleanupEntry = entryCommitted ? entry.entry : pendingEntry;
+          await fs.unlink(path.join(cleanupEntry, 'manifest.json')).catch(() => undefined);
+          await fs.rmdir(cleanupEntry).catch(() => undefined);
+        }
+      } finally {
+        await release();
       }
     }
     return {
@@ -584,7 +884,10 @@ export class TrashManager {
       expiresAt: new Date(manifest.expiresAt).toISOString(),
       expiresInMs: Math.max(0, manifest.expiresAt - Date.now()),
       note: 'Item was renamed into managed trash. No copy+delete fallback is permitted.',
-    };
+      };
+    } finally {
+      await finalizeWorkspaceReservation(moved);
+    }
   }
 
   private async list(name: string | undefined, workspace: string | undefined, deadlineAt: number) {
@@ -594,91 +897,134 @@ export class TrashManager {
     void this.sweepWorkspace(root).catch(() => undefined);
     if (name) return this.listEntry(root, storage, name, deadlineAt);
 
-    const dirents = await runWithAbortableTimeout(
-      (_signal) => fs.readdir(storage.entries, { withFileTypes: true }),
-      remaining(deadlineAt, 'List managed trash entries'), 'List managed trash entries',
+    const directory = await runWithAbortableTimeout(
+      (_signal) => fs.opendir(storage.entries),
+      remaining(deadlineAt, 'Open managed trash entries'), 'Open managed trash entries',
     );
     const entries = [];
     const warnings: string[] = [];
-    for (const dirent of dirents.slice(0, TRASH_MAX_ENTRIES)) {
-      if (!dirent.isDirectory() || !MANAGED_TRASH_ENTRY_NAME.test(dirent.name)) continue;
-      try {
-        const manifest = await readManifest(storage, root, dirent.name, deadlineAt);
-        const payload = entryPaths(storage, dirent.name).payload;
-        if (manifest.expiresAt <= Date.now() || !(await pathExists(payload, deadlineAt))) continue;
-        entries.push({
-          name: manifest.name, displayName: manifest.displayName,
-          originalRelativePath: manifest.originalRelativePath, kind: manifest.kind,
-          createdAt: new Date(manifest.createdAt).toISOString(),
-          expiresAt: new Date(manifest.expiresAt).toISOString(),
-          expiresInMs: Math.max(0, manifest.expiresAt - Date.now()),
-        });
-      } catch (error) {
-        warnings.push(`${dirent.name}: ${error instanceof Error ? error.message : String(error)}`);
+    let totalEntryDirectories = 0;
+    try {
+      for await (const dirent of directory) {
+        remaining(deadlineAt, 'List managed trash entries');
+        if (!dirent.isDirectory() || !MANAGED_TRASH_ENTRY_NAME.test(dirent.name)) continue;
+        totalEntryDirectories += 1;
+        if (totalEntryDirectories > TRASH_MAX_ENTRIES) continue;
+        try {
+          const manifest = await readManifest(storage, root, dirent.name, deadlineAt);
+          const payload = entryPaths(storage, dirent.name).payload;
+          if (manifest.expiresAt <= Date.now()) continue;
+          let payloadStats: Awaited<ReturnType<typeof fs.lstat>>;
+          try {
+            payloadStats = await lstatBounded(payload, deadlineAt, `Stat trash payload ${dirent.name}`);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') continue;
+            throw error;
+          }
+          assertPayloadKind(manifest, payloadStats);
+          entries.push({
+            name: manifest.name, displayName: manifest.displayName,
+            originalRelativePath: manifest.originalRelativePath, kind: manifest.kind,
+            createdAt: new Date(manifest.createdAt).toISOString(),
+            expiresAt: new Date(manifest.expiresAt).toISOString(),
+            expiresInMs: Math.max(0, manifest.expiresAt - Date.now()),
+          });
+        } catch (error) {
+          warnings.push(`${dirent.name}: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
+    } finally {
+      await directory.close().catch(() => undefined);
     }
     entries.sort((a, b) => a.expiresAt.localeCompare(b.expiresAt));
     return {
       action: 'list', workspace: slash(root), entries,
-      ...(dirents.length > TRASH_MAX_ENTRIES ? { truncated: true, totalEntryDirectories: dirents.length } : {}),
+      ...(totalEntryDirectories > TRASH_MAX_ENTRIES ? { truncated: true, totalEntryDirectories } : {}),
       ...(warnings.length ? { warnings: warnings.slice(0, 20) } : {}),
     };
   }
 
   private async listEntry(root: string, storage: TrashStorage, name: string, deadlineAt: number) {
-    const manifest = await readManifest(storage, root, name, deadlineAt);
-    if (manifest.expiresAt <= Date.now()) throw new Error(`Trash entry ${name} has expired and is no longer restorable.`);
     const payload = entryPaths(storage, name).payload;
-    const stats = await lstatBounded(payload, deadlineAt, `Stat trash payload ${name}`);
-    if (stats.isSymbolicLink()) {
-      const linkTarget = await runWithAbortableTimeout(
-        (_signal) => fs.readlink(payload), remaining(deadlineAt, `Read trash symlink ${name}`),
-        `Read trash symlink ${name}`,
-      );
-      return { action: 'list', workspace: slash(root), name, kind: 'symlink', linkTarget };
-    }
-    if (!stats.isDirectory()) {
-      return { action: 'list', workspace: slash(root), name, kind: manifest.kind, children: [] };
-    }
-    const children = await runWithAbortableTimeout(
-      (_signal) => fs.readdir(payload, { withFileTypes: true }),
-      remaining(deadlineAt, `List trash directory ${name}`), `List trash directory ${name}`,
+    const release = await acquireMutationResourceLocks(
+      [payload], deadlineAt, { topologyMode: 'none', resourceMode: 'shared' },
     );
-    return {
-      action: 'list', workspace: slash(root), name, kind: 'directory',
-      children: children.slice(0, TRASH_MAX_LIST_CHILDREN).map((child) => ({
-        name: child.name,
-        kind: child.isSymbolicLink() ? 'symlink' : child.isDirectory() ? 'directory' : child.isFile() ? 'file' : 'other',
-      })),
-      ...(children.length > TRASH_MAX_LIST_CHILDREN ? { truncated: true, totalChildren: children.length } : {}),
-    };
+    try {
+      const manifest = await readManifest(storage, root, name, deadlineAt);
+      if (manifest.expiresAt <= Date.now()) throw new Error(`Trash entry ${name} has expired and is no longer restorable.`);
+      const stats = await lstatBounded(payload, deadlineAt, `Stat trash payload ${name}`);
+      assertPayloadKind(manifest, stats);
+      if (stats.isSymbolicLink()) {
+        const linkTarget = await runWithAbortableTimeout(
+          (_signal) => fs.readlink(payload), remaining(deadlineAt, `Read trash symlink ${name}`),
+          `Read trash symlink ${name}`,
+        );
+        return { action: 'list', workspace: slash(root), name, kind: 'symlink', linkTarget };
+      }
+      if (!stats.isDirectory()) {
+        return { action: 'list', workspace: slash(root), name, kind: manifest.kind, children: [] };
+      }
+      const directory = await runWithAbortableTimeout(
+        (_signal) => fs.opendir(payload),
+        remaining(deadlineAt, `Open trash directory ${name}`), `Open trash directory ${name}`,
+      );
+      const children: Array<{ name: string; kind: TrashKind }> = [];
+      let totalChildren = 0;
+      try {
+        for await (const child of directory) {
+          remaining(deadlineAt, `List trash directory ${name}`);
+          totalChildren += 1;
+          if (children.length >= TRASH_MAX_LIST_CHILDREN) continue;
+          children.push({
+            name: child.name,
+            kind: child.isSymbolicLink() ? 'symlink' : child.isDirectory() ? 'directory' : child.isFile() ? 'file' : 'other',
+          });
+        }
+      } finally {
+        await directory.close().catch(() => undefined);
+      }
+      return {
+        action: 'list', workspace: slash(root), name, kind: 'directory', children,
+        ...(totalChildren > TRASH_MAX_LIST_CHILDREN ? { truncated: true, totalChildren } : {}),
+      };
+    } finally {
+      await release();
+    }
   }
   private async read(name: string, workspace: string | undefined, deadlineAt: number) {
     const root = await this.workspaceForAction(workspace, deadlineAt);
     const storage = await ensureTrashStorage(root, deadlineAt, false);
     if (!storage) throw new Error('Managed trash is empty for this workspace.');
-    const manifest = await readManifest(storage, root, name, deadlineAt);
-    if (manifest.expiresAt <= Date.now()) throw new Error(`Trash entry ${name} has expired and is no longer readable.`);
     const payload = entryPaths(storage, name).payload;
-    const stats = await lstatBounded(payload, deadlineAt, `Stat trash payload ${name}`);
-    if (stats.isSymbolicLink()) {
-      const linkTarget = await runWithAbortableTimeout(
-        (_signal) => fs.readlink(payload), remaining(deadlineAt, `Read trash symlink ${name}`),
-        `Read trash symlink ${name}`,
-      );
-      return { action: 'read', workspace: slash(root), name, kind: 'symlink', encoding: 'link-target', content: linkTarget };
-    }
-    if (!stats.isFile()) throw new Error(`trash_action.read only reads file payloads; ${name} is ${manifest.kind}.`);
-    const bytes = await runWithAbortableTimeout(
-      (signal) => readFileBounded(payload, TRASH_READ_MAX_BYTES, signal, 'trash_action read payload'),
-      remaining(deadlineAt, `Read trash payload ${name}`), `Read trash payload ${name}`,
+    const release = await acquireMutationResourceLocks(
+      [payload], deadlineAt, { topologyMode: 'none', resourceMode: 'shared' },
     );
-    const binary = await isBinaryFile(bytes, bytes.length);
-    return {
-      action: 'read', workspace: slash(root), name, kind: manifest.kind,
-      encoding: binary ? 'base64' : 'utf8', content: binary ? bytes.toString('base64') : bytes.toString('utf8'),
-      bytes: bytes.length,
-    };
+    try {
+      const manifest = await readManifest(storage, root, name, deadlineAt);
+      if (manifest.expiresAt <= Date.now()) throw new Error(`Trash entry ${name} has expired and is no longer readable.`);
+      const stats = await lstatBounded(payload, deadlineAt, `Stat trash payload ${name}`);
+      assertPayloadKind(manifest, stats);
+      if (stats.isSymbolicLink()) {
+        const linkTarget = await runWithAbortableTimeout(
+          (_signal) => fs.readlink(payload), remaining(deadlineAt, `Read trash symlink ${name}`),
+          `Read trash symlink ${name}`,
+        );
+        return { action: 'read', workspace: slash(root), name, kind: 'symlink', encoding: 'link-target', content: linkTarget };
+      }
+      if (!stats.isFile()) throw new Error(`trash_action.read only reads file payloads; ${name} is ${manifest.kind}.`);
+      const bytes = await runWithAbortableTimeout(
+        (signal) => readFileBounded(payload, TRASH_READ_MAX_BYTES, signal, 'trash_action read payload'),
+        remaining(deadlineAt, `Read trash payload ${name}`), `Read trash payload ${name}`,
+      );
+      const binary = await isBinaryFile(bytes, bytes.length);
+      return {
+        action: 'read', workspace: slash(root), name, kind: manifest.kind,
+        encoding: binary ? 'base64' : 'utf8', content: binary ? bytes.toString('base64') : bytes.toString('utf8'),
+        bytes: bytes.length,
+      };
+    } finally {
+      await release();
+    }
   }
   private async resolveRestoreDestination(root: string, relativePath: string, deadlineAt: number): Promise<string> {
     const lexical = path.resolve(root, relativePath);
@@ -725,7 +1071,8 @@ export class TrashManager {
       if (await pathExists(destination, deadlineAt)) {
         throw new Error(`Restore refused because destination now exists: ${destination}`);
       }
-      await lstatBounded(entry.payload, deadlineAt, `Stat restore payload ${name}`);
+      const payloadStats = await lstatBounded(entry.payload, deadlineAt, `Stat restore payload ${name}`);
+      assertPayloadKind(currentManifest, payloadStats);
       requireCommitReserve(deadlineAt, `Restore trash entry ${name}`);
       try {
         // Restore has the same truthful-commit rule as put: never return a
@@ -738,12 +1085,10 @@ export class TrashManager {
         throw error;
       }
       restored = true;
-    } finally {
-      await release();
-    }
-    if (restored) {
       await fs.unlink(entry.manifest).catch(() => undefined);
       await fs.rmdir(entry.entry).catch(() => undefined);
+    } finally {
+      await release();
     }
     return {
       action: 'restore', name, workspace: slash(root),
@@ -757,6 +1102,12 @@ export class TrashManager {
     if (this.sweepRunning) return;
     this.sweepRunning = true;
     try {
+      try {
+        const durableRoots = await readDurableWorkspaceRegistry(Date.now() + 2_000);
+        if (durableRoots) this.syncTrackedWorkspaces(durableRoots);
+      } catch {
+        // A transient registry read failure must not stop sweeping already-known roots.
+      }
       for (const root of [...this.workspaces.values()]) {
         try { await this.sweepWorkspace(root); }
         catch { /* one inaccessible workspace must not stop the autonomous sweeper */ }
@@ -771,18 +1122,55 @@ export class TrashManager {
     const validatedRoot = await validateWorkspaceRoot(root, deadlineAt);
     const storage = await ensureTrashStorage(validatedRoot, deadlineAt, false);
     if (!storage) return;
-    const dirents = await runWithAbortableTimeout(
-      (_signal) => fs.readdir(storage.entries, { withFileTypes: true }),
-      remaining(deadlineAt, 'Sweep managed trash entries'), 'Sweep managed trash entries',
+    const directory = await runWithAbortableTimeout(
+      (_signal) => fs.opendir(storage.entries),
+      remaining(deadlineAt, 'Open managed trash entries for sweep'), 'Open managed trash entries for sweep',
     );
-    for (const dirent of dirents.slice(0, TRASH_MAX_ENTRIES)) {
-      if (!dirent.isDirectory() || !MANAGED_TRASH_ENTRY_NAME.test(dirent.name)) continue;
-      if (Date.now() >= deadlineAt - 250) break;
-      let manifest: TrashManifest;
-      try { manifest = await readManifest(storage, validatedRoot, dirent.name, deadlineAt); }
-      catch { continue; }
-      if (manifest.expiresAt > Date.now()) continue;
-      await this.purgeEntry(validatedRoot, storage, manifest, deadlineAt).catch(() => undefined);
+    let managedEntriesSeen = 0;
+    try {
+      for await (const dirent of directory) {
+        if (Date.now() >= deadlineAt - 250) break;
+        if (isPendingEntryName(dirent.name)) {
+          await this.purgePendingEntry(storage, dirent.name, deadlineAt).catch(() => undefined);
+          continue;
+        }
+        if (!dirent.isDirectory() || !MANAGED_TRASH_ENTRY_NAME.test(dirent.name)) continue;
+        managedEntriesSeen += 1;
+        if (managedEntriesSeen > TRASH_MAX_ENTRIES) break;
+        let manifest: TrashManifest;
+        try { manifest = await readManifest(storage, validatedRoot, dirent.name, deadlineAt); }
+        catch { continue; }
+        const payload = entryPaths(storage, manifest.name).payload;
+        if (manifest.expiresAt > Date.now() && await pathExists(payload, deadlineAt)) continue;
+        await this.purgeEntry(validatedRoot, storage, manifest, deadlineAt).catch(() => undefined);
+      }
+    } finally {
+      await directory.close().catch(() => undefined);
+    }
+  }
+
+  private async purgePendingEntry(storage: TrashStorage, pendingName: string, deadlineAt: number): Promise<void> {
+    if (!isPendingEntryName(pendingName)) return;
+    const pending = path.join(storage.entries, pendingName);
+    const release = await acquireMutationResourceLocks(
+      [storage.root, pending], deadlineAt, { topologyMode: 'exclusive' },
+    );
+    try {
+      let stats: Awaited<ReturnType<typeof fs.lstat>>;
+      try {
+        stats = await lstatBounded(pending, deadlineAt, `Stat pending trash entry ${pendingName}`);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return;
+        throw error;
+      }
+      if (!stats.isDirectory() || stats.isSymbolicLink()) {
+        throw new Error(`Refusing unsafe pending trash cleanup for ${pendingName}.`);
+      }
+      const real = await realpathBounded(pending, deadlineAt, `Resolve pending trash entry ${pendingName}`);
+      if (!isInside(storage.entries, real)) throw new Error(`Pending trash entry escaped storage: ${pendingName}`);
+      await removeTreeNoFollow(pending, storage.entries, stats.dev, deadlineAt, { nodes: 0 });
+    } finally {
+      await release();
     }
   }
 
@@ -795,7 +1183,8 @@ export class TrashManager {
     );
     try {
       const current = await readManifest(storage, root, manifest.name, deadlineAt);
-      if (current.expiresAt > Date.now()) return;
+      const payloadMissing = !(await pathExists(entry.payload, deadlineAt));
+      if (current.expiresAt > Date.now() && !payloadMissing) return;
       const entryStats = await lstatBounded(entry.entry, deadlineAt, `Stat purge entry ${manifest.name}`);
       const entryReal = await realpathBounded(entry.entry, deadlineAt, `Resolve purge entry ${manifest.name}`);
       if (!entryStats.isDirectory() || entryStats.isSymbolicLink() || !isInside(storage.entries, entryReal)) {

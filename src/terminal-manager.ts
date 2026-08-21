@@ -10,6 +10,7 @@ import { createProcessOutputDecoder, mergeOutputDecodingInfo } from './utils/pro
 import { probeProcessTree, terminateProcessTree } from './utils/process-tree.js';
 import { getWindowsJobHelperFailure, spawnWindowsJobOwnedProcess, terminateWindowsJobOwnedProcess } from './utils/windows-job-owner.js';
 import { makeCancellationError, type CancellationCause } from './utils/cancellation.js';
+import { randomUUID } from 'crypto';
 
 /**
  * Standard Windows PATHEXT value, used to repair a corrupted PATHEXT before
@@ -49,6 +50,8 @@ interface ReaderCursor {
 
 interface CompletedSession {
   pid: number;
+  terminalSessionId: string;
+  ownerSessionIdentity?: string;
   outputLines: string[];       // Line-based buffer (consistent with active sessions)
   lastReadIndex: number;       // Preserve the legacy offset=0 cursor across active -> completed
   outputRevision: number;      // Preserve partial-line activity detection after process completion
@@ -212,6 +215,7 @@ export interface ProcessExecutionOptions {
   env?: Record<string, string>;
   detectPrompts?: boolean;
   executionKind?: 'auto' | 'finite' | 'interactive' | 'service';
+  ownerSessionIdentity?: string;
   onSpawned?: (pid: number) => void;
 }
 
@@ -399,11 +403,12 @@ export class TerminalManager {
    * @param input Text to send to the process
    * @returns Whether input was successfully sent
    */
-  sendInputToProcess(pid: number, input: string): boolean {
+  sendInputToProcess(pid: number, input: string, expectedTerminalSessionId?: string): boolean {
     const session = this.sessions.get(pid);
     if (!session) {
       return false;
     }
+    if (expectedTerminalSessionId && session.terminalSessionId !== expectedTerminalSessionId) return false;
     
     try {
       if (session.process.stdin && !session.process.stdin.destroyed) {
@@ -527,6 +532,8 @@ export class TerminalManager {
 
     const session: TerminalSession = {
       pid: sessionPid,
+      terminalSessionId: randomUUID(),
+      ownerSessionIdentity: executionOptions.ownerSessionIdentity,
       process: childProcess,
       backend: 'pipe',
       processTreeOwner,
@@ -761,6 +768,8 @@ export class TerminalManager {
         {
           this.storeCompletedSession({
             pid: session.pid,
+            terminalSessionId: session.terminalSessionId,
+            ownerSessionIdentity: session.ownerSessionIdentity,
             outputLines: [...session.outputLines],
             lastReadIndex: session.lastReadIndex,
             outputRevision: session.outputRevision,
@@ -902,6 +911,8 @@ export class TerminalManager {
     };
     const session: TerminalSession = {
       pid: ptyProcess.pid,
+      terminalSessionId: randomUUID(),
+      ownerSessionIdentity: executionOptions.ownerSessionIdentity,
       process: {
         stdin: stdinAdapter,
         kill: () => {
@@ -990,6 +1001,8 @@ export class TerminalManager {
         session.process.kill();
         this.storeCompletedSession({
           pid: finalPid,
+          terminalSessionId: session.terminalSessionId,
+          ownerSessionIdentity: session.ownerSessionIdentity,
           outputLines: [...session.outputLines],
           lastReadIndex: session.lastReadIndex,
           outputRevision: session.outputRevision,
@@ -1440,6 +1453,26 @@ export class TerminalManager {
     return this.sessions.get(pid);
   }
 
+  getSessionBinding(pid: number): { terminalSessionId: string; ownerSessionIdentity?: string } | undefined {
+    const session = this.sessions.get(pid) ?? this.completedSessions.get(pid);
+    if (!session) return undefined;
+    return {
+      terminalSessionId: session.terminalSessionId,
+      ownerSessionIdentity: session.ownerSessionIdentity,
+    };
+  }
+
+  canAccessSession(pid: number, ownerSessionIdentity?: string, terminalSessionId?: string): boolean {
+    const binding = this.getSessionBinding(pid);
+    if (!binding) return false;
+    if (terminalSessionId && terminalSessionId === binding.terminalSessionId) return true;
+    return Boolean(
+      ownerSessionIdentity
+      && binding.ownerSessionIdentity
+      && ownerSessionIdentity === binding.ownerSessionIdentity
+    );
+  }
+
   async reconcileExitedSession(pid: number): Promise<void> {
     const reconcile = this.exitReconcilers.get(pid);
     if (reconcile) await reconcile();
@@ -1449,9 +1482,11 @@ export class TerminalManager {
     pid: number,
     cause: CancellationCause = 'client_cancelled',
     detail?: string,
+    expectedTerminalSessionId?: string,
   ): Promise<boolean> {
     const session = this.sessions.get(pid);
     if (!session) return false;
+    if (expectedTerminalSessionId && session.terminalSessionId !== expectedTerminalSessionId) return false;
     session.cancellationCause ??= cause;
     session.cancellationDetail ??= detail;
 
@@ -1480,10 +1515,16 @@ export class TerminalManager {
     }
   }
 
-  listActiveSessions(): ActiveSession[] {
+  listActiveSessions(ownerSessionIdentity?: string, enforceOwnership = false): ActiveSession[] {
     const now = new Date();
-    return Array.from(this.sessions.values()).map(session => ({
+    return Array.from(this.sessions.values())
+      .filter(session => !enforceOwnership || (
+        ownerSessionIdentity !== undefined
+        && session.ownerSessionIdentity === ownerSessionIdentity
+      ))
+      .map(session => ({
       pid: session.pid,
+      terminalSessionId: session.terminalSessionId,
       backend: session.backend,
       processTreeOwner: session.processTreeOwner,
       executionKind: session.executionKind,

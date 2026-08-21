@@ -286,7 +286,8 @@ async function run() {
     try {
       await configManager.setValue('allowedDirectories', [tmpDir]);
       fsp.writeFile = async (file, data, options = {}) => {
-        if (String(file).includes('.write.tmp') && data === 'replacement-that-must-not-commit') {
+        const stagedText = Buffer.isBuffer(data) ? data.toString('utf8') : String(data);
+        if (String(file).includes('.write.tmp') && stagedText === 'replacement-that-must-not-commit') {
           stagedWriteSignal = options.signal;
           return new Promise((_resolve, reject) => {
             const abort = () => reject(stagedWriteSignal?.reason ?? new Error('aborted'));

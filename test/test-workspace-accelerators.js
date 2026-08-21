@@ -133,6 +133,12 @@ async function main() {
     assert(bridgeList.routing_guidance.includes('cpp_build_plan'));
     assert(bridgeList.routing_guidance.includes('safe_fix'));
     assert(bridgeList.routing_guidance.includes('ast_rewrite'));
+    const acceleratorList = parseTextResult(await listExternalMcpTools({ server: BUILTIN_SERVER_ID }));
+    const acceleratorSchema = parseTextResult(await listExternalMcpTools({
+      server: BUILTIN_SERVER_ID, tool: 'workspace_snapshot',
+    }));
+    assert.equal(acceleratorList.routing_guidance, undefined, 'server list repeated root routing guidance');
+    assert.equal(acceleratorSchema.routing_guidance, undefined, 'tool schema repeated root routing guidance');
     assert.doesNotThrow(() => assertCoreMcpCoverage());
     assert.deepEqual(
       listBuiltinCoreTools().map((tool) => tool.name).sort(),

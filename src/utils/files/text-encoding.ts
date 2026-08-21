@@ -3,6 +3,7 @@ import { StringDecoder } from 'string_decoder';
 import { Transform } from 'stream';
 
 export type Utf16BomEncoding = 'utf16le' | 'utf16be';
+export type TextFileEncoding = 'utf8' | Utf16BomEncoding;
 
 export function detectUtf16Bom(buffer: Uint8Array): Utf16BomEncoding | null {
     if (buffer.length < 2) return null;
@@ -31,11 +32,24 @@ export function decodeTextBuffer(buffer: Buffer): string {
     const encoding = detectUtf16Bom(buffer);
     if (!encoding) return buffer.toString('utf8');
     const body = buffer.subarray(2);
+    if (body.length % 2 !== 0) throw new Error('Truncated UTF-16 code unit at end of file');
     if (encoding === 'utf16le') return body.toString('utf16le');
     const swapped = Buffer.allocUnsafe(body.length);
-    for (let i = 0; i + 1 < body.length; i += 2) { swapped[i] = body[i + 1]; swapped[i + 1] = body[i]; }
-    if (body.length % 2 !== 0) swapped[body.length - 1] = body[body.length - 1];
+    for (let i = 0; i < body.length; i += 2) { swapped[i] = body[i + 1]; swapped[i + 1] = body[i]; }
     return swapped.toString('utf16le');
+}
+
+export function encodeTextBuffer(text: string, encoding: TextFileEncoding, includeBom = true): Buffer {
+    if (encoding === 'utf8') return Buffer.from(text, 'utf8');
+    const body = Buffer.from(text, 'utf16le');
+    if (encoding === 'utf16be') {
+        for (let i = 0; i + 1 < body.length; i += 2) {
+            const byte = body[i]; body[i] = body[i + 1]; body[i + 1] = byte;
+        }
+    }
+    if (!includeBom) return body;
+    const bom = encoding === 'utf16le' ? Buffer.from([0xff, 0xfe]) : Buffer.from([0xfe, 0xff]);
+    return Buffer.concat([bom, body]);
 }
 
 export function createUtf16DecodeTransform(encoding: Utf16BomEncoding): Transform {

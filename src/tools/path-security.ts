@@ -2,10 +2,18 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { configManager } from '../config-manager.js';
+import { CONFIG_FILE } from '../config.js';
 import { withTimeout } from '../utils/withTimeout.js';
-import { pathContainsManagedTrashSegment } from '../utils/trash-contract.js';
+import {
+  MANAGED_TRASH_WORKSPACE_REGISTRY_FILE_NAME, MANAGED_TRASH_WORKSPACE_REGISTRY_TEMP_PREFIX,
+  pathContainsManagedTrashSegment,
+} from '../utils/trash-contract.js';
 
 export const PATH_VALIDATION_TIMEOUT_MS = 10_000;
+const MANAGED_TRASH_CONTROL_DIRECTORY = path.dirname(CONFIG_FILE);
+const MANAGED_TRASH_WORKSPACE_REGISTRY_FILE = path.join(
+  MANAGED_TRASH_CONTROL_DIRECTORY, MANAGED_TRASH_WORKSPACE_REGISTRY_FILE_NAME,
+);
 
 export async function getAllowedDirs(): Promise<string[]> {
   try {
@@ -34,6 +42,39 @@ function expandHome(filePath: string): string {
 function normalizePath(value: string): string {
   const normalized = path.normalize(expandHome(value));
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function isManagedTrashControlPath(value: string): boolean {
+  const candidate = path.resolve(expandHome(value));
+  if (normalizePath(path.dirname(candidate)) !== normalizePath(MANAGED_TRASH_CONTROL_DIRECTORY)) return false;
+  const basename = path.basename(candidate);
+  const exact = process.platform === 'win32'
+    ? basename.toLowerCase() === MANAGED_TRASH_WORKSPACE_REGISTRY_FILE_NAME.toLowerCase()
+    : basename === MANAGED_TRASH_WORKSPACE_REGISTRY_FILE_NAME;
+  const tempPrefix = process.platform === 'win32'
+    ? basename.toLowerCase().startsWith(MANAGED_TRASH_WORKSPACE_REGISTRY_TEMP_PREFIX.toLowerCase())
+    : basename.startsWith(MANAGED_TRASH_WORKSPACE_REGISTRY_TEMP_PREFIX);
+  return exact || tempPrefix;
+}
+
+async function isManagedTrashControlIdentity(value: string): Promise<boolean> {
+  let candidate: Awaited<ReturnType<typeof fs.lstat>>;
+  try {
+    candidate = await fs.lstat(value);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
+    throw error;
+  }
+  if (!candidate.isFile() || candidate.isSymbolicLink() || candidate.nlink <= 1) return false;
+  let registry: Awaited<ReturnType<typeof fs.lstat>>;
+  try {
+    registry = await fs.lstat(MANAGED_TRASH_WORKSPACE_REGISTRY_FILE);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
+    throw error;
+  }
+  return registry.isFile() && !registry.isSymbolicLink()
+    && candidate.dev === registry.dev && candidate.ino === registry.ino;
 }
 
 function isWithin(root: string, candidate: string): boolean {
@@ -127,12 +168,18 @@ export async function validatePathAuthority(
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new Error('Path validation timeout must be a positive finite number.');
   }
+  if (isManagedTrashControlPath(requestedPath)) {
+    throw new Error('Managed trash registry metadata is reserved for trash_action.');
+  }
   if (pathContainsManagedTrashSegment(requestedPath)) {
     throw new Error('Managed trash storage is reserved for trash_action.');
   }
   const effectiveTimeoutMs = Math.max(1, Math.min(PATH_VALIDATION_TIMEOUT_MS, Math.floor(timeoutMs)));
   const operation = async (): Promise<string> => {
     const canonicalPath = await resolveCanonicalPath(requestedPath);
+    if (isManagedTrashControlPath(canonicalPath) || await isManagedTrashControlIdentity(canonicalPath)) {
+      throw new Error('Managed trash registry metadata is reserved for trash_action.');
+    }
     if (pathContainsManagedTrashSegment(canonicalPath)) {
       throw new Error('Managed trash storage is reserved for trash_action.');
     }

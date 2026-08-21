@@ -4,17 +4,17 @@
  * Blocking script to update device status to offline
  * Runs synchronously during shutdown to ensure DB update completes
  * 
- * Usage: node blocking-offline-update.js <deviceId> <supabaseUrl> <supabaseKey> <accessToken> <refreshToken> <sessionGeneration>
+ * Usage: node blocking-offline-update.js <deviceId> <supabaseUrl> <supabaseKey> <accessToken> <refreshToken>
  */
 
 import { createClient } from '@supabase/supabase-js';
 
 // Parse command line arguments
-const [deviceId, supabaseUrl, supabaseKey, accessToken, refreshToken, sessionGeneration] = process.argv.slice(2);
+const [deviceId, supabaseUrl, supabaseKey, accessToken, refreshToken] = process.argv.slice(2);
 
-if (!deviceId || !supabaseUrl || !supabaseKey || !accessToken || !refreshToken || !sessionGeneration) {
+if (!deviceId || !supabaseUrl || !supabaseKey || !accessToken || !refreshToken) {
     console.error('❌ Missing required arguments');
-    console.error('Usage: node blocking-offline-update.js <deviceId> <supabaseUrl> <supabaseKey> <accessToken> <refreshToken> <sessionGeneration>');
+    console.error('Usage: node blocking-offline-update.js <deviceId> <supabaseUrl> <supabaseKey> <accessToken> <refreshToken>');
     process.exit(1);
 }
 
@@ -44,24 +44,16 @@ try {
     // Update device status to offline, stamping the exact shutdown moment so
     // "last seen X ago" is precise for clean shutdowns (the periodic
     // bookkeeping write only runs on the slow capable cadence).
-    const { data, error } = await client
+    const { error } = await client
         .from('mcp_devices')
         .update({ status: 'offline', last_seen: new Date().toISOString() })
-        .contains('capabilities', { device_session_v1: { generation: sessionGeneration } })
-        .eq('id', deviceId)
-        .select('id')
-        .maybeSingle();
+        .eq('id', deviceId);
 
     clearTimeout(timeoutHandle);
 
     if (error) {
         console.error('❌ DB update error:', error.message);
         process.exit(4); // Exit code 4 for DB error
-    }
-
-    if (!data) {
-        console.log('✓ Offline write skipped: device session was superseded');
-        process.exit(0);
     }
 
     console.log('✓ Device marked as offline');

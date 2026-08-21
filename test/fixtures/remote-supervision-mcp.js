@@ -7,6 +7,10 @@ const server = new Server(
   { capabilities: { tools: {} } },
 );
 
+if (process.env.DC_TEST_STDERR_SENTINEL) {
+  process.stderr.write(`${process.env.DC_TEST_STDERR_SENTINEL}\n`);
+}
+
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     { name: 'ping', description: 'Return fixture pid', inputSchema: { type: 'object', properties: {} } },

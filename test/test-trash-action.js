@@ -59,7 +59,7 @@ async function main() {
   await commitBaseline(root);
   await commitBaseline(rootB);
   const originalConfig = await configManager.getConfig();
-  const originalTrashRegistry = originalConfig.trashWorkspaceRootsV1;
+  const trashRegistryFile = path.join(os.homedir(), '.claude-server-commander', 'trash-workspaces-v1.json');
   await configManager.setValue('allowedDirectories', [root, rootB, outside]);
 
   try {
@@ -264,21 +264,27 @@ async function main() {
 
     let registered = false;
     for (let attempt = 0; attempt < 20; attempt += 1) {
-      const roots = await configManager.getValue('trashWorkspaceRootsV1');
-      if (Array.isArray(roots) && roots.some((value) => path.resolve(value) === path.resolve(root))) {
-        registered = true;
-        break;
-      }
+      try {
+        const registry = JSON.parse(await fs.readFile(trashRegistryFile, 'utf8'));
+        if (Array.isArray(registry.roots) && registry.roots.some((value) => path.resolve(value) === path.resolve(root))) {
+          registered = true;
+          break;
+        }
+      } catch {}
       await sleep(25);
     }
-    assert.equal(registered, true, 'trash workspace registry was not persisted in memory');
+    assert.equal(registered, true, 'trash workspace registry was not persisted to the authoritative registry file');
+
+    const pendingOrphan = path.join(storage, 'entries', `.pending-tr_${'a'.repeat(32)}`);
+    await fs.mkdir(pendingOrphan, { recursive: false });
 
     const restartedManager = new TrashManager();
     await restartedManager.start();
-    for (let attempt = 0; attempt < 40 && await exists(expiredEntry); attempt += 1) {
+    for (let attempt = 0; attempt < 40 && (await exists(expiredEntry) || await exists(pendingOrphan)); attempt += 1) {
       await sleep(50);
     }
     assert.equal(await exists(expiredEntry), false, 'cold-start autonomous sweep did not purge expired entry');
+    assert.equal(await exists(pendingOrphan), false, 'cold-start autonomous sweep did not purge abandoned pending entry');
     assert.equal(await fs.readFile(outsideSecret, 'utf8'), 'TOP SECRET');
 
     const invalidHandler = await handleTrashAction({ action: 'restore', workspace: root });
@@ -294,7 +300,6 @@ async function main() {
   } finally {
     try {
       await configManager.updateConfig(originalConfig);
-      await configManager.setValue('trashWorkspaceRootsV1', originalTrashRegistry);
     } catch {
       // Test cleanup is best-effort; isolated suite homes are removed by the runner.
     }

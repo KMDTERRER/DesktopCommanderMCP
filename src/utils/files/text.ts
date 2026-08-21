@@ -17,7 +17,7 @@ import fs from "fs/promises";
 import path from "path";
 import { createReadStream } from 'fs';
 import { createInterface } from 'readline';
-import { createUtf16DecodeTransform, detectUtf16BomFile, type Utf16BomEncoding } from './text-encoding.js';
+import { createUtf16DecodeTransform, detectUtf16BomFile, encodeTextBuffer, type Utf16BomEncoding } from './text-encoding.js';
 import {
     MAX_TEXT_LINE_BYTES,
     MAX_TEXT_READ_OUTPUT_BYTES,
@@ -133,8 +133,9 @@ export class TextFileHandler implements FileHandler {
     async write(
         path: string, content: string, mode: 'rewrite' | 'append' = 'rewrite', options?: WriteOptions,
     ): Promise<void> {
-        await fs.writeFile(path, content, {
-            encoding: 'utf8',
+        const encoding = options?.textEncoding ?? 'utf8';
+        const bytes = encodeTextBuffer(content, encoding, mode !== 'append');
+        await fs.writeFile(path, bytes, {
             flag: mode === 'append' ? 'a' : 'w',
             signal: options?.signal,
             flush: true,
@@ -360,11 +361,13 @@ export class TextFileHandler implements FileHandler {
             if (fileSize < FILE_SIZE_LIMITS.LARGE_FILE_THRESHOLD || offset === 0) {
                 return await this.readFromStartWithReadline(filePath, offset, length, mimeType, includeStatusMessage, totalLines, signal, maxOutputBytes);
             } else {
-                if (offset > READ_PERFORMANCE_THRESHOLDS.DEEP_OFFSET_THRESHOLD) {
-                    return await this.readFromEstimatedPosition(filePath, offset, length, mimeType, includeStatusMessage, totalLines, signal, maxOutputBytes);
-                } else {
-                    return await this.readFromStartWithReadline(filePath, offset, length, mimeType, includeStatusMessage, totalLines, signal, maxOutputBytes);
-                }
+                // A line offset is an exact API contract. Byte-position estimation can
+                // only approximate the target when line lengths vary, which can return
+                // a completely different line. Keep the bounded streaming scan until
+                // we have an exact persisted/checkpointed line index.
+                return await this.readFromStartWithReadline(
+                    filePath, offset, length, mimeType, includeStatusMessage, totalLines, signal, maxOutputBytes
+                );
             }
         }
     }
@@ -385,12 +388,14 @@ export class TextFileHandler implements FileHandler {
         try {
             const stats = await fd.stat();
             const fileSize = stats.size;
-
             let position = fileSize;
-            let lines: string[] = [];
-            let partialLine = '';
+            let lineBreakCount = 0;
+            let endsWithLineBreak = false;
+            let firstChunk = true;
+            let followingByte: number | undefined;
+            const reverseChunks: Buffer[] = [];
 
-            while (position > 0 && lines.length < n) {
+            while (position > 0) {
                 if (signal?.aborted) {
                     const err = new Error('Read aborted') as NodeJS.ErrnoException;
                     err.code = 'ABORT_ERR';
@@ -398,32 +403,62 @@ export class TextFileHandler implements FileHandler {
                 }
                 const readSize = Math.min(READ_PERFORMANCE_THRESHOLDS.CHUNK_SIZE, position);
                 position -= readSize;
-
-                const buffer = Buffer.alloc(readSize);
-                await fd.read(buffer, 0, readSize, position);
-
-                const chunk = buffer.toString('utf-8');
-                const text = chunk + partialLine;
-                const chunkLines = text.split('\n');
-
-                partialLine = chunkLines.shift() || '';
-                const partialBytes = Buffer.byteLength(partialLine, 'utf8');
-                const lineLimit = Math.min(MAX_TEXT_LINE_BYTES, maxOutputBytes);
-                if (partialBytes > lineLimit) throw resourceLimitError('Text line', lineLimit, partialBytes);
-                lines = chunkLines.concat(lines);
+                const buffer = Buffer.allocUnsafe(readSize);
+                const { bytesRead } = await fd.read(buffer, 0, readSize, position);
+                const chunk = buffer.subarray(0, bytesRead);
+                if (firstChunk) {
+                    const last = chunk[chunk.length - 1];
+                    endsWithLineBreak = last === 0x0a || last === 0x0d;
+                    firstChunk = false;
+                }
+                for (let i = 0; i < chunk.length; i++) {
+                    const byte = chunk[i];
+                    if (byte === 0x0a) lineBreakCount++;
+                    else if (byte === 0x0d) {
+                        const next = i + 1 < chunk.length ? chunk[i + 1] : followingByte;
+                        if (next !== 0x0a) lineBreakCount++;
+                    }
+                }
+                reverseChunks.push(chunk);
+                followingByte = chunk[0];
+                const requiredBoundaries = n + (endsWithLineBreak ? 1 : 0);
+                if (lineBreakCount >= requiredBoundaries) break;
             }
 
-            if (position === 0 && partialLine) {
-                lines.unshift(partialLine);
+            const collected = Buffer.concat(reverseChunks.reverse());
+            let end = collected.length;
+            if (end > 0 && collected[end - 1] === 0x0a) {
+                end -= 1;
+                if (end > 0 && collected[end - 1] === 0x0d) end -= 1;
+            } else if (end > 0 && collected[end - 1] === 0x0d) {
+                end -= 1;
             }
+            let start = end;
+            let boundaries = n;
+            while (start > 0 && boundaries > 0) {
+                start -= 1;
+                const byte = collected[start];
+                if (byte === 0x0a) boundaries -= 1;
+                else if (byte === 0x0d && collected[start + 1] !== 0x0a) boundaries -= 1;
+            }
+            if (boundaries === 0) start += 1;
+            else start = 0;
 
-            const result = lines.slice(-n);
+            const selectedBytes = collected.subarray(start, end);
+            const decoded = selectedBytes.toString('utf8');
+            const result = selectedBytes.length === 0 && fileSize > 0
+                ? ['']
+                : decoded.split(/\r\n|\n|\r/);
+            const lineLimit = Math.min(MAX_TEXT_LINE_BYTES, maxOutputBytes);
             let resultBytes = 0;
-            for (const line of result) resultBytes = addLineResultBytes(resultBytes, line, maxOutputBytes);
+            for (const line of result) {
+                const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
+                if (lineBytes > lineLimit) throw resourceLimitError('Text line', lineLimit, lineBytes);
+                resultBytes = addLineResultBytes(resultBytes, line, maxOutputBytes);
+            }
             const content = includeStatusMessage
                 ? `${this.generateEnhancedStatusMessage(result.length, -n, fileTotalLines, true)}\n\n${result.join('\n')}`
                 : result.join('\n');
-
             return { content, mimeType, metadata: {} };
         } finally {
             await fd.close();

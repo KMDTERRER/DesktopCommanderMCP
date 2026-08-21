@@ -119,6 +119,9 @@ async function runServerPassthroughProbe(root) {
         if (error) reject(error); else resolve(value);
       };
       const send = (message) => child.stdin.write(JSON.stringify(message) + '\n');
+      let canonicalDiscoveryResult;
+      let aliasDiscoveryResult;
+      let aliasValidationMessage;
       let readResult;
       let writeResult;
       let baseWriteResult;
@@ -134,6 +137,24 @@ async function runServerPassthroughProbe(root) {
           try { message = JSON.parse(line); } catch { continue; }
           if (message.id === 1) {
             send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+            send({
+              jsonrpc: '2.0', id: 20, method: 'tools/call',
+              params: { name: 'read_file', arguments: { path: 'mcp://servers' } },
+            });
+          } else if (message.id === 20) {
+            canonicalDiscoveryResult = message.result;
+            send({
+              jsonrpc: '2.0', id: 21, method: 'tools/call',
+              params: { name: 'read_file', arguments: { path: 'mcp://servers/discovery' } },
+            });
+          } else if (message.id === 21) {
+            aliasDiscoveryResult = message.result;
+            send({
+              jsonrpc: '2.0', id: 22, method: 'tools/call',
+              params: { name: 'file_get', arguments: {} },
+            });
+          } else if (message.id === 22) {
+            aliasValidationMessage = message;
             send({
               jsonrpc: '2.0',
               id: 2,
@@ -182,7 +203,7 @@ async function runServerPassthroughProbe(root) {
               },
             });
           } else if (message.id === 5) {
-            finish({ readResult, writeResult, baseWriteResult, baseReadResult: message.result });
+            finish({ canonicalDiscoveryResult, aliasDiscoveryResult, aliasValidationMessage, readResult, writeResult, baseWriteResult, baseReadResult: message.result });
           }
         }
       });
@@ -196,6 +217,19 @@ async function runServerPassthroughProbe(root) {
         params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'routing-probe', version: '1.0.0' } },
       });
     });
+    const canonicalDiscoveryText = (result?.canonicalDiscoveryResult?.content ?? []).map((item) => item?.text ?? '').join('\n');
+    const aliasDiscoveryText = (result?.aliasDiscoveryResult?.content ?? []).map((item) => item?.text ?? '').join('\n');
+    const canonicalDiscovery = JSON.parse(canonicalDiscoveryText);
+    const aliasDiscovery = JSON.parse(aliasDiscoveryText);
+    assert.deepEqual(aliasDiscovery.servers, canonicalDiscovery.servers, 'second-turn discovery alias returned a different server catalog');
+    assert(aliasDiscovery.servers.includes('desktop-core'), 'second-turn discovery alias returned an empty or invalid catalog');
+    assert.equal(aliasDiscovery.server, undefined, 'discovery alias was misrouted as an external server named servers');
+    assert.equal(result?.aliasValidationMessage?.error, undefined,
+      `registered wrapper validation escaped as JSON-RPC/MCP server error: ${JSON.stringify(result?.aliasValidationMessage?.error)}`);
+    assert.equal(result?.aliasValidationMessage?.result?.isError, true,
+      'registered wrapper validation was not marked as a native tool error');
+    assert.match(result?.aliasValidationMessage?.result?.content?.[0]?.text ?? '', /^Error:/,
+      'registered wrapper validation lost the original tool error content shape');
     const readText = (result?.readResult?.content ?? []).map((item) => item?.text ?? '').join('\n');
     assert(readText.includes('workspace_snapshot'), 'frozen wrapper defaults must not break mcp:// read_file discovery');
     const text = (result?.writeResult?.content ?? []).map((item) => item?.text ?? '').join('\n');
@@ -237,6 +271,11 @@ async function main() {
   assert.deepEqual(
     parseExternalMcpCompatUri('MCP://server/tool?timeout_ms=5000'),
     { server: 'server', tool: 'tool', timeout_ms: 5000 },
+  );
+  assert.deepEqual(parseExternalMcpCompatUri('mcp://servers/discovery'), {});
+  assert.deepEqual(
+    parseExternalMcpCompatUri('mcp://servers/discovery?timeout_ms=5000'),
+    { timeout_ms: 5000 },
   );
   assert.throws(() => parseExternalMcpCompatUri('mcp://server/tool?timeout_ms=1&timeout_ms=2'), /only once/);
   assert.throws(() => parseExternalMcpCompatUri('mcp://server/tool?envelope=other'), /flat or legacy/);
@@ -431,6 +470,11 @@ async function handle(message) {
   if (message.method === 'ping') { send(message.id, {}); return; }
   if (message.method === 'tools/list') {
     if (process.env.DC_LIST_TOOLS_FILE) fs.appendFileSync(process.env.DC_LIST_TOOLS_FILE, 'list\\n');
+    if (process.env.DC_MALFORMED_TOOLS_FILE && fs.existsSync(process.env.DC_MALFORMED_TOOLS_FILE)) {
+      fs.rmSync(process.env.DC_MALFORMED_TOOLS_FILE, { force: true });
+      send(message.id, {});
+      return;
+    }
     const triggerDuringList = !message.params?.cursor && process.env.DC_LIST_CHANGE_DURING_LIST_FILE && fs.existsSync(process.env.DC_LIST_CHANGE_DURING_LIST_FILE);
     const responseGeneration = listGeneration;
     if (triggerDuringList) {
@@ -455,7 +499,7 @@ async function handle(message) {
       name: 'echo',
       title: 'Echo Full Metadata',
       description: 'Echo arguments with full MCP metadata. generation=' + responseGeneration,
-      inputSchema: { type: 'object', properties: { value: { type: 'string' }, delay_ms: { type: 'number' }, change_tools: { type: 'boolean' }, huge_bytes: { type: 'number' }, disconnect_once: { type: 'boolean' } }, additionalProperties: false },
+      inputSchema: { type: 'object', properties: { value: { type: 'string' }, delay_ms: { type: 'number' }, change_tools: { type: 'boolean' }, huge_bytes: { type: 'number' }, disconnect_once: { type: 'boolean' }, return_error: { type: 'boolean' } }, additionalProperties: false },
       outputSchema: { type: 'object', properties: { echoed: { type: 'object' } }, required: ['echoed'] },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       execution: { taskSupport: 'forbidden' },
@@ -483,6 +527,14 @@ async function handle(message) {
     }
     if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
     const echoed = message.params?.arguments || {};
+    if (echoed.return_error) {
+      send(message.id, {
+        content: [{ type: 'text', text: 'downstream failure without wrapper prefix' }],
+        isError: true,
+        _meta: { 'x-downstream-error': true }
+      });
+      return;
+    }
     const hugeBytes = Number(echoed.huge_bytes || 0);
     const responseText = hugeBytes > 0 ? 'x'.repeat(hugeBytes) : JSON.stringify(echoed);
     send(message.id, {
@@ -521,13 +573,6 @@ process.stdin.on('end', () => process.exit(0));
           lifecycle: 'keep-alive',
           allowedTools: ['echo', 'echo_two', 'get_symbols_overview'],
         },
-        'serena-test': {
-          command: process.execPath,
-          args: [fakeServer, 'start-mcp-server', '--project', isolated],
-          protocolVersion: 'legacy',
-          lifecycle: 'keep-alive',
-          allowedTools: ['echo', 'echo_two', 'get_symbols_overview'],
-        },
       },
     });
     await fs.writeFile(configPath, JSON.stringify(configFor('fake-a'), null, 2), 'utf8');
@@ -536,12 +581,11 @@ process.stdin.on('end', () => process.exit(0));
     await fs.writeFile(childScript, `
 import assert from 'node:assert';
 import fs from 'node:fs/promises';
-import { listExternalMcpTools, callExternalMcpTool, callExternalMcpCompatUri, readExternalMcpCompatUri, callSerenaWorkspaceTool, callSessionSerenaTool, callSessionSerenaReadBatch, closeExternalMcpRuntime } from ${JSON.stringify(externalMcpUrl)};
+import { listExternalMcpTools, callExternalMcpTool, callExternalMcpCompatUri, readExternalMcpCompatUri, closeExternalMcpRuntime } from ${JSON.stringify(externalMcpUrl)};
 const configPath = process.env.DESKTOP_COMMANDER_MCP_CONFIG;
 const fakeServer = process.env.DC_FAKE_SERVER;
 const configFor = (name) => ({ mcpServers: {
   [name]: { command: process.execPath, args: [fakeServer], protocolVersion: 'legacy', lifecycle: 'keep-alive', allowedTools: ['echo', 'echo_two', 'get_symbols_overview'] },
-  'serena-test': { command: process.execPath, args: [fakeServer, 'start-mcp-server', '--project', process.env.DC_SERENA_ROOT], protocolVersion: 'legacy', lifecycle: 'keep-alive', allowedTools: ['echo', 'echo_two', 'get_symbols_overview'] }
 } });
 const roots = await Promise.all(Array.from({ length: 6 }, () => listExternalMcpTools({ timeout_ms: 5000 })));
 for (const result of roots) {
@@ -570,6 +614,20 @@ const trustedExact = JSON.parse((await listExternalMcpTools({ server: 'fake-a', 
 assert.equal(trustedExact.tool.preferredFrozenSurface, 'read_file');
 const trustedRead = await readExternalMcpCompatUri('mcp://fake-a/echo?timeout_ms=5000', { value: 'trusted-read-route' });
 assert.equal(trustedRead.structuredContent.echoed.value, 'trusted-read-route');
+const directError = await callExternalMcpTool({ server: 'fake-a', tool: 'echo', arguments: { return_error: true }, timeout_ms: 5000 });
+assert.equal(directError.isError, true);
+assert.equal(directError.content[0].text, 'downstream failure without wrapper prefix');
+assert.equal(directError._meta['x-downstream-error'], true, 'direct mcp_call_tool path did not preserve downstream error metadata');
+const frozenReadError = await readExternalMcpCompatUri('mcp://fake-a/echo?timeout_ms=5000', { return_error: true });
+assert.equal(frozenReadError.isError, true);
+assert.equal(frozenReadError.content[0].text, 'Error: downstream failure without wrapper prefix');
+assert.equal(frozenReadError._meta, undefined, 'read_file compatibility returned a downstream-specific error extension');
+const frozenWriteError = await callExternalMcpCompatUri(
+  'mcp://fake-a/echo?timeout_ms=5000', JSON.stringify({ return_error: true }),
+);
+assert.equal(frozenWriteError.isError, true);
+assert.equal(frozenWriteError.content[0].text, 'Error: downstream failure without wrapper prefix');
+assert.equal(frozenWriteError._meta, undefined, 'write_file compatibility returned a downstream-specific error extension');
 await fs.rm(process.env.DC_DISCONNECT_ONCE_FILE, { force: true });
 const recoveredRead = await readExternalMcpCompatUri('mcp://fake-a/echo?timeout_ms=5000', { value: 'recovered-read-route', disconnect_once: true });
 assert.equal(recoveredRead.structuredContent.echoed.value, 'recovered-read-route');
@@ -596,96 +654,22 @@ assert(refreshed.tools.some((tool) => tool.name === 'echo'));
 const refreshedListCalls = (await fs.readFile(process.env.DC_LIST_TOOLS_FILE, 'utf8')).trim().split(/\\r?\\n/).filter(Boolean);
 assert.equal(refreshedListCalls.length, cachedListCalls.length + 2, 'tools/list_changed should invalidate both paginated cache pages');
 
+await fs.writeFile(process.env.DC_MALFORMED_TOOLS_FILE, 'armed', 'utf8');
+await callExternalMcpTool({ server: 'fake-a', tool: 'echo', arguments: { value: 'invalidate-before-malformed-list', change_tools: true }, timeout_ms: 5000 });
+await assert.rejects(
+  () => listExternalMcpTools({ server: 'fake-a', timeout_ms: 5000 }),
+  /Invalid result for tools\\/list/,
+  'a malformed tools/list response must not be converted to a successful tools=[] catalog',
+);
+const recoveredAfterMalformed = JSON.parse((await listExternalMcpTools({ server: 'fake-a', timeout_ms: 5000 })).content[0].text);
+assert(recoveredAfterMalformed.tools.some((tool) => tool.name === 'echo'), 'tool discovery did not recover after rejecting a malformed empty envelope');
+
 await fs.writeFile(process.env.DC_LIST_CHANGE_DURING_LIST_FILE, 'armed', 'utf8');
 await callExternalMcpTool({ server: 'fake-a', tool: 'echo', arguments: { value: 'pre-list-race', change_tools: true }, timeout_ms: 5000 });
 await listExternalMcpTools({ server: 'fake-a', timeout_ms: 5000 });
 const afterListRace = JSON.parse((await listExternalMcpTools({ server: 'fake-a', timeout_ms: 5000 })).content[0].text);
 const racedEcho = afterListRace.tools.find((tool) => tool.name === 'echo');
 assert(racedEcho?.description?.includes('generation=1'), 'tools/list_changed during discovery allowed a stale cache generation');
-
-const fixedSerenaTools = JSON.parse((await listExternalMcpTools({ server: 'serena-test', timeout_ms: 5000 })).content[0].text);
-assert(!fixedSerenaTools.tools.some((tool) => tool.name === 'search_for_pattern'), 'fixed Serena template unexpectedly gained session-only search_for_pattern');
-const cacheProbePath = process.env.DC_SERENA_ROOT + '/cache-probe.ts';
-await fs.writeFile(cacheProbePath, 'export const generation = 1;\\n', 'utf8');
-const workspaceSession = 'session_test_123';
-const boundSerena = await callSerenaWorkspaceTool({ operation: 'bind', root: process.env.DC_SERENA_ROOT, session: workspaceSession, templateServer: 'serena-test' }, 5000);
-assert.equal(boundSerena.workspaceSession, workspaceSession);
-const patternRead = JSON.parse((await callExternalMcpCompatUri(
-  'mcp://desktop-context/serena_call?timeout_ms=5000',
-  JSON.stringify({ tool: 'search_for_pattern', arguments: { substring_pattern: 'generation' }, session: workspaceSession }),
-)).content[0].text);
-assert.equal(patternRead.status, 'ready');
-assert.equal(patternRead.result.structuredContent.echoed.substring_pattern, 'generation');
-const sessionSerenaTools = JSON.parse((await listExternalMcpTools({ server: boundSerena.server, timeout_ms: 5000 })).content[0].text);
-assert(sessionSerenaTools.tools.some((tool) => tool.name === 'search_for_pattern'), 'warmed session Serena did not expose search_for_pattern through mcp://');
-const localReadArgs = { relative_path: 'cache-probe.ts', value: 'session-read' };
-const originalSerenaCacheReadFile = fs.readFile;
-let cacheProbeReads = 0;
-fs.readFile = async (...args) => {
-  if (String(args[0]) === cacheProbePath) {
-    cacheProbeReads++;
-    if (cacheProbeReads === 2) await new Promise((resolve) => setTimeout(resolve, 1200));
-  }
-  return originalSerenaCacheReadFile(...args);
-};
-const sessionReadStartedAt = Date.now();
-let sessionRead;
-try {
-  sessionRead = await callSessionSerenaTool({ tool: 'get_symbols_overview', arguments: localReadArgs, session: workspaceSession }, 5000);
-} finally {
-  fs.readFile = originalSerenaCacheReadFile;
-}
-assert(Date.now() - sessionReadStartedAt < 900, 'completed Serena read waited for post-result cache hashing');
-assert.equal(sessionRead.status, 'ready');
-assert.equal(sessionRead.result.structuredContent.echoed.value, 'session-read');
-await new Promise((resolve) => setTimeout(resolve, 1300));
-const sessionCached = await callSessionSerenaTool({ tool: 'get_symbols_overview', arguments: localReadArgs, session: workspaceSession }, 5000);
-assert.equal(sessionCached.cached, true, 'unchanged file-local Serena read was not reused');
-await fs.writeFile(cacheProbePath, 'export const generation = 2;\\n', 'utf8');
-const invalidatedRead = await callSessionSerenaTool({ tool: 'get_symbols_overview', arguments: localReadArgs, session: workspaceSession }, 5000);
-assert.equal(invalidatedRead.cached, false, 'file-local Serena cache survived a content hash change');
-const genericRead = await callSessionSerenaTool({ tool: 'echo', arguments: { value: 'global-read' }, session: workspaceSession }, 5000);
-const genericRepeat = await callSessionSerenaTool({ tool: 'echo', arguments: { value: 'global-read' }, session: workspaceSession }, 5000);
-assert.equal(genericRead.cached, false);
-assert.equal(genericRepeat.cached, false, 'workspace-dependent read without a file dependency was memoized unsafely');
-
-const readBatch = await callSessionSerenaReadBatch({
-  session: workspaceSession,
-  concurrency: 2,
-  calls: [
-    { tool: 'echo', arguments: { value: 'batch-a' } },
-    { tool: 'get_symbols_overview', arguments: { relative_path: 'cache-probe.ts', value: 'batch-b' } },
-  ],
-}, 5000);
-assert.equal(readBatch.status, 'ready');
-assert.equal(readBatch.results.length, 2);
-assert.equal(readBatch.results[0].tool, 'echo');
-assert.equal(readBatch.results[0].result.structuredContent.echoed.value, 'batch-a');
-assert.equal(readBatch.results[1].tool, 'get_symbols_overview');
-assert.equal(readBatch.results[1].result.structuredContent.echoed.value, 'batch-b');
-await assert.rejects(
-  () => callSessionSerenaReadBatch({
-    session: workspaceSession, calls: [{ tool: 'echo_two', arguments: { value: 'must-reject' } }],
-  }, 5000),
-  /read-only tool/,
-);
-
-const coldSession = 'session_cold_123';
-await callSerenaWorkspaceTool({ operation: 'bind', root: process.env.DC_SERENA_ROOT, session: coldSession, templateServer: 'serena-test' }, 5000);
-await fs.rm(process.env.DC_CALL_STARTED_FILE, { force: true });
-const coldStartedAt = Date.now();
-const coldArgs = { relative_path: 'cache-probe.ts', value: 'cold-session', delay_ms: 16000 };
-const coldResult = await callSessionSerenaTool({ tool: 'get_symbols_overview', arguments: coldArgs, session: coldSession }, 20000);
-assert.equal(coldResult.status, 'cold_start');
-assert(Date.now() - coldStartedAt >= 14000, 'cold-start status returned before the 15s reporting window');
-await new Promise((resolve) => setTimeout(resolve, 1800));
-const warmedResult = await callSessionSerenaTool({ tool: 'get_symbols_overview', arguments: coldArgs, session: coldSession }, 5000);
-assert.equal(warmedResult.status, 'ready');
-assert.equal(warmedResult.cached, true, 'completed cold-start read was not reused from session cache');
-const coldMarkers = (await fs.readFile(process.env.DC_CALL_STARTED_FILE, 'utf8')).trim().split(/\\r?\\n/).filter((line) => line === 'cold-session');
-assert.equal(coldMarkers.length, 1, 'cold-start retry re-executed the detached read');
-await callSerenaWorkspaceTool({ operation: 'release', session: coldSession }, 5000);
-await callSerenaWorkspaceTool({ operation: 'release', session: workspaceSession }, 5000);
 
 const call = await callExternalMcpTool({ server: 'fake-a', tool: 'echo', arguments: { value: 'ok' }, timeout_ms: 5000 });
 assert.deepEqual(call.structuredContent, { echoed: { value: 'ok' } });
@@ -797,10 +781,10 @@ console.log('isolated external MCP routing: PASS');
       USERPROFILE: isolated,
       DESKTOP_COMMANDER_MCP_CONFIG: configPath,
       DC_FAKE_SERVER: fakeServer,
-      DC_SERENA_ROOT: isolated,
       DC_CALL_STARTED_FILE: path.join(isolated, 'call-started.txt'),
       DC_DISCONNECT_ONCE_FILE: path.join(isolated, 'disconnect-once.txt'),
       DC_LIST_TOOLS_FILE: path.join(isolated, 'list-tools.txt'),
+      DC_MALFORMED_TOOLS_FILE: path.join(isolated, 'malformed-tools.txt'),
       DC_LIST_CHANGE_DURING_LIST_FILE: path.join(isolated, 'list-change-during-list.txt'),
       MCPORTER_STDIO_PROBE_TIMEOUT_MS: '1000',
     }, 45000);

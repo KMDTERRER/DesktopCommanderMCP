@@ -15,9 +15,12 @@ import { processProblemEvidence } from '../utils/process-problem-matcher.js';
 import { runWithAbortableTimeout } from '../utils/withTimeout.js';
 import { OperationScope } from '../utils/operation-scope.js';
 import { KeyedSerializedOperationOwners } from '../utils/serialized-operation-owner.js';
-import { registerToolCallCancellationCleanup } from '../utils/client-context.js';
 import {
-  PROCESS_INITIAL_OUTPUT_MAX_CHARS, PROCESS_INTERACTION_DEFAULT_MS,
+  getToolCallContext, getToolCallSessionIdentity, registerToolCallCancellationCleanup,
+} from '../utils/client-context.js';
+import { randomUUID } from 'crypto';
+import {
+  PROCESS_INITIAL_OUTPUT_MAX_CHARS, PROCESS_INTERACTION_DEFAULT_MS, PROCESS_STRUCTURED_OUTPUT_MAX_CHARS,
   PROCESS_STALL_DEFAULT_MS, PROCESS_WAIT_DEFAULT_MS,
 } from '../utils/process-wait-contract.js';
 
@@ -27,7 +30,11 @@ const __dirname = path.dirname(__filename);
 const mcpRoot = path.resolve(__dirname, '..', '..');
 
 // Track virtual Node sessions (PIDs that are actually Node fallback sessions)
-const virtualNodeSessions = new Map<number, { timeout_ms: number }>();
+const virtualNodeSessions = new Map<number, {
+  timeout_ms: number;
+  terminalSessionId: string;
+  ownerSessionIdentity?: string;
+}>();
 let virtualPidCounter = -1000; // Use negative PIDs for virtual sessions
 const MAX_NODE_LOCAL_OUTPUT_BYTES = 2 * 1024 * 1024;
 const PROCESS_LOCAL_IO_TIMEOUT_MS = 5_000;
@@ -39,11 +46,48 @@ function processLocalIoTimeout(requestTimeoutMs: number): number {
 const processInteractionOwners = new KeyedSerializedOperationOwners<number>();
 const PIPE_PROMPT_SETTLE_MS = 150;
 
+function remoteTerminalAccessFailure(
+  pid: number,
+  terminalSessionId: string | undefined,
+  virtualSession?: { terminalSessionId: string; ownerSessionIdentity?: string },
+): ServerResult | null {
+  const context = getToolCallContext();
+  if (!context.isRemote) return null;
+  const ownerSessionIdentity = getToolCallSessionIdentity();
+  const authorized = virtualSession
+    ? Boolean(
+        (terminalSessionId && terminalSessionId === virtualSession.terminalSessionId)
+        || (ownerSessionIdentity && ownerSessionIdentity === virtualSession.ownerSessionIdentity)
+      )
+    : terminalManager.canAccessSession(pid, ownerSessionIdentity, terminalSessionId);
+  if (authorized) return null;
+  capture('server_terminal_session_access_denied', {
+    pid,
+    hasCallerIdentity: Boolean(ownerSessionIdentity),
+    hasTerminalSessionId: Boolean(terminalSessionId),
+  });
+  return {
+    content: [{
+      type: 'text',
+      text: `Error: Managed terminal session ${pid} is not available to this remote conversation. Use the terminal_session_id returned by start_process, or start a new process in this conversation.`,
+    }],
+    isError: true,
+  };
+}
+
 function compactInitialProcessOutput(value: string): { text: string; truncated: boolean; chars: number } {
   const chars = value.length;
   if (chars <= PROCESS_INITIAL_OUTPUT_MAX_CHARS) return { text: value, truncated: false, chars };
   const marker = `[Initial output truncated: ${chars - PROCESS_INITIAL_OUTPUT_MAX_CHARS} earlier characters omitted; use read_process_output for retained output]\n`;
   const tailChars = Math.max(0, PROCESS_INITIAL_OUTPUT_MAX_CHARS - marker.length);
+  return { text: `${marker}${value.slice(-tailChars)}`, truncated: true, chars };
+}
+
+function compactStructuredProcessOutput(value: string): { text: string; truncated: boolean; chars: number } {
+  const chars = value.length;
+  if (chars <= PROCESS_STRUCTURED_OUTPUT_MAX_CHARS) return { text: value, truncated: false, chars };
+  const marker = `[Structured terminal output truncated: ${chars - PROCESS_STRUCTURED_OUTPUT_MAX_CHARS} earlier characters omitted; use read_process_output with a narrower offset/length]\n`;
+  const tailChars = Math.max(0, PROCESS_STRUCTURED_OUTPUT_MAX_CHARS - marker.length);
   return { text: `${marker}${value.slice(-tailChars)}`, truncated: true, chars };
 }
 
@@ -198,6 +242,7 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
   const executable = parsed.data.executable;
   const directArgs = parsed.data.args ?? [];
   const executionKind = parsed.data.execution_kind;
+  const ownerSessionIdentity = getToolCallSessionIdentity();
   let resolvedCwd: string | undefined;
   if (parsed.data.cwd) {
     if (!path.isAbsolute(parsed.data.cwd)) {
@@ -222,11 +267,16 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
 
   if (commandToRun === 'node:local') {
     const virtualPid = virtualPidCounter--;
-    virtualNodeSessions.set(virtualPid, { timeout_ms: parsed.data.timeout_ms || PROCESS_WAIT_DEFAULT_MS });
+    const terminalSessionId = randomUUID();
+    virtualNodeSessions.set(virtualPid, {
+      timeout_ms: parsed.data.timeout_ms || PROCESS_WAIT_DEFAULT_MS,
+      terminalSessionId,
+      ownerSessionIdentity,
+    });
     registerToolCallCancellationCleanup(() => { virtualNodeSessions.delete(virtualPid); });
     return {
       content: [{ type: "text", text: `Node.js session started with PID ${virtualPid} (MCP server execution)\n\n🔄 Ready for self-contained code via interact_with_process.` }],
-      structuredContent: { pid: virtualPid, backend: 'node-local', executionKind: 'interactive', state: 'waiting_for_input' },
+      structuredContent: { pid: virtualPid, terminalSessionId, backend: 'node-local', executionKind: 'interactive', state: 'waiting_for_input' },
     };
   }
 
@@ -267,6 +317,7 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
     env: parsed.data.env,
     detectPrompts: executionKind === 'auto' || executionKind === 'interactive',
     executionKind,
+    ownerSessionIdentity,
     onSpawned: (pid: number) => {
       registerToolCallCancellationCleanup(async (cause) => {
         void await terminalManager.forceTerminate(
@@ -304,6 +355,7 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
   }
 
   const snapshot = terminalManager.readOutputPaginated(result.pid, -1, 1);
+  const terminalSessionId = terminalManager.getSessionBinding(result.pid)?.terminalSessionId;
   const backend = result.backend ?? snapshot?.backend ?? 'pipe';
   const shouldInterpretPrompt = executionKind === 'auto' || executionKind === 'interactive';
   const processState = shouldInterpretPrompt
@@ -341,6 +393,7 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
     }],
     structuredContent: {
       pid: result.pid,
+      terminalSessionId: terminalSessionId ?? null,
       backend,
       executionKind,
       launchMode: executable ? 'direct' : 'shell',
@@ -358,6 +411,7 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
       descendantPids: snapshot?.descendantPids ?? [],
       treeProbeWarning: snapshot?.treeProbeWarning ?? null,
       terminalError: terminalError ?? null,
+      initialOutput: initialOutput.text,
       initialOutputChars: initialOutput.chars,
       initialOutputTruncated: initialOutput.truncated,
       ...processProblemEvidence(result.output),
@@ -411,6 +465,7 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
 
   const { 
     pid, 
+    terminal_session_id,
     timeout_ms = PROCESS_WAIT_DEFAULT_MS,
     stall_timeout_ms = PROCESS_STALL_DEFAULT_MS,
     offset = 0,                    // 0 = from last read, positive = absolute, negative = tail
@@ -418,6 +473,11 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
     length = defaultLength,        // Default from config, same as file reading
     verbose_timing = false 
   } = parsed.data;
+
+  const accessFailure = remoteTerminalAccessFailure(pid, terminal_session_id);
+  if (accessFailure) return accessFailure;
+  const expectedTerminalSessionId = getToolCallContext().isRemote
+    ? terminalManager.getSessionBinding(pid)?.terminalSessionId : undefined;
 
   // Timing telemetry
   const startTime = Date.now();
@@ -460,6 +520,13 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
           // Completion may arrive through normal close or through the bounded
           // root-exit/tree reconciler when close is delayed/missing.
           const activeSession = terminalManager.getSession(pid);
+          if (
+            expectedTerminalSessionId
+            && terminalManager.getSessionBinding(pid)?.terminalSessionId !== expectedTerminalSessionId
+          ) {
+            resolveOnce();
+            return;
+          }
           if (!activeSession) {
             resolveOnce();
             return;
@@ -484,6 +551,11 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
     };
 
     await waitForOutput();
+  }
+
+  if (expectedTerminalSessionId) {
+    const reboundFailure = remoteTerminalAccessFailure(pid, expectedTerminalSessionId);
+    if (reboundFailure) return reboundFailure;
   }
 
   // Read output with pagination
@@ -573,6 +645,7 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
   }
 
   const responseText = output || '(No output in requested range)';
+  const structuredOutput = compactStructuredProcessOutput(output);
 
   return {
     content: [{
@@ -581,6 +654,10 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
     }],
     structuredContent: {
       pid,
+      terminalSessionId: terminalManager.getSessionBinding(pid)?.terminalSessionId ?? null,
+      output: structuredOutput.text,
+      outputChars: structuredOutput.chars,
+      outputTruncated: structuredOutput.truncated,
       backend: result.backend ?? 'pipe',
       state: result.isComplete ? 'completed'
         : result.treeState === 'descendants_running' ? 'root_exited_tree_running'
@@ -624,6 +701,7 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
 
   const {
     pid,
+    terminal_session_id,
     input,
     timeout_ms = PROCESS_INTERACTION_DEFAULT_MS,
     wait_for_prompt = true,
@@ -637,6 +715,8 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
   // Check if this is a virtual Node session (node:local)
   if (virtualNodeSessions.has(pid)) {
     const session = virtualNodeSessions.get(pid)!;
+    const accessFailure = remoteTerminalAccessFailure(pid, terminal_session_id, session);
+    if (accessFailure) return accessFailure;
     capture('server_interact_with_process_node_fallback', {
       pid: pid,
       inputLength: input.length
@@ -647,6 +727,11 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
     const effectiveTimeout = timeout_ms ?? session.timeout_ms;
     return executeNodeCode(input, effectiveTimeout);
   }
+
+  const accessFailure = remoteTerminalAccessFailure(pid, terminal_session_id);
+  if (accessFailure) return accessFailure;
+  const expectedTerminalSessionId = getToolCallContext().isRemote
+    ? terminalManager.getSessionBinding(pid)?.terminalSessionId : undefined;
 
   // Serialize the whole snapshot -> stdin -> response transaction for this PID.
   // Raw stdin writes are ordered, but without this lease concurrent callers share
@@ -674,12 +759,17 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
       inputLength: input.length
     });
 
+    if (expectedTerminalSessionId) {
+      const reboundFailure = remoteTerminalAccessFailure(pid, expectedTerminalSessionId);
+      if (reboundFailure) return reboundFailure;
+    }
+
     // Capture output snapshot BEFORE sending input
     // This handles REPLs where output is appended to the prompt line
     const outputSnapshot = terminalManager.captureOutputSnapshot(pid);
     const interactionBackend = terminalManager.getSession(pid)?.backend;
 
-    const success = terminalManager.sendInputToProcess(pid, input);
+    const success = terminalManager.sendInputToProcess(pid, input, expectedTerminalSessionId);
 
     if (!success) {
       const terminalState = terminalManager.readOutputPaginated(pid, -1, 1);
@@ -689,6 +779,7 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
         content: [{ type: "text", text: `Error: Failed to send input to process ${pid}. The process may have exited or doesn't accept input.${terminalDetail}` }],
         structuredContent: {
           pid,
+          terminalSessionId: terminalManager.getSessionBinding(pid)?.terminalSessionId ?? null,
           state: terminalState?.isComplete ? 'completed' : 'unavailable_for_input',
           exitCode: terminalState?.isComplete ? terminalState.exitCode ?? null : null,
           terminalError: terminalState?.terminalError ?? null,
@@ -720,6 +811,11 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
           type: "text",
           text: `✅ Input sent to process ${pid}. Use read_process_output to get the response.${timingMessage}`
         }],
+        structuredContent: {
+          pid,
+          terminalSessionId: terminalManager.getSessionBinding(pid)?.terminalSessionId ?? null,
+          state: 'input_sent',
+        },
       };
     }
 
@@ -755,6 +851,13 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
         // Fast-polling check - check every 50ms for quick responses
         interval = setInterval(() => {
           if (resolved) return;
+          if (
+            expectedTerminalSessionId
+            && terminalManager.getSessionBinding(pid)?.terminalSessionId !== expectedTerminalSessionId
+          ) {
+            resolveOnce();
+            return;
+          }
           if (!terminalManager.getSession(pid)) {
             // The active session may have moved to completed after writing its
             // final stderr/terminal-host bytes. Read that completed buffer before
@@ -866,6 +969,11 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
     
     await waitForResponse();
 
+    if (expectedTerminalSessionId) {
+      const reboundFailure = remoteTerminalAccessFailure(pid, expectedTerminalSessionId);
+      if (reboundFailure) return reboundFailure;
+    }
+
     // Clean and format output
     let cleanOutput = cleanProcessOutput(output, input);
     const timeoutReached = !earlyExit && !processFinished && !processState?.isFinished && !processState?.isWaitingForInput;
@@ -918,6 +1026,8 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
       timingMessage = formatTimingInfo(timingInfo);
     }
 
+    const structuredOutput = compactStructuredProcessOutput(cleanOutput);
+
     if (cleanOutput.trim().length === 0 && !timeoutReached) {
       return {
         content: [{
@@ -926,6 +1036,10 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
         }],
         structuredContent: {
           pid,
+          terminalSessionId: terminalManager.getSessionBinding(pid)?.terminalSessionId ?? null,
+          output: structuredOutput.text,
+          outputChars: structuredOutput.chars,
+          outputTruncated: structuredOutput.truncated,
           state: processFinished ? 'completed' : processState.isWaitingForInput ? 'waiting_for_input' : 'running',
           exitCode: completedExitCode ?? null,
           processSucceeded: processFinished && completedExitCode !== undefined
@@ -964,6 +1078,10 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
       }],
       structuredContent: {
         pid,
+        terminalSessionId: terminalManager.getSessionBinding(pid)?.terminalSessionId ?? null,
+        output: structuredOutput.text,
+        outputChars: structuredOutput.chars,
+        outputTruncated: structuredOutput.truncated,
         state: processFinished ? 'completed' : processState.isWaitingForInput ? 'waiting_for_input' : 'running',
         exitCode: completedExitCode ?? null,
         processSucceeded: processFinished && completedExitCode !== undefined
@@ -1000,10 +1118,12 @@ export async function forceTerminate(args: unknown): Promise<ServerResult> {
     };
   }
 
-  const pid = parsed.data.pid;
+  const { pid, terminal_session_id } = parsed.data;
 
   // Handle virtual Node.js sessions (node:local)
   if (virtualNodeSessions.has(pid)) {
+    const accessFailure = remoteTerminalAccessFailure(pid, terminal_session_id, virtualNodeSessions.get(pid));
+    if (accessFailure) return accessFailure;
     virtualNodeSessions.delete(pid);
     return {
       content: [{
@@ -1013,7 +1133,13 @@ export async function forceTerminate(args: unknown): Promise<ServerResult> {
     };
   }
 
-  const success = await terminalManager.forceTerminate(pid);
+
+  const accessFailure = remoteTerminalAccessFailure(pid, terminal_session_id);
+  if (accessFailure) return accessFailure;
+  const expectedTerminalSessionId = getToolCallContext().isRemote
+    ? terminalManager.getSessionBinding(pid)?.terminalSessionId : undefined;
+
+  const success = await terminalManager.forceTerminate(pid, 'client_cancelled', undefined, expectedTerminalSessionId);
   return {
     content: [{
       type: "text",
@@ -1028,14 +1154,21 @@ export async function forceTerminate(args: unknown): Promise<ServerResult> {
  * List active sessions
  */
 export async function listSessions(): Promise<ServerResult> {
-  const sessions = terminalManager.listActiveSessions();
+  const context = getToolCallContext();
+  const ownerSessionIdentity = getToolCallSessionIdentity();
+  const sessions = terminalManager.listActiveSessions(ownerSessionIdentity, context.isRemote);
 
   // Include virtual Node.js sessions
-  const virtualSessions = Array.from(virtualNodeSessions.entries()).map(([pid, session]) => ({
-    pid,
-    type: 'node:local',
-    timeout_ms: session.timeout_ms
-  }));
+  const virtualSessions = Array.from(virtualNodeSessions.entries())
+    .filter(([, session]) => !context.isRemote || (
+      ownerSessionIdentity !== undefined && session.ownerSessionIdentity === ownerSessionIdentity
+    ))
+    .map(([pid, session]) => ({
+      pid,
+      terminalSessionId: session.terminalSessionId,
+      type: 'node:local',
+      timeout_ms: session.timeout_ms
+    }));
 
   const realSessionsText = sessions.map(s =>
     `PID: ${s.pid}, Backend: ${s.backend}, Kind: ${s.executionKind}, Blocked: ${s.isBlocked}, Runtime: ${Math.round(s.runtime / 1000)}s`

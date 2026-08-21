@@ -500,6 +500,69 @@ export const capture = async (event: string, properties?: any) => {
 export const capture_call_tool = capture;
 export const capture_ui_event = capture;
 
+// Remote-device analytics is a public compatibility surface. Keep it byte-for-
+// byte at the event/property vocabulary shipped by upstream Desktop Commander
+// (wonderwhy-er/DesktopCommanderMCP main, 9bd8422). Fork-only diagnostics belong
+// in local logs and must never become unexpected telemetry proxy input.
+const UPSTREAM_REMOTE_TELEMETRY_FIELDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+    desktop_integration_init_failed: ['error'],
+    desktop_integration_tool_call_failed: ['error', 'toolName'],
+    desktop_integration_list_tools_failed: ['error'],
+    desktop_integration_shutdown_error: ['error', 'component'],
+    remote_device_auth_request_failed: ['error'],
+    remote_device_auth_failed: ['error'],
+    remote_device_auth_network_error: ['error'],
+    remote_device_auth_timeout: ['error'],
+    remote_device_shutdown_handler_error: ['error', 'signal'],
+    remote_device_auth_success: ['device'],
+    remote_device_startup_failed: ['error'],
+    remote_device_config_load_error: ['error'],
+    remote_device_config_save_error: ['error'],
+    remote_device_tool_call_failed: ['error', 'tool_name'],
+    remote_device_shutdown_error: ['error'],
+    remote_channel_set_session_error: ['error'],
+    remote_channel_get_user_error: ['error'],
+    remote_channel_get_user_empty: [],
+    remote_channel_find_device_error: ['error'],
+    remote_channel_update_device_error: ['error'],
+    remote_channel_create_device_error: ['error'],
+    remote_channel_register_device_error: ['error', 'deviceId'],
+    remote_channel_presence_tracked: ['recoveredAfterAttempts'],
+    remote_channel_presence_track_error: ['attempts'],
+    remote_channel_subscription_error: ['error'],
+    remote_channel_subscription_timeout: ['attempt'],
+    remote_channel_doorbell_fetch_error: ['error'],
+    remote_channel_doorbell_row_missing: ['call_id'],
+    remote_channel_result_doorbell_send_failed: ['result', 'error'],
+    remote_channel_joining_wedge: ['stuckMs', 'attempt'],
+    remote_channel_state_health: ['state', 'attempt'],
+    remote_channel_recreate_error: ['errMsg', 'attempt'],
+    remote_channel_mark_call_executing_error: ['error'],
+    remote_channel_update_call_result_error: ['error'],
+    remote_channel_heartbeat_error: ['error'],
+    remote_channel_status_update_error: ['error', 'status'],
+    remote_channel_offline_update_error: ['error'],
+});
+
+const UPSTREAM_REMOTE_TELEMETRY_ALIASES: Readonly<Record<string, string>> = Object.freeze({
+    remote_channel_result_wake_failed: 'remote_channel_result_doorbell_send_failed',
+    remote_result_transport_commit_error: 'remote_channel_update_call_result_error',
+});
+
+export function normalizeRemoteTelemetryForUpstream(
+    event: string, properties?: Record<string, unknown>,
+): { event: string; properties: Record<string, unknown> } | null {
+    const upstreamEvent = UPSTREAM_REMOTE_TELEMETRY_ALIASES[event] ?? event;
+    const allowedFields = UPSTREAM_REMOTE_TELEMETRY_FIELDS[upstreamEvent];
+    if (!allowedFields) return null;
+    const source = properties && typeof properties === 'object' ? properties : {};
+    const filtered: Record<string, unknown> = {};
+    for (const key of allowedFields) {
+        if (source[key] !== undefined) filtered[key] = source[key];
+    }
+    return { event: upstreamEvent, properties: filtered };
+}
+
 /**
  * Wrapper for capture() that automatically adds remote flag for remote-device telemetry
  * Also adds additional privacy filtering to remove sensitive identity information
@@ -507,8 +570,11 @@ export const capture_ui_event = capture;
  * @param properties Optional event properties
  */
 export const captureRemote = async (event: string, properties?: any) => {
+    const normalized = normalizeRemoteTelemetryForUpstream(event, properties);
+    if (!normalized) return;
+
     // Create a copy of properties to avoid mutating the original
-    const sanitizedProps = properties ? { ...properties } : {};
+    const sanitizedProps = { ...normalized.properties };
 
     // Remove sensitive identity keys specific to remote devices
     const sensitiveIdentityKeys = ['deviceId', 'userId', 'email', 'user_id', 'device_id', 'user_email'];
@@ -518,7 +584,7 @@ export const captureRemote = async (event: string, properties?: any) => {
         }
     }
 
-    return await capture(event, {
+    return await capture(normalized.event, {
         ...sanitizedProps,
         remote: String(true)
     });

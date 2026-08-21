@@ -25,15 +25,16 @@ import { renameReplacingWithRetry } from '../utils/atomic-rename.js';
 import { findWindowsFileLockers } from '../utils/windows-file-locks.js';
 import { acquireMutationResourceLocks } from '../utils/mutation-resource-lock.js';
 import { acquireCoordinatedMutationOwnership } from '../utils/resource-lease-owner.js';
-import { getToolCallSessionIdentity } from '../utils/client-context.js';
+import { getToolCallContext, getToolCallSessionIdentity } from '../utils/client-context.js';
 import { readFileBounded } from '../utils/bounded-file-read.js';
+import { decodeTextBuffer, detectUtf16Bom, encodeTextBuffer, type TextFileEncoding } from '../utils/files/text-encoding.js';
 import { MANAGED_TRASH_DIRECTORY_NAME, isManagedTrashRelativePath } from '../utils/trash-contract.js';
 import { runBoundedSubprocess, type BoundedSubprocessResult } from '../utils/bounded-subprocess.js';
 import { processProblemEvidence } from '../utils/process-problem-matcher.js';
 import { waitForTerminalProcess } from '../utils/terminal-process-wait.js';
 import {
-  PROCESS_STALL_DEFAULT_MS, PROCESS_TRANSPORT_RESERVE_MS, PROCESS_TRANSPORT_TIMEOUT_MAX_MS,
-  PROCESS_WAIT_DEFAULT_MS, PROCESS_WAIT_MAX_MS,
+  PROCESS_REMOTE_OBSERVE_MAX_MS, PROCESS_STALL_DEFAULT_MS, PROCESS_TRANSPORT_RESERVE_MS, PROCESS_TRANSPORT_TIMEOUT_MAX_MS,
+  PROCESS_WAIT_DEFAULT_MS, PROCESS_WAIT_MAX_MS, processObservationWaitMs,
 } from '../utils/process-wait-contract.js';
 
 const GIT_TIMEOUT_MS = 15_000;
@@ -242,7 +243,7 @@ function recordMutationHashTransition(filePath: string, beforeHash: string, afte
 
 async function replaceTextFileAtomically(
   filePath: string,
-  content: string,
+  content: Buffer,
   expectedCurrentHash: string,
   expectedReplacementHash: string,
   deadlineAt: number,
@@ -260,7 +261,7 @@ async function replaceTextFileAtomically(
     );
     await runWithAbortableTimeout(
       (signal) => {
-        pendingWrite = fs.writeFile(tempPath, content, { encoding: 'utf8', mode: stats.mode, signal, flush: true });
+        pendingWrite = fs.writeFile(tempPath, content, { mode: stats.mode, signal, flush: true });
         return pendingWrite;
       },
       remainingTimeout(deadlineAt),
@@ -1368,8 +1369,11 @@ async function contextPack(args: Record<string, unknown>, deadlineAt: number) {
         remainingTimeout(deadlineAt),
         `Read bounded context_pack candidate ${absolute}`,
       );
-      if (await isBinaryFile(bytes, bytes.length)) return { value: null, bytesRead: bytes.length, aggregateLimit: false };
-      const text = bytes.toString('utf8');
+      const textEncoding = detectUtf16Bom(bytes);
+      if (!textEncoding && await isBinaryFile(bytes, bytes.length)) {
+        return { value: null, bytesRead: bytes.length, aggregateLimit: false };
+      }
+      const text = decodeTextBuffer(bytes);
       const lines = text ? text.match(/.*(?:\r\n|\n|\r|$)/g)?.filter(Boolean) ?? [] : [];
       const hitLines: number[] = [];
       let termHits = 0;
@@ -1547,10 +1551,10 @@ async function readRanges(args: Record<string, unknown>, deadlineAt: number) {
     return { requestedPath, offset, length, knownHash };
   });
 
-  const validated = await Promise.all(parsed.map(async (request) => ({
+  const validated = await mapConcurrent(parsed, 8, async (request) => ({
     ...request,
     validPath: await validatePath(request.requestedPath, remainingTimeout(deadlineAt, 10_000)),
-  })));
+  }));
   const uniquePaths = new Map<string, string>();
   for (const request of validated) {
     const absolute = path.resolve(request.validPath);
@@ -1558,7 +1562,7 @@ async function readRanges(args: Record<string, unknown>, deadlineAt: number) {
     uniquePaths.set(identity, request.validPath);
   }
 
-  const entries = await Promise.all([...uniquePaths.entries()].map(async ([identity, filePath]) => {
+  const entries = await mapConcurrent([...uniquePaths.entries()], 8, async ([identity, filePath]) => {
     const stats = await runWithAbortableTimeout(
       (_signal) => fs.stat(filePath),
       remainingTimeout(deadlineAt),
@@ -1569,7 +1573,7 @@ async function readRanges(args: Record<string, unknown>, deadlineAt: number) {
       throw new Error(`read_ranges file exceeds ${MAX_READ_RANGE_FILE_BYTES} bytes: ${filePath}`);
     }
     return { identity, filePath, size: stats.size };
-  }));
+  });
   const preflightTotalFileBytes = entries.reduce((sum, entry) => sum + entry.size, 0);
   if (preflightTotalFileBytes > MAX_READ_RANGES_TOTAL_FILE_BYTES) {
     throw new Error(`read_ranges unique files total ${preflightTotalFileBytes} bytes; limit is ${MAX_READ_RANGES_TOTAL_FILE_BYTES}.`);
@@ -1589,10 +1593,11 @@ async function readRanges(args: Record<string, unknown>, deadlineAt: number) {
     if (totalFileBytes > MAX_READ_RANGES_TOTAL_FILE_BYTES) {
       throw new Error(`read_ranges unique files total ${totalFileBytes} bytes; limit is ${MAX_READ_RANGES_TOTAL_FILE_BYTES}.`);
     }
-    if (await isBinaryFile(bytes, bytes.length)) {
+    const textEncoding = detectUtf16Bom(bytes);
+    if (!textEncoding && await isBinaryFile(bytes, bytes.length)) {
       throw new Error(`read_ranges only supports text files: ${filePath}`);
     }
-    const text = bytes.toString('utf8');
+    const text = decodeTextBuffer(bytes);
     const lines = text ? text.match(/.*(?:\r\n|\n|\r|$)/g)?.filter(Boolean) ?? [] : [];
     loaded.set(identity, {
       hash: crypto.createHash('sha256').update(bytes).digest('hex'),
@@ -1681,7 +1686,8 @@ async function editFile(args: Record<string, unknown>, deadlineAt: number) {
   // independent reads create a race where stale text can be paired with a
   // newer hash and later overwrite the newer file.
   const beforeBytes = await readFileBytes(validPath, deadlineAt);
-  if (await isBinaryFile(beforeBytes, beforeBytes.length)) {
+  const textEncoding: TextFileEncoding = detectUtf16Bom(beforeBytes) ?? 'utf8';
+  if (textEncoding === 'utf8' && await isBinaryFile(beforeBytes, beforeBytes.length)) {
     throw new Error('edit_file only supports text files.');
   }
   const beforeHash = crypto.createHash('sha256').update(beforeBytes).digest('hex');
@@ -1695,7 +1701,7 @@ async function editFile(args: Record<string, unknown>, deadlineAt: number) {
       rebasedFromHash = `sha256:${expectedHash}`;
     }
   }
-  const before = beforeBytes.toString('utf8');
+  const before = decodeTextBuffer(beforeBytes);
   let after = before;
   const applied: Array<{ index: number; replacements: number; oldLength: number; newLength: number }> = [];
 
@@ -1717,14 +1723,15 @@ async function editFile(args: Record<string, unknown>, deadlineAt: number) {
     applied.push({ index, replacements: expected, oldLength: oldText.length, newLength: newText.length });
   }
 
-  const afterHash = sha256Text(after);
+  const afterBytes = encodeTextBuffer(after, textEncoding);
+  const afterHash = crypto.createHash('sha256').update(afterBytes).digest('hex');
   const dryRun = args.dryRun !== false;
   if (!dryRun && after !== before) {
     const currentHash = await sha256File(validPath, deadlineAt);
     if (currentHash !== beforeHash) {
       throw new Error(`File changed after edit_file read and before write: ${validPath}. No accelerator write was performed.`);
     }
-    await replaceTextFileAtomically(validPath, after, beforeHash, afterHash, deadlineAt);
+    await replaceTextFileAtomically(validPath, afterBytes, beforeHash, afterHash, deadlineAt);
     recordMutationHashTransition(validPath, beforeHash, afterHash);
   }
 
@@ -1735,8 +1742,8 @@ async function editFile(args: Record<string, unknown>, deadlineAt: number) {
     beforeHash: `sha256:${beforeHash}`,
     afterHash: `sha256:${afterHash}`,
     ...(rebasedFromHash ? { rebasedFromHash } : {}),
-    bytesBefore: Buffer.byteLength(before),
-    bytesAfter: Buffer.byteLength(after),
+    bytesBefore: beforeBytes.length,
+    bytesAfter: afterBytes.length,
     edits: applied,
   };
   } finally {
@@ -1975,10 +1982,37 @@ async function applyPatch(args: Record<string, unknown>, deadlineAt: number) {
 
 async function waitProcess(args: Record<string, unknown>) {
   const pid = Number(args.pid);
-  const timeoutMs = args.timeout_ms === undefined ? PROCESS_WAIT_DEFAULT_MS : Number(args.timeout_ms);
+  const requestedTimeoutMs = args.timeout_ms === undefined ? PROCESS_WAIT_DEFAULT_MS : Number(args.timeout_ms);
+  const isRemote = getToolCallContext().isRemote;
+  const terminalSessionId = typeof args.terminal_session_id === 'string' ? args.terminal_session_id : undefined;
+  const binding = terminalManager.getSessionBinding(pid);
+  if (isRemote && !terminalManager.canAccessSession(pid, getToolCallSessionIdentity(), terminalSessionId)) {
+    throw new Error(`Managed terminal session ${pid} is not available to this remote conversation. Pass terminal_session_id from start_process or start a new process.`);
+  }
+  const expectedTerminalSessionId = isRemote ? binding?.terminalSessionId : undefined;
+  const timeoutMs = processObservationWaitMs(requestedTimeoutMs, isRemote);
   const stallTimeoutMs = args.stall_timeout_ms === undefined ? PROCESS_STALL_DEFAULT_MS : Number(args.stall_timeout_ms);
   const tailLines = args.tail_lines === undefined ? 100 : Number(args.tail_lines);
-  return waitForTerminalProcess(terminalManager, { pid, timeoutMs, stallTimeoutMs, tailLines });
+  const boundTerminal = expectedTerminalSessionId ? {
+    readOutputPaginated: (boundPid: number, offset: number, length: number) =>
+      terminalManager.getSessionBinding(boundPid)?.terminalSessionId === expectedTerminalSessionId
+        ? terminalManager.readOutputPaginated(boundPid, offset, length) : null,
+    reconcileExitedSession: async (boundPid: number) => {
+      if (terminalManager.getSessionBinding(boundPid)?.terminalSessionId !== expectedTerminalSessionId) {
+        throw new Error(`Managed terminal session ${boundPid} changed while it was being observed.`);
+      }
+      await terminalManager.reconcileExitedSession(boundPid);
+    },
+  } : terminalManager;
+  const result = await waitForTerminalProcess(boundTerminal, { pid, timeoutMs, stallTimeoutMs, tailLines });
+  const boundResult = { ...result, terminalSessionId: expectedTerminalSessionId ?? binding?.terminalSessionId ?? null };
+  if (isRemote && timeoutMs < requestedTimeoutMs && !result.completed) {
+    return {
+      ...boundResult, observationCapped: true, requestedTimeoutMs, observationWindowMs: timeoutMs,
+      note: `Remote observation returned control after ${timeoutMs}ms without terminating PID ${pid}; call wait_process again for the same PID to continue observing.`,
+    };
+  }
+  return boundResult;
 }
 
 const tools: BuiltinAcceleratorTool[] = [
@@ -2192,7 +2226,7 @@ const tools: BuiltinAcceleratorTool[] = [
   {
     name: 'wait_process',
     purpose: 'Wait internally for a finite Desktop Commander terminal session and return completion plus a bounded output tail.',
-    when_to_use: 'After start_process for builds/tests that should finish, instead of repeated read_process_output polling.',
+    when_to_use: 'After start_process for builds/tests that should finish, instead of repeated read_process_output polling. Remote calls return control after at most 30s and can resume observation of the same PID.',
     when_not_to_use: 'For REPLs, servers, watchers, or intentionally long-lived processes.',
     readOnly: true,
     mutating: false,
@@ -2202,6 +2236,7 @@ const tools: BuiltinAcceleratorTool[] = [
       additionalProperties: false,
       properties: {
         pid: { type: 'integer' },
+        terminal_session_id: { type: 'string', format: 'uuid', description: 'Opaque terminal session ID returned by start_process; required when remote conversation metadata does not own the PID.' },
         timeout_ms: { type: 'integer', minimum: 0, maximum: PROCESS_WAIT_MAX_MS, default: PROCESS_WAIT_DEFAULT_MS },
         stall_timeout_ms: { type: 'integer', minimum: 0, maximum: PROCESS_WAIT_MAX_MS, default: PROCESS_STALL_DEFAULT_MS, description: 'Return stalled=true after this long without stdout/stderr; 0 disables stall detection.' },
         tail_lines: { type: 'integer', minimum: 1, maximum: 1000, default: 100 },
@@ -2209,7 +2244,7 @@ const tools: BuiltinAcceleratorTool[] = [
     },
     recommended_workflow: [
       'Start the finite command once.',
-      'If start_process reports it still running, call wait_process in a bounded window.',
+      `If start_process reports it still running, call wait_process in a bounded window; remote calls cap one observation at ${PROCESS_REMOTE_OBSERVE_MAX_MS}ms without terminating the PID.`,
       'If stalled=true, inspect the process/tail before deciding whether to keep waiting or terminate; stall detection never kills the process.',
       'Treat processSucceeded/exitCode as verification, not transport success alone.',
     ],
